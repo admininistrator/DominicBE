@@ -74,6 +74,11 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+def root():
+    return {"service": "Dominic Backend", "status": "running"}
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
