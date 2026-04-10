@@ -1,3 +1,4 @@
+import logging
 import os
 from uuid import uuid4
 
@@ -14,8 +15,31 @@ from app.core.config import (
 )
 from app.crud import crud_chat
 
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-MODEL_NAME = os.getenv("ANTHROPIC_MODEL")
+logger = logging.getLogger("uvicorn.error")
+
+# Lazy-initialised so that a missing API key does NOT crash the app at import time.
+_client: Anthropic | None = None
+
+
+def _get_client() -> Anthropic:
+    global _client
+    if _client is None:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY environment variable is not set. "
+                "Please configure it in Azure App Service → Configuration → Application settings."
+            )
+        _client = Anthropic(api_key=api_key)
+        logger.info("Anthropic client initialised successfully.")
+    return _client
+
+
+def _get_model() -> str:
+    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+    if not model:
+        model = "claude-sonnet-4-20250514"
+    return model
 
 def login_user(db: Session, username: str, password: str):
     user = crud_chat.verify_user_credentials(db, username, password)
@@ -101,8 +125,8 @@ def get_session_history(db: Session, username: str, session_id: int):
 def _estimate_input_tokens(messages: list[dict], system_prompt: str | None = None) -> int:
     # Prefer provider-side token counting when available.
     try:
-        token_info = client.messages.count_tokens(
-            model=MODEL_NAME,
+        token_info = _get_client().messages.count_tokens(
+            model=_get_model(),
             messages=messages,
             system=system_prompt or "",
         )
@@ -149,8 +173,8 @@ def _refresh_summary_if_needed(db: Session, username: str, session_id: int):
 
     try:
         prompt = _build_summary_prompt(summary_row.summary_text if summary_row else "", candidates)
-        resp = client.messages.create(
-            model=MODEL_NAME,
+        resp = _get_client().messages.create(
+            model=_get_model(),
             max_tokens=SUMMARY_MAX_TOKENS,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -234,13 +258,13 @@ def handle_chat(db: Session, username: str, session_id: int, user_message: str):
             raise PermissionError("Rolling 2-hour token limit exceeded.")
 
         request_kwargs = {
-            "model": MODEL_NAME,
+            "model": _get_model(),
             "max_tokens": max_output_tokens,
             "messages": formatted_messages,
         }
         if system_prompt:
             request_kwargs["system"] = system_prompt
-        response = client.messages.create(**request_kwargs)
+        response = _get_client().messages.create(**request_kwargs)
 
         ai_content = response.content[0].text
         in_tokens = int(response.usage.input_tokens or 0)

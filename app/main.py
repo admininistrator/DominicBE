@@ -1,5 +1,7 @@
 from contextlib import asynccontextmanager
 import logging
+import os
+import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,23 +9,38 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from app.api.endpoints import chat
-from app.core.database import engine, Base, SQLALCHEMY_DATABASE_URL
-import os
-
+# Configure logging EARLY so we see startup messages
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+)
 logger = logging.getLogger("uvicorn.error")
+
+# These imports may touch the DB engine / Anthropic – keep them AFTER load_dotenv()
+from app.api.endpoints import chat  # noqa: E402
+from app.core.database import engine, Base, SQLALCHEMY_DATABASE_URL  # noqa: E402
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("=== Dominic Backend starting (lifespan) ===")
+    logger.info("PORT env = %s", os.getenv("PORT", "(not set)"))
+    logger.info("WEBSITES_PORT env = %s", os.getenv("WEBSITES_PORT", "(not set)"))
+    logger.info("DB URL (masked): %s", _mask_db_url(SQLALCHEMY_DATABASE_URL))
+    logger.info("CORS_ORIGINS env = %s", os.getenv("CORS_ORIGINS", "(not set)"))
+    logger.info("ANTHROPIC_API_KEY set = %s", bool(os.getenv("ANTHROPIC_API_KEY")))
+    logger.info("ANTHROPIC_MODEL = %s", os.getenv("ANTHROPIC_MODEL", "(not set)"))
+
     # Startup: try to create tables, but don't crash if DB is unreachable yet
     try:
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables verified/created successfully.")
     except Exception as exc:
-        logger.error("Could not connect to DB on startup: %s", exc)
-        logger.error("DB URL (masked): %s", _mask_db_url(SQLALCHEMY_DATABASE_URL))
+        logger.warning("Could not connect to DB on startup (app will still start): %s", exc)
+    logger.info("=== Dominic Backend ready ===")
     yield
+    logger.info("=== Dominic Backend shutting down ===")
 
 
 def _mask_db_url(url: str) -> str:

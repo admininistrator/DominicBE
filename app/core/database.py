@@ -19,7 +19,11 @@ DB_SSL = os.getenv("DB_SSL", "")  # set to "true" on Azure
 # Sử dụng pymysql làm driver kết nối MySQL
 SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-connect_args = {}
+connect_args: dict = {
+    "connect_timeout": 10,   # fail fast (seconds) instead of hanging
+    "read_timeout": 30,
+    "write_timeout": 30,
+}
 if DB_SSL.lower() in ("true", "1", "yes"):
     connect_args["ssl"] = {"ssl_mode": "REQUIRED"}
 
@@ -27,6 +31,7 @@ engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=300,
+    pool_timeout=10,
     connect_args=connect_args,
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
