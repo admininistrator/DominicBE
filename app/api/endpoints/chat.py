@@ -12,6 +12,7 @@ from app.schemas.chat_schemas import (
     UsageResponse,
 )
 from app.services.chat_service import (
+    ProviderRequestError,
     create_session,
     get_session_history,
     get_sessions,
@@ -30,6 +31,8 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
         return LoginResponse(**result)
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
+    except ProviderRequestError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -41,6 +44,8 @@ def get_user_usage(username: str, db: Session = Depends(get_db)):
         return UsageResponse(**result)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ProviderRequestError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -52,6 +57,8 @@ def create_chat_session(request: SessionCreateRequest, db: Session = Depends(get
         return SessionResponse(**result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except ProviderRequestError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -63,6 +70,8 @@ def list_user_sessions(username: str, db: Session = Depends(get_db)):
         return [SessionResponse(**row) for row in result]
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ProviderRequestError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -74,6 +83,8 @@ def get_messages_by_session(username: str, session_id: int, db: Session = Depend
         return [SessionMessageResponse(**row) for row in result]
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ProviderRequestError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -89,6 +100,8 @@ def send_message(request: ChatRequest, db: Session = Depends(get_db)):
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+    except ProviderRequestError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

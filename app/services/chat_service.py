@@ -2,7 +2,7 @@ import logging
 import os
 from uuid import uuid4
 
-from anthropic import Anthropic
+from anthropic import APIConnectionError, APIStatusError, Anthropic
 from sqlalchemy.orm import Session
 
 from app.core.config import (
@@ -16,6 +16,14 @@ from app.core.config import (
 from app.crud import crud_chat
 
 logger = logging.getLogger("uvicorn.error")
+
+
+class ProviderRequestError(Exception):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
 
 # Lazy-initialised so that a missing API key does NOT crash the app at import time.
 _client: Anthropic | None = None
@@ -36,10 +44,54 @@ def _get_client() -> Anthropic:
 
 
 def _get_model() -> str:
-    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+    model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
     if not model:
-        model = "claude-sonnet-4-20250514"
-    return model
+        model = "claude-3-5-haiku-latest"
+    return model.strip()
+
+
+def _extract_provider_message(exc: APIStatusError) -> str:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+    return str(exc).strip()
+
+
+def _raise_provider_error(exc: Exception):
+    model = _get_model()
+
+    if isinstance(exc, APIConnectionError):
+        raise ProviderRequestError(
+            503,
+            "Khong the ket noi toi nha cung cap AI (Anthropic). Kiem tra outbound network, DNS, firewall, va API key.",
+        ) from exc
+
+    if isinstance(exc, APIStatusError):
+        status_code = int(getattr(exc, "status_code", 502) or 502)
+        provider_message = _extract_provider_message(exc)
+
+        if status_code == 401:
+            detail = "Anthropic API key khong hop le hoac chua duoc cap quyen. Kiem tra bien moi truong ANTHROPIC_API_KEY tren Azure App Service."
+        elif status_code == 403:
+            detail = (
+                f"Anthropic tu choi request cho model '{model}'. "
+                "Kiem tra billing/quyen truy cap model cua API key, va thu dat ANTHROPIC_MODEL=claude-3-5-haiku-latest tren Azure. "
+                f"Provider message: {provider_message}"
+            )
+        elif status_code == 404:
+            detail = f"Model '{model}' khong ton tai hoac API key hien tai khong duoc phep dung model nay."
+        elif status_code == 429:
+            detail = "Anthropic dang gioi han toc do hoac het quota. Thu lai sau hoac kiem tra usage/billing."
+        else:
+            detail = f"Anthropic API loi {status_code}: {provider_message}"
+
+        raise ProviderRequestError(status_code, detail) from exc
+
+    raise exc
 
 def login_user(db: Session, username: str, password: str):
     user = crud_chat.verify_user_credentials(db, username, password)
@@ -243,9 +295,9 @@ def handle_chat(db: Session, username: str, session_id: int, user_message: str):
                 db=db,
                 message_id=user_msg.id,
                 status="error",
-                error_message="Rolling 2-hour token limit exceeded before API call.",
+                error_message=f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded before API call.",
             )
-            raise PermissionError("Rolling 2-hour token limit exceeded.")
+            raise PermissionError(f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded.")
 
         max_output_tokens = min(MAX_OUTPUT_TOKENS, remaining_tokens - estimated_input_tokens)
         if max_output_tokens <= 0:
@@ -255,7 +307,7 @@ def handle_chat(db: Session, username: str, session_id: int, user_message: str):
                 status="error",
                 error_message="No remaining output token budget.",
             )
-            raise PermissionError("Rolling 2-hour token limit exceeded.")
+            raise PermissionError(f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded.")
 
         request_kwargs = {
             "model": _get_model(),
@@ -299,6 +351,22 @@ def handle_chat(db: Session, username: str, session_id: int, user_message: str):
             "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens},
             "request_id": request_id,
         }
+
+    except (APIConnectionError, APIStatusError) as e:
+        logger.warning("Anthropic request failed for username=%s session_id=%s: %s", username, session_id, e)
+        provider_error = None
+        try:
+            _raise_provider_error(e)
+        except ProviderRequestError as mapped_error:
+            provider_error = mapped_error
+
+        crud_chat.update_message_tokens_and_status(
+            db=db,
+            message_id=user_msg.id,
+            status="error",
+            error_message=provider_error.detail if provider_error else str(e),
+        )
+        raise provider_error if provider_error else e
 
     except Exception as e:
         crud_chat.update_message_tokens_and_status(
