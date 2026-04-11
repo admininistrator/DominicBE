@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from app.api.deps import get_db
+from app.core.database import get_database_error_message, is_unknown_database_error
 from app.schemas.chat_schemas import (
     ChatRequest,
     ChatResponse,
@@ -23,6 +25,13 @@ from app.services.chat_service import (
 router = APIRouter()
 
 
+def _raise_api_error(exc: Exception):
+    if isinstance(exc, OperationalError):
+        status_code = 503 if is_unknown_database_error(exc) else 500
+        raise HTTPException(status_code=status_code, detail=get_database_error_message(exc))
+    raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.post("/login", response_model=LoginResponse)
 def login(request: LoginRequest, db: Session = Depends(get_db)):
     try:
@@ -31,7 +40,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_api_error(e)
 
 
 @router.get("/usage/{username}", response_model=UsageResponse)
@@ -42,7 +51,7 @@ def get_user_usage(username: str, db: Session = Depends(get_db)):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_api_error(e)
 
 
 @router.post("/sessions", response_model=SessionResponse)
@@ -53,7 +62,7 @@ def create_chat_session(request: SessionCreateRequest, db: Session = Depends(get
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_api_error(e)
 
 
 @router.get("/sessions/{username}", response_model=list[SessionResponse])
@@ -64,7 +73,7 @@ def list_user_sessions(username: str, db: Session = Depends(get_db)):
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_api_error(e)
 
 
 @router.get("/sessions/{username}/{session_id}/messages", response_model=list[SessionMessageResponse])
@@ -75,7 +84,7 @@ def get_messages_by_session(username: str, session_id: int, db: Session = Depend
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_api_error(e)
 
 @router.post("/", response_model=ChatResponse)
 def send_message(request: ChatRequest, db: Session = Depends(get_db)):
@@ -92,4 +101,4 @@ def send_message(request: ChatRequest, db: Session = Depends(get_db)):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _raise_api_error(e)
