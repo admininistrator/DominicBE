@@ -26,20 +26,27 @@ class ProviderRequestError(Exception):
 
 
 # Lazy-initialised so that a missing API key does NOT crash the app at import time.
+# Also re-initialised when the API key env-var changes (e.g. after updating Azure App Settings).
 _client: Anthropic | None = None
+_client_key: str | None = None  # the key used to build the current _client
 
 
 def _get_client() -> Anthropic:
-    global _client
-    if _client is None:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY environment variable is not set. "
-                "Please configure it in Azure App Service → Configuration → Application settings."
-            )
+    global _client, _client_key
+    api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY environment variable is not set. "
+            "Please configure it in Azure App Service → Configuration → Application settings."
+        )
+    if _client is None or api_key != _client_key:
         _client = Anthropic(api_key=api_key)
-        logger.info("Anthropic client initialised successfully.")
+        _client_key = api_key
+        logger.info(
+            "Anthropic client (re)initialised. key prefix=%s model=%s",
+            api_key[:12] + "...",
+            _get_model(),
+        )
     return _client
 
 
@@ -177,11 +184,10 @@ def get_session_history(db: Session, username: str, session_id: int):
 def _estimate_input_tokens(messages: list[dict], system_prompt: str | None = None) -> int:
     # Prefer provider-side token counting when available.
     try:
-        token_info = _get_client().messages.count_tokens(
-            model=_get_model(),
-            messages=messages,
-            system=system_prompt or "",
-        )
+        kwargs: dict = {"model": _get_model(), "messages": messages}
+        if system_prompt:
+            kwargs["system"] = system_prompt
+        token_info = _get_client().messages.count_tokens(**kwargs)
         return int(getattr(token_info, "input_tokens", 0) or 0)
     except Exception:
         # Fallback heuristic: ~4 chars/token for mixed VN/EN text.
@@ -243,10 +249,45 @@ def _refresh_summary_if_needed(db: Session, username: str, session_id: int):
         return summary_row
 
 
+def _sanitize_messages_for_api(messages: list[dict]) -> list[dict]:
+    """Ensure messages alternate user/assistant and start with user.
+
+    Anthropic requires strictly alternating roles.  When a previous request
+    failed the user message was persisted but no assistant reply was saved,
+    leaving two consecutive user messages.  We merge/drop them so the payload
+    is always valid.
+    """
+    result: list[dict] = []
+    for msg in messages:
+        role = msg.get("role")
+        if not role or not msg.get("content"):
+            continue
+        if result and result[-1]["role"] == role:
+            # Consecutive same-role: merge into the existing message.
+            result[-1] = {
+                "role": role,
+                "content": result[-1]["content"] + "\n\n" + msg["content"],
+            }
+        else:
+            result.append({"role": role, "content": msg["content"]})
+
+    # Must start with a user message (drop leading assistant messages).
+    while result and result[0]["role"] != "user":
+        result.pop(0)
+
+    return result
+
+
 def _build_hybrid_context(db: Session, username: str, session_id: int):
     summary_row = _refresh_summary_if_needed(db, username, session_id)
     recent = crud_chat.get_recent_user_history(db, username, session_id, CONTEXT_WINDOW_SIZE)
-    formatted_messages = [{"role": m.role, "content": m.content} for m in recent]
+
+    # Only include successfully completed messages so that failed/pending
+    # user messages don't create consecutive-same-role sequences that Anthropic
+    # would reject with a 400/403.
+    success_messages = [m for m in recent if getattr(m, "status", "success") == "success"]
+    raw_messages = [{"role": m.role, "content": m.content} for m in success_messages]
+    formatted_messages = _sanitize_messages_for_api(raw_messages)
 
     system_prompt = None
     if summary_row and summary_row.summary_text:

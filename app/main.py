@@ -87,6 +87,7 @@ def health():
 @app.get("/debug/env")
 def debug_env():
     """Temporary endpoint to verify env-var visibility on Azure.  Remove after debugging."""
+    raw_key = os.getenv("ANTHROPIC_API_KEY", "")
     return {
         "CORS_ORIGINS": os.getenv("CORS_ORIGINS", "(not set)"),
         "DB_HOST": os.getenv("DB_HOST", "(not set)"),
@@ -94,7 +95,9 @@ def debug_env():
         "DB_NAME": os.getenv("DB_NAME", "(not set)"),
         "DB_USER": os.getenv("DB_USER", "(not set)"),
         "DB_PASSWORD_SET": bool(os.getenv("DB_PASSWORD")),
-        "ANTHROPIC_API_KEY_SET": bool(os.getenv("ANTHROPIC_API_KEY")),
+        "ANTHROPIC_API_KEY_SET": bool(raw_key),
+        # Show enough of the key to confirm it matches what you expect, without full exposure.
+        "ANTHROPIC_API_KEY_PREFIX": (raw_key[:16] + "...") if len(raw_key) >= 16 else ("(too short or empty)"),
         "ANTHROPIC_MODEL": os.getenv("ANTHROPIC_MODEL", "(not set)"),
         "PORT": os.getenv("PORT", "(not set)"),
         "WEBSITE_HOSTNAME": os.getenv("WEBSITE_HOSTNAME", "(not set)"),
