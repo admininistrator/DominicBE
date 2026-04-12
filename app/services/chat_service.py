@@ -29,23 +29,35 @@ class ProviderRequestError(Exception):
 # Also re-initialised when the API key env-var changes (e.g. after updating Azure App Settings).
 _client: Anthropic | None = None
 _client_key: str | None = None  # the key used to build the current _client
+_client_base_url: str | None = None
+
+
+def _get_base_url() -> str | None:
+    base_url = (os.getenv("ANTHROPIC_BASE_URL") or "").strip()
+    return base_url or None
 
 
 def _get_client() -> Anthropic:
-    global _client, _client_key
+    global _client, _client_key, _client_base_url
     api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    base_url = _get_base_url()
     if not api_key:
         raise RuntimeError(
             "ANTHROPIC_API_KEY environment variable is not set. "
             "Please configure it in Azure App Service → Configuration → Application settings."
         )
-    if _client is None or api_key != _client_key:
-        _client = Anthropic(api_key=api_key)
+    if _client is None or api_key != _client_key or base_url != _client_base_url:
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        _client = Anthropic(**client_kwargs)
         _client_key = api_key
+        _client_base_url = base_url
         logger.info(
-            "Anthropic client (re)initialised. key prefix=%s model=%s",
+            "Anthropic client (re)initialised. key prefix=%s model=%s base_url=%s",
             api_key[:12] + "...",
             _get_model(),
+            base_url or "(default)",
         )
     return _client
 
@@ -86,7 +98,8 @@ def _raise_provider_error(exc: Exception):
         elif status_code == 403:
             detail = (
                 f"Anthropic tu choi request cho model '{model}'. "
-                "Kiem tra billing/quyen truy cap model cua API key, va thu dat ANTHROPIC_MODEL=claude-3-5-haiku-latest tren Azure. "
+                "Neu key/model nay goi duoc tren may local nhung fail tren Azure App Service, kha nang cao la Anthropic dang chan theo region/egress IP cua Azure (vi du East Asia) hoac request phai di qua proxy/base URL khac. "
+                "Kiem tra billing/quyen truy cap model, thu model khac, hoac cau hinh ANTHROPIC_BASE_URL neu ban co AI gateway/proxy. "
                 f"Provider message: {provider_message}"
             )
         elif status_code == 404:

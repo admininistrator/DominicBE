@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI):
     logger.info("anthropic package version = %s", _get_package_version("anthropic"))
     logger.info("ANTHROPIC_API_KEY set = %s", bool(os.getenv("ANTHROPIC_API_KEY")))
     logger.info("ANTHROPIC_MODEL = %s", os.getenv("ANTHROPIC_MODEL", "(not set)"))
+    logger.info("ANTHROPIC_BASE_URL = %s", os.getenv("ANTHROPIC_BASE_URL", "(default)"))
 
     # Startup: try to create tables, but don't crash if DB is unreachable yet
     try:
@@ -108,6 +109,7 @@ def debug_env():
         # Show enough of the key to confirm it matches what you expect, without full exposure.
         "ANTHROPIC_API_KEY_PREFIX": (raw_key[:16] + "...") if len(raw_key) >= 16 else ("(too short or empty)"),
         "ANTHROPIC_MODEL": os.getenv("ANTHROPIC_MODEL", "(not set)"),
+        "ANTHROPIC_BASE_URL": os.getenv("ANTHROPIC_BASE_URL", "(default)"),
         "PORT": os.getenv("PORT", "(not set)"),
         "WEBSITE_HOSTNAME": os.getenv("WEBSITE_HOSTNAME", "(not set)"),
         "db_url_masked": _mask_db_url(SQLALCHEMY_DATABASE_URL),
