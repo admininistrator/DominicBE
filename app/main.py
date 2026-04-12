@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
 import logging
 import os
 import sys
@@ -17,6 +18,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("uvicorn.error")
 
+
+def _get_package_version(name: str) -> str:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "(not installed)"
+
 # These imports may touch the DB engine / Anthropic – keep them AFTER load_dotenv()
 from app.api.endpoints import chat  # noqa: E402
 from app.core.database import engine, Base, SQLALCHEMY_DATABASE_URL  # noqa: E402
@@ -29,6 +37,7 @@ async def lifespan(app: FastAPI):
     logger.info("WEBSITES_PORT env = %s", os.getenv("WEBSITES_PORT", "(not set)"))
     logger.info("DB URL (masked): %s", _mask_db_url(SQLALCHEMY_DATABASE_URL))
     logger.info("CORS_ORIGINS env = %s", os.getenv("CORS_ORIGINS", "(not set)"))
+    logger.info("anthropic package version = %s", _get_package_version("anthropic"))
     logger.info("ANTHROPIC_API_KEY set = %s", bool(os.getenv("ANTHROPIC_API_KEY")))
     logger.info("ANTHROPIC_MODEL = %s", os.getenv("ANTHROPIC_MODEL", "(not set)"))
 

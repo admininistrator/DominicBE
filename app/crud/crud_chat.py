@@ -101,7 +101,7 @@ def get_recent_user_history(db: Session, username: str, session_id: int, limit: 
             Message.sender_username == username,
             Message.session_id == session_id,
         )
-        .order_by(Message.created_at.desc())
+        .order_by(Message.id.desc())
         .limit(limit)
         .all()
     )

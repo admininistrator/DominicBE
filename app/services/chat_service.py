@@ -187,7 +187,10 @@ def _estimate_input_tokens(messages: list[dict], system_prompt: str | None = Non
         kwargs: dict = {"model": _get_model(), "messages": messages}
         if system_prompt:
             kwargs["system"] = system_prompt
-        token_info = _get_client().messages.count_tokens(**kwargs)
+        count_tokens = getattr(_get_client().messages, "count_tokens", None)
+        if not callable(count_tokens):
+            raise AttributeError("Anthropic SDK does not expose messages.count_tokens")
+        token_info = count_tokens(**kwargs)
         return int(getattr(token_info, "input_tokens", 0) or 0)
     except Exception:
         # Fallback heuristic: ~4 chars/token for mixed VN/EN text.
@@ -278,6 +281,20 @@ def _sanitize_messages_for_api(messages: list[dict]) -> list[dict]:
     return result
 
 
+def _build_request_messages(history_messages: list[dict], user_message: str) -> list[dict]:
+    """Build a valid Anthropic payload that always includes the latest user prompt."""
+    latest_user_message = (user_message or "").strip()
+    combined = list(history_messages)
+    if latest_user_message:
+        combined.append({"role": "user", "content": latest_user_message})
+
+    sanitized = _sanitize_messages_for_api(combined)
+    if sanitized and sanitized[-1]["role"] != "user" and latest_user_message:
+        sanitized.append({"role": "user", "content": latest_user_message})
+
+    return sanitized
+
+
 def _build_hybrid_context(db: Session, username: str, session_id: int):
     summary_row = _refresh_summary_if_needed(db, username, session_id)
     recent = crud_chat.get_recent_user_history(db, username, session_id, CONTEXT_WINDOW_SIZE)
@@ -329,8 +346,18 @@ def handle_chat(db: Session, username: str, session_id: int, user_message: str):
 
     try:
         system_prompt, formatted_messages = _build_hybrid_context(db, username, session_id)
+        request_messages = _build_request_messages(formatted_messages, user_message)
 
-        estimated_input_tokens = _estimate_input_tokens(formatted_messages, system_prompt)
+        if not request_messages:
+            crud_chat.update_message_tokens_and_status(
+                db=db,
+                message_id=user_msg.id,
+                status="error",
+                error_message="Current prompt is empty after sanitization.",
+            )
+            raise ValueError("Prompt khong hop le hoac dang rong.")
+
+        estimated_input_tokens = _estimate_input_tokens(request_messages, system_prompt)
         if estimated_input_tokens >= remaining_tokens:
             crud_chat.update_message_tokens_and_status(
                 db=db,
@@ -353,10 +380,19 @@ def handle_chat(db: Session, username: str, session_id: int, user_message: str):
         request_kwargs = {
             "model": _get_model(),
             "max_tokens": max_output_tokens,
-            "messages": formatted_messages,
+            "messages": request_messages,
         }
         if system_prompt:
             request_kwargs["system"] = system_prompt
+        logger.info(
+            "Sending Anthropic request username=%s session_id=%s model=%s messages=%s first_role=%s last_role=%s",
+            username,
+            session_id,
+            request_kwargs["model"],
+            len(request_messages),
+            request_messages[0]["role"] if request_messages else None,
+            request_messages[-1]["role"] if request_messages else None,
+        )
         response = _get_client().messages.create(**request_kwargs)
 
         ai_content = response.content[0].text
