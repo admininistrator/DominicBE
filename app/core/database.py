@@ -2,6 +2,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 import os
 from pathlib import Path
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # Always resolve .env from project root: <repo>/.env
@@ -9,15 +10,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
-DB_USER = os.getenv("DB_USER", "root")
+DB_USER = os.getenv("DB_USER", "dominic")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = os.getenv("DB_PORT", "3306")
 DB_NAME = os.getenv("DB_NAME", "chatbot_db")
 DB_SSL = os.getenv("DB_SSL", "")  # set to "true" on Azure
 
 # Sử dụng pymysql làm driver kết nối MySQL
-SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+encoded_password = quote_plus(DB_PASSWORD)
+SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 connect_args: dict = {
     "connect_timeout": 10,   # fail fast (seconds) instead of hanging
