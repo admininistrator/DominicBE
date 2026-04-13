@@ -3,6 +3,7 @@ import os
 from uuid import uuid4
 
 from anthropic import APIConnectionError, APIStatusError, Anthropic
+import httpx
 from sqlalchemy.orm import Session
 
 from app.core.config import (
@@ -30,6 +31,7 @@ class ProviderRequestError(Exception):
 _client: Anthropic | None = None
 _client_key: str | None = None  # the key used to build the current _client
 _client_base_url: str | None = None
+_client_force_ipv4: bool | None = None
 
 
 def _get_base_url() -> str | None:
@@ -37,27 +39,44 @@ def _get_base_url() -> str | None:
     return base_url or None
 
 
+def _should_force_ipv4() -> bool:
+    raw = (os.getenv("ANTHROPIC_FORCE_IPV4") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _get_client() -> Anthropic:
-    global _client, _client_key, _client_base_url
+    global _client, _client_key, _client_base_url, _client_force_ipv4
     api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
     base_url = _get_base_url()
+    force_ipv4 = _should_force_ipv4()
     if not api_key:
         raise RuntimeError(
             "ANTHROPIC_API_KEY environment variable is not set. "
             "Please configure it in Azure App Service → Configuration → Application settings."
         )
-    if _client is None or api_key != _client_key or base_url != _client_base_url:
+    if (
+        _client is None
+        or api_key != _client_key
+        or base_url != _client_base_url
+        or force_ipv4 != _client_force_ipv4
+    ):
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
+        if force_ipv4:
+            client_kwargs["http_client"] = httpx.Client(
+                transport=httpx.HTTPTransport(local_address="0.0.0.0")
+            )
         _client = Anthropic(**client_kwargs)
         _client_key = api_key
         _client_base_url = base_url
+        _client_force_ipv4 = force_ipv4
         logger.info(
-            "Anthropic client (re)initialised. key prefix=%s model=%s base_url=%s",
+            "Anthropic client (re)initialised. key prefix=%s model=%s base_url=%s force_ipv4=%s",
             api_key[:12] + "...",
             _get_model(),
             base_url or "(default)",
+            force_ipv4,
         )
     return _client
 
