@@ -1,0 +1,16 @@
+[Unit]
+Description=Dominic FastAPI backend
+After=network.target mysql.service
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/var/www/DominicBE
+EnvironmentFile=/var/www/DominicBE/.env
+ExecStart=/var/www/DominicBE/.venv/bin/gunicorn app.main:app --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --workers 1 --timeout 120 --access-logfile - --error-logfile - --log-level info
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
