@@ -131,11 +131,11 @@ def _raise_provider_error(exc: Exception):
         provider_message = _extract_provider_message(exc)
 
         if status_code == 401:
-            detail = "Anthropic API key khong hop le hoac chua duoc cap quyen. Kiem tra bien moi truong ANTHROPIC_API_KEY tren Azure App Service."
+            detail = "Anthropic API key khong hop le hoac chua duoc cap quyen. Kiem tra bien moi truong ANTHROPIC_API_KEY tren server/backend deployment hien tai."
         elif status_code == 403:
             detail = (
                 f"Anthropic tu choi request cho model '{model}'. "
-                "Neu key/model nay goi duoc tren may local nhung fail tren Azure App Service, kha nang cao la Anthropic dang chan theo region/egress IP cua Azure (vi du East Asia) hoac request phai di qua proxy/base URL khac. "
+                "Neu key/model nay goi duoc tren may local nhung fail tren server, kha nang cao la key khac nhau, region/egress IP bi chan, hoac request phai di qua proxy/base URL khac. "
                 "Kiem tra billing/quyen truy cap model, thu model khac, hoac cau hinh ANTHROPIC_BASE_URL neu ban co AI gateway/proxy. "
                 f"Provider message: {provider_message}"
             )
