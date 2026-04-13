@@ -26,6 +26,18 @@ class ProviderRequestError(Exception):
         self.detail = detail
 
 
+def _format_exception_chain(exc: BaseException | None) -> str:
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).strip() or repr(current)
+        parts.append(f"{current.__class__.__name__}: {message}")
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)
+
+
 # Lazy-initialised so that a missing API key does NOT crash the app at import time.
 # Also re-initialised when the API key env-var changes (e.g. after updating Azure App Settings).
 _client: Anthropic | None = None
@@ -111,7 +123,7 @@ def _raise_provider_error(exc: Exception):
     if isinstance(exc, APIConnectionError):
         raise ProviderRequestError(
             503,
-            "Khong the ket noi toi nha cung cap AI (Anthropic). Kiem tra outbound network, DNS, firewall, va API key.",
+            "Khong the ket noi toi nha cung cap AI (Anthropic). Kiem tra outbound network, DNS, firewall. Neu EC2/Ubuntu co IPv6 loi nhung IPv4 van ok, hay dat ANTHROPIC_FORCE_IPV4=true trong .env va restart backend.",
         ) from exc
 
     if isinstance(exc, APIStatusError):
@@ -468,7 +480,16 @@ def handle_chat(db: Session, username: str, session_id: int, user_message: str):
         }
 
     except (APIConnectionError, APIStatusError) as e:
-        logger.warning("Anthropic request failed for username=%s session_id=%s: %s", username, session_id, e)
+        logger.warning(
+            "Anthropic request failed for username=%s session_id=%s model=%s base_url=%s force_ipv4=%s chain=%s",
+            username,
+            session_id,
+            _get_model(),
+            _get_effective_base_url(),
+            _should_force_ipv4(),
+            _format_exception_chain(e),
+            exc_info=True,
+        )
         provider_error = None
         try:
             _raise_provider_error(e)

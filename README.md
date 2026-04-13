@@ -46,6 +46,7 @@ The project has been adjusted so it is less Azure-specific and more suitable for
   - builds DB URL safely even if password contains special characters
 - `app/services/chat_service.py`
   - deployment messages are generic instead of Azure-only
+  - supports `ANTHROPIC_FORCE_IPV4=true` for EC2 environments where IPv6 resolution exists but outbound IPv6 connectivity is broken
 - `startup.sh`
   - now supports `HOST`, `PORT`, `WEB_CONCURRENCY`
 - `.env.example`
@@ -223,6 +224,7 @@ Paste/edit values like this:
 ANTHROPIC_API_KEY=your_real_anthropic_key
 ANTHROPIC_MODEL=claude-3-5-haiku-latest
 ANTHROPIC_BASE_URL=
+ANTHROPIC_FORCE_IPV4=true
 
 DB_HOST=127.0.0.1
 DB_PORT=3306
@@ -262,6 +264,22 @@ Do not add path suffixes like `/api`.
 Only origin, for example:
 - correct: `https://example.com`
 - wrong: `https://example.com/api/chat`
+
+### If Anthropic fails on EC2 with connection errors
+
+If these are true:
+
+- `curl -4 -I https://api.anthropic.com` works
+- `curl -6 -I https://api.anthropic.com` fails
+- backend logs show `APIConnectionError` / `Connection error`
+
+then keep this in `.env`:
+
+```dotenv
+ANTHROPIC_FORCE_IPV4=true
+```
+
+This project supports forcing the Anthropic SDK onto IPv4 to avoid broken IPv6 egress on some EC2 environments.
 
 ---
 
@@ -528,6 +546,25 @@ If login works but sending prompt fails, inspect:
 - `sudo journalctl -u dominic -f`
 - Anthropic key/model
 - outbound network from EC2
+
+### 18.7 Direct Anthropic diagnostic on EC2
+
+Run the built-in diagnostic script with the same `.env` used by systemd:
+
+```bash
+cd /var/www/DominicBE
+source .venv/bin/activate
+python scripts/test_anthropic_connection.py
+```
+
+This prints:
+
+- whether the API key is loaded
+- effective model/base URL
+- whether `ANTHROPIC_FORCE_IPV4` is enabled
+- `count_tokens` result
+- `messages.create` result
+- the full exception chain if the SDK still fails
 
 ---
 
