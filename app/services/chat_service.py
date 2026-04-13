@@ -2,7 +2,7 @@ import logging
 import os
 from uuid import uuid4
 
-from anthropic import APIConnectionError, APIStatusError, Anthropic
+from anthropic import APIConnectionError, APIStatusError, Anthropic, DefaultHttpxClient
 import httpx
 from sqlalchemy.orm import Session
 
@@ -39,6 +39,10 @@ def _get_base_url() -> str | None:
     return base_url or None
 
 
+def _get_effective_base_url() -> str:
+    return _get_base_url() or "https://api.anthropic.com"
+
+
 def _should_force_ipv4() -> bool:
     raw = (os.getenv("ANTHROPIC_FORCE_IPV4") or "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
@@ -48,6 +52,7 @@ def _get_client() -> Anthropic:
     global _client, _client_key, _client_base_url, _client_force_ipv4
     api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
     base_url = _get_base_url()
+    effective_base_url = _get_effective_base_url()
     force_ipv4 = _should_force_ipv4()
     if not api_key:
         raise RuntimeError(
@@ -64,8 +69,9 @@ def _get_client() -> Anthropic:
         if base_url:
             client_kwargs["base_url"] = base_url
         if force_ipv4:
-            client_kwargs["http_client"] = httpx.Client(
-                transport=httpx.HTTPTransport(local_address="0.0.0.0")
+            client_kwargs["http_client"] = DefaultHttpxClient(
+                base_url=effective_base_url,
+                transport=httpx.HTTPTransport(local_address="0.0.0.0"),
             )
         _client = Anthropic(**client_kwargs)
         _client_key = api_key
