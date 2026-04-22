@@ -1,5 +1,13 @@
 from sqlalchemy.orm import Session
+from secrets import compare_digest
 from app.models.chat_models import Message, User, ChatSummary, ChatSession
+from app.core.security import (
+    hash_password,
+    normalize_password,
+    normalize_username,
+    password_hash_needs_update,
+    verify_password,
+)
 from uuid import uuid4
 from datetime import datetime
 from datetime import timedelta
@@ -153,7 +161,31 @@ def upsert_chat_summary(db: Session, username: str, session_id: int, summary_tex
 
 
 def get_user_by_username(db: Session, username: str):
-    return db.query(User).filter(User.username == username).first()
+    normalized_username = normalize_username(username)
+    if not normalized_username:
+        return None
+    return db.query(User).filter(User.username == normalized_username).first()
+
+
+def create_user(db: Session, username: str, password: str, max_tokens_per_day: int = 10000):
+    normalized_username = normalize_username(username)
+    if not normalized_username:
+        raise ValueError("Username must not be empty.")
+
+    existing = get_user_by_username(db, normalized_username)
+    if existing:
+        raise ValueError("Username already exists.")
+
+    user = User(
+        username=normalized_username,
+        password=None,
+        password_hash=hash_password(password, enforce_policy=True),
+        max_tokens_per_day=max_tokens_per_day,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
 
 
 def reset_user_tokens_if_needed(db: Session, user: User, reset_interval_hours: int = 2):
@@ -193,14 +225,37 @@ def get_rolling_token_usage(db: Session, username: str, window_hours: int = 2):
 
 
 def verify_user_credentials(db: Session, username: str, password: str):
-    user = db.query(User).filter(User.username == username).first()
+    normalized_username = normalize_username(username)
+    if not normalized_username:
+        return None
+
+    user = db.query(User).filter(User.username == normalized_username).first()
     if not user:
         return None
-    # Current project stores plaintext passwords; keep compatible for now.
-    if user.password != password:
-        return None
-    return user
 
+    normalized_password = normalize_password(password)
+    if not normalized_password:
+        return None
+
+    stored_hash = (user.password_hash or "").strip()
+    legacy_password = normalize_password(user.password)
+
+    if stored_hash and verify_password(normalized_password, stored_hash):
+        if password_hash_needs_update(stored_hash) or user.password:
+            user.password_hash = hash_password(normalized_password)
+            user.password = None
+            db.commit()
+            db.refresh(user)
+        return user
+
+    if legacy_password and compare_digest(legacy_password, normalized_password):
+        user.password_hash = hash_password(normalized_password)
+        user.password = None
+        db.commit()
+        db.refresh(user)
+        return user
+
+    return None
 
 def get_user_usage(db: Session, username: str):
     user = db.query(User).filter(User.username == username).first()

@@ -1,41 +1,34 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-import os
-from pathlib import Path
-from urllib.parse import quote_plus
-from dotenv import load_dotenv
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Always resolve .env from project root: <repo>/.env
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ENV_PATH = PROJECT_ROOT / ".env"
-load_dotenv(dotenv_path=ENV_PATH)
-
-DB_USER = os.getenv("DB_USER", "dominic")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_PORT = os.getenv("DB_PORT", "3306")
-DB_NAME = os.getenv("DB_NAME", "chatbot_db")
-DB_SSL = os.getenv("DB_SSL", "")  # set to "true" on Azure
-
-# Sử dụng pymysql làm driver kết nối MySQL
-encoded_password = quote_plus(DB_PASSWORD)
-SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+from app.core.config import settings
 
 connect_args: dict = {
-    "connect_timeout": 10,   # fail fast (seconds) instead of hanging
-    "read_timeout": 30,
-    "write_timeout": 30,
+    "connect_timeout": settings.db_connect_timeout,
+    "read_timeout": settings.db_read_timeout,
+    "write_timeout": settings.db_write_timeout,
 }
-if DB_SSL.lower() in ("true", "1", "yes"):
-    connect_args["ssl"] = {"ssl_mode": "REQUIRED"}
+
+if settings.db_ssl:
+    ssl_config: dict = {}
+    if (settings.db_ssl_ca or "").strip():
+        ssl_config["ca"] = settings.db_ssl_ca.strip()
+    else:
+        ssl_config["ssl_mode"] = "REQUIRED"
+    connect_args["ssl"] = ssl_config
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL,
+    settings.sqlalchemy_database_url,
     pool_pre_ping=True,
-    pool_recycle=300,
-    pool_timeout=10,
+    pool_recycle=settings.db_pool_recycle,
+    pool_timeout=settings.db_pool_timeout,
     connect_args=connect_args,
 )
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+)
 
 Base = declarative_base()

@@ -1,16 +1,18 @@
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 import logging
-import os
 import sys
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+from sqlalchemy import text
 
-load_dotenv()
+from app.api.deps import get_current_user_optional
+from app.crud import crud_auth
+from app.api.endpoints import auth, chat, knowledge
+from app.core.config import settings
+from app.core.database import engine
 
-# Configure logging EARLY so we see startup messages
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -25,37 +27,8 @@ def _get_package_version(name: str) -> str:
     except PackageNotFoundError:
         return "(not installed)"
 
-# These imports may touch the DB engine / Anthropic – keep them AFTER load_dotenv()
-from app.api.endpoints import chat  # noqa: E402
-from app.core.database import engine, Base, SQLALCHEMY_DATABASE_URL  # noqa: E402
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("=== Dominic Backend starting (lifespan) ===")
-    logger.info("PORT env = %s", os.getenv("PORT", "(not set)"))
-    logger.info("WEBSITES_PORT env = %s", os.getenv("WEBSITES_PORT", "(not set)"))
-    logger.info("DB URL (masked): %s", _mask_db_url(SQLALCHEMY_DATABASE_URL))
-    logger.info("CORS_ORIGINS env = %s", os.getenv("CORS_ORIGINS", "(not set)"))
-    logger.info("anthropic package version = %s", _get_package_version("anthropic"))
-    logger.info("ANTHROPIC_API_KEY set = %s", bool(os.getenv("ANTHROPIC_API_KEY")))
-    logger.info("ANTHROPIC_MODEL = %s", os.getenv("ANTHROPIC_MODEL", "(not set)"))
-    logger.info("ANTHROPIC_BASE_URL = %s", os.getenv("ANTHROPIC_BASE_URL", "(default)"))
-    logger.info("ANTHROPIC_FORCE_IPV4 = %s", os.getenv("ANTHROPIC_FORCE_IPV4", "(not set)"))
-
-    # Startup: try to create tables, but don't crash if DB is unreachable yet
-    try:
-        Base.metadata.create_all(bind=engine)
-        logger.info("Database tables verified/created successfully.")
-    except Exception as exc:
-        logger.warning("Could not connect to DB on startup (app will still start): %s", exc)
-    logger.info("=== Dominic Backend ready ===")
-    yield
-    logger.info("=== Dominic Backend shutting down ===")
-
 
 def _mask_db_url(url: str) -> str:
-    """Hide password in DB URL for safe logging."""
     try:
         at = url.index("@")
         colon = url.index("://") + 3
@@ -65,19 +38,48 @@ def _mask_db_url(url: str) -> str:
         return "(could not parse)"
 
 
-app = FastAPI(title="Dominic Backend", lifespan=lifespan)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("=== %s starting ===", settings.app_name)
+    logger.info("ENVIRONMENT = %s", settings.environment)
+    logger.info("PORT = %s", settings.port)
+    logger.info("DB URL (masked) = %s", _mask_db_url(settings.sqlalchemy_database_url))
+    logger.info("CORS_ORIGINS = %s", settings.cors_origins)
+    logger.info(
+        "AUTH_ACCESS_TOKEN_EXPIRE_MINUTES = %s",
+        settings.auth_access_token_expire_minutes,
+    )
+    logger.info("anthropic package version = %s", _get_package_version("anthropic"))
+    logger.info("ANTHROPIC_API_KEY set = %s", bool(settings.anthropic_api_key))
+    logger.info("ANTHROPIC_MODEL = %s", settings.anthropic_model)
+    logger.info("ANTHROPIC_BASE_URL = %s", settings.anthropic_base_url or "(default)")
+    logger.info("ANTHROPIC_FORCE_IPV4 = %s", settings.anthropic_force_ipv4)
+    if settings.auth_secret_key == "change-this-in-production":
+        logger.warning(
+            "AUTH_SECRET_KEY is using the default value. Set a strong secret in non-local environments."
+        )
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        logger.info("Database connectivity check passed.")
+    except Exception as exc:
+        logger.warning("Database connectivity check failed: %s", exc)
+
+    logger.info("=== %s ready ===", settings.app_name)
+    yield
+    logger.info("=== %s shutting down ===", settings.app_name)
 
 
-def _parse_origins() -> list[str]:
-    raw = os.getenv("CORS_ORIGINS", "")
-    origins = [x.strip().rstrip("/") for x in raw.split(",") if x.strip()]
-    # fallback local (common Vite ports)
-    return origins or ["http://localhost:5173", "http://127.0.0.1:5173"]
-
+app = FastAPI(
+    title=settings.app_name,
+    debug=settings.debug,
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_parse_origins(),
+    allow_origins=settings.cors_origins,
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://.*\.azurestaticapps\.net$",
     allow_credentials=True,
     allow_methods=["*"],
@@ -87,7 +89,7 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"service": "Dominic Backend", "status": "running"}
+    return {"service": settings.app_name, "status": "running"}
 
 
 @app.get("/health")
@@ -95,28 +97,35 @@ def health():
     return {"ok": True}
 
 
-@app.get("/debug/env")
-def debug_env():
-    """Temporary endpoint to verify env-var visibility on Azure.  Remove after debugging."""
-    raw_key = os.getenv("ANTHROPIC_API_KEY", "")
+@app.get("/debug/env", include_in_schema=False)
+def debug_env(current_user=Depends(get_current_user_optional)):
+    if not settings.enable_debug_env:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+
+    if not crud_auth.is_effective_admin_username(getattr(current_user, "username", None)):
+        raise HTTPException(status_code=403, detail="Admin privileges required.")
+
     return {
-        "CORS_ORIGINS": os.getenv("CORS_ORIGINS", "(not set)"),
-        "DB_HOST": os.getenv("DB_HOST", "(not set)"),
-        "DB_PORT": os.getenv("DB_PORT", "(not set)"),
-        "DB_NAME": os.getenv("DB_NAME", "(not set)"),
-        "DB_USER": os.getenv("DB_USER", "(not set)"),
-        "DB_PASSWORD_SET": bool(os.getenv("DB_PASSWORD")),
-        "ANTHROPIC_API_KEY_SET": bool(raw_key),
-        # Show enough of the key to confirm it matches what you expect, without full exposure.
-        "ANTHROPIC_API_KEY_PREFIX": (raw_key[:16] + "...") if len(raw_key) >= 16 else ("(too short or empty)"),
-        "ANTHROPIC_MODEL": os.getenv("ANTHROPIC_MODEL", "(not set)"),
-        "ANTHROPIC_BASE_URL": os.getenv("ANTHROPIC_BASE_URL", "(default)"),
-        "ANTHROPIC_FORCE_IPV4": os.getenv("ANTHROPIC_FORCE_IPV4", "(not set)"),
-        "PORT": os.getenv("PORT", "(not set)"),
-        "WEBSITE_HOSTNAME": os.getenv("WEBSITE_HOSTNAME", "(not set)"),
-        "db_url_masked": _mask_db_url(SQLALCHEMY_DATABASE_URL),
-        "allowed_origins": _parse_origins(),
+        "app_name": settings.app_name,
+        "environment": settings.environment,
+        "debug": settings.debug,
+        "cors_origins": settings.cors_origins,
+        "db_host": settings.db_host,
+        "db_port": settings.db_port,
+        "db_name": settings.db_name,
+        "db_user": settings.db_user,
+        "db_password_set": bool(settings.db_password),
+        "anthropic_api_key_set": bool(settings.anthropic_api_key),
+        "anthropic_model": settings.anthropic_model,
+        "anthropic_base_url": settings.anthropic_base_url or "(default)",
+        "anthropic_force_ipv4": settings.anthropic_force_ipv4,
+        "db_url_masked": _mask_db_url(settings.sqlalchemy_database_url),
     }
 
 
+app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
 app.include_router(chat.router, prefix="/api/chat", tags=["Chat"])
+app.include_router(knowledge.router, prefix="/api/knowledge", tags=["Knowledge"])

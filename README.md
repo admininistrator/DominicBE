@@ -221,6 +221,17 @@ nano .env
 Paste/edit values like this:
 
 ```dotenv
+APP_NAME=Dominic Backend
+ENVIRONMENT=prod
+DEBUG=false
+ENABLE_DEBUG_ENV=false
+
+AUTH_SECRET_KEY=replace_with_a_long_random_secret
+AUTH_ALGORITHM=HS256
+AUTH_ACCESS_TOKEN_EXPIRE_MINUTES=10080
+AUTH_PASSWORD_MIN_LENGTH=8
+AUTH_PASSWORD_MAX_LENGTH=64
+
 ANTHROPIC_API_KEY=your_real_anthropic_key
 ANTHROPIC_MODEL=claude-3-5-haiku-latest
 ANTHROPIC_BASE_URL=
@@ -243,8 +254,14 @@ MAX_OUTPUT_TOKENS=5000
 HOST=0.0.0.0
 PORT=8000
 WEB_CONCURRENCY=1
-ENABLE_DEBUG_ENV=false
 ```
+
+### Auth settings note
+
+- `AUTH_SECRET_KEY` must be changed in every non-local environment
+- the current Phase 1 login flow uses bearer tokens signed by `AUTH_SECRET_KEY`
+- frontend currently stores the access token in browser `localStorage`
+- if you rotate `AUTH_SECRET_KEY`, all existing browser sessions will need to log in again
 
 ### What to enter in `CORS_ORIGINS`
 
@@ -475,7 +492,17 @@ If you use a preview/staging frontend URL too, add both origins separated by com
 ## 17. How to seed a test user in MySQL
 
 Your current backend expects users to exist in the `users` table.
-Passwords are currently compared as plain text in this project.
+Passwords should now be stored in `password_hash` using bcrypt.
+
+Generate a bcrypt hash from the backend environment first:
+
+```bash
+cd /var/www/DominicBE
+source .venv/bin/activate
+python -c "from app.core.security import hash_password; print(hash_password('ChangeMe123!'))"
+```
+
+Copy the printed hash, then open MySQL:
 
 Open MySQL:
 
@@ -487,17 +514,39 @@ Then:
 
 ```sql
 USE chatbot_db;
-INSERT INTO users (username, password, max_tokens_per_day)
-VALUES ('test_user', '123456', 10000);
+INSERT INTO users (username, password_hash, max_tokens_per_day)
+VALUES ('test_user', '$2b$12$REPLACE_WITH_GENERATED_HASH', 10000);
 ```
 
 If the user already exists:
 
 ```sql
 UPDATE users
-SET password = '123456'
+SET password_hash = '$2b$12$REPLACE_WITH_GENERATED_HASH',
+    password = NULL
 WHERE username = 'test_user';
 ```
+
+Note:
+- legacy rows that still have plaintext in `password` can log in once and will be auto-upgraded to `password_hash`
+- do not manually paste plaintext passwords into `password_hash`
+- avoid leading/trailing spaces in user passwords because the backend normalizes them before hashing and verification
+- newly registered passwords are validated with a minimum security policy: at least 8 characters, and should include lowercase, uppercase, digit, and special character
+
+### Alternative: create an account through the API
+
+Instead of inserting directly into MySQL, you can create a user through the backend:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"phase1_user","password":"StrongPass1!","confirm_password":"StrongPass1!"}'
+```
+
+Successful responses return:
+- `username`
+- `access_token`
+- `token_type=bearer`
 
 ---
 
@@ -538,7 +587,7 @@ sudo tail -f /var/log/nginx/error.log
 
 ### 18.6 Browser test
 - open frontend
-- login
+- register a new account or login with an existing account
 - create session
 - send a prompt
 
@@ -547,7 +596,62 @@ If login works but sending prompt fails, inspect:
 - Anthropic key/model
 - outbound network from EC2
 
-### 18.7 Direct Anthropic diagnostic on EC2
+### 18.7 Auth smoke test
+
+Run the built-in authentication smoke test:
+
+```bash
+cd /var/www/DominicBE
+source .venv/bin/activate
+python scripts/auth_smoke_test.py
+```
+
+Expected:
+
+```text
+AUTH_API_SMOKE_OK
+```
+
+### 18.8 Direct token check
+
+After login or register, call `/api/auth/me` using the returned bearer token:
+
+```bash
+curl http://127.0.0.1:8000/api/auth/me \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+```
+
+Expected:
+
+```json
+{"username":"phase1_user","role":"user"}
+```
+
+### 18.9 Knowledge ingestion + retrieval smoke test
+
+Run the built-in knowledge pipeline smoke test:
+
+```bash
+cd /var/www/DominicBE
+source .venv/bin/activate
+python scripts/knowledge_smoke_test.py
+```
+
+Expected:
+
+```text
+KNOWLEDGE_API_SMOKE_OK
+```
+
+This validates the current Phase 2 MVP:
+
+- ingest raw text into `knowledge_documents`
+- upload supported files through `/api/knowledge/upload`
+- chunking + local embedding metadata + `vector_id`
+- searchable chunks through `/api/knowledge/search`
+- document job history and reindex flow
+
+### 18.10 Direct Anthropic diagnostic on EC2
 
 Run the built-in diagnostic script with the same `.env` used by systemd:
 

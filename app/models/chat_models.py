@@ -7,7 +7,10 @@ class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     username = Column(String(255), unique=True, nullable=False)
-    password = Column(String(255), nullable=False)
+    password_hash = Column(String(255), nullable=True)
+    role = Column(String(50), nullable=False, server_default="user")  # "user" | "admin"
+    reset_token = Column(String(255), nullable=True)
+    reset_token_expires_at = Column(DateTime, nullable=True)
     max_tokens_per_day = Column(Integer, default=10000)
     total_token_used = Column(Integer, default=0)
     total_input_tokens_used = Column(Integer, default=0)
@@ -15,21 +18,6 @@ class User(Base):
     last_token_reset_at = Column(DateTime, server_default=func.now())
     created_at = Column(DateTime, server_default=func.now())
 
-
-class Conversation(Base):
-    __tablename__ = "conversations"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    title = Column(String(255), nullable=False)
-    created_at = Column(DateTime, server_default=func.now())
-    last_message_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
-
-class ConversationMember(Base):
-    __tablename__ = "conversation_members"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    joined_at = Column(DateTime, server_default=func.now())
 
 class Message(Base):
     __tablename__ = "messages"
@@ -63,5 +51,4 @@ class ChatSession(Base):
     title = Column(String(255), nullable=False, default="New chat")
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
-
 

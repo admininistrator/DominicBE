@@ -1,0 +1,44 @@
+[
+  {
+    "id": "grounded_scoped_refund",
+    "document_title": "Refund FAQ",
+    "document_text": "Refund policy requests are reviewed within 5 business days. Customers must submit evidence through the support portal.",
+    "message": "Chính sách hoàn tiền xử lý trong bao lâu?",
+    "use_scope": true,
+    "expected_answer_policy": "grounded",
+    "expected_sources_min": 1,
+    "expected_reply_contains": "5 ngày"
+  },
+  {
+    "id": "insufficient_scoped_unrelated",
+    "document_title": "Refund FAQ",
+    "document_text": "Refund policy requests are reviewed within 5 business days. Customers must submit evidence through the support portal.",
+    "message": "Bảo hành thiết bị trong bao lâu?",
+    "use_scope": true,
+    "expected_answer_policy": "insufficient_evidence",
+    "expected_sources_min": 0,
+    "expected_reply_contains": "chưa có đủ bằng chứng"
+  },
+  {
+    "id": "cautious_unscoped_partial",
+    "document_title": "General FAQ",
+    "document_text": "Refund portal workflow is available for evidence uploads.",
+    "message": "Quy trình hoàn tiền như thế nào?",
+    "use_scope": false,
+    "expected_answer_policy": "cautious_general",
+    "expected_sources_min": 0,
+    "expected_reply_contains": "chưa thể khẳng định chắc chắn"
+  },
+  {
+    "id": "insufficient_unscoped_none",
+    "document_title": "General FAQ",
+    "document_text": "Users can update profile settings and change passwords in the account page.",
+    "message": "Chính sách hoàn tiền xử lý trong bao lâu?",
+    "use_scope": false,
+    "expected_answer_policy": "insufficient_evidence",
+    "expected_sources_min": 0,
+    "expected_reply_contains": "chưa có đủ bằng chứng"
+  }
+]
+
+
