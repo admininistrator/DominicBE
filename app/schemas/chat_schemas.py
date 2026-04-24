@@ -88,6 +88,10 @@ class SessionCreateRequest(BaseModel):
     title: Optional[str] = None
 
 
+class SessionRenameRequest(BaseModel):
+    title: str
+
+
 class SessionResponse(BaseModel):
     id: int
     username: str
@@ -100,6 +104,7 @@ class SessionMessageResponse(BaseModel):
     id: int
     role: str
     content: str
+    images: list[str] = Field(default_factory=list)
     input_tokens: int
     output_tokens: int
     created_at: datetime

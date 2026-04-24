@@ -1,4 +1,5 @@
 import logging
+import json
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -47,6 +48,17 @@ def _format_exception_chain(exc: BaseException | None) -> str:
 def _get_model() -> str:
     """Return the resolved LiteLLM model string (for logging)."""
     return llm_provider.resolve_model()
+
+
+def _load_message_images(payload: str | None) -> list[str]:
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except Exception:
+        logger.warning("Failed to decode message image payload.", exc_info=True)
+        return []
+    return [item for item in data if isinstance(item, str) and item]
 
 
 def get_usage(db: Session, username: str):
@@ -105,6 +117,21 @@ def get_sessions(db: Session, username: str):
     ]
 
 
+def delete_session(db: Session, username: str, session_id: int) -> bool:
+    session = crud_chat.get_chat_session(db, username, session_id)
+    if not session:
+        raise ValueError("Session not found.")
+    return crud_chat.delete_chat_session(db, username, session_id)
+
+
+def rename_session(db: Session, username: str, session_id: int, title: str) -> dict:
+    session = crud_chat.get_chat_session(db, username, session_id)
+    if not session:
+        raise ValueError("Session not found.")
+    row = crud_chat.rename_chat_session(db, username, session_id, title)
+    return {"id": row.id, "username": row.username, "title": row.title, "created_at": row.created_at, "updated_at": row.updated_at}
+
+
 def get_session_history(db: Session, username: str, session_id: int):
     session = crud_chat.get_chat_session(db, username, session_id)
     if not session:
@@ -118,6 +145,7 @@ def get_session_history(db: Session, username: str, session_id: int):
             "id": m.id,
             "role": m.role,
             "content": m.content,
+            "images": _load_message_images(m.__dict__.get("image_payload_json")),
             "input_tokens": int(m.input_tokens or 0),
             "output_tokens": int(m.output_tokens or 0),
             "created_at": m.created_at,
@@ -552,6 +580,7 @@ def handle_chat(
         session_id=session_id,
         content=user_message,
         request_id=request_id,
+        images=images or None,
         status="pending",
     )
 

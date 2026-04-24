@@ -27,6 +27,7 @@ class Message(Base):
     sender_username = Column(String(255), nullable=False, index=True)
     role = Column(Enum("user", "assistant"), nullable=False)
     content = Column(Text, nullable=False)
+    image_payload_json = Column(Text, nullable=True)
     input_tokens = Column(Integer, default=0)
     output_tokens = Column(Integer, default=0)
     status = Column(Enum("pending", "success", "error"), nullable=False, server_default="pending")

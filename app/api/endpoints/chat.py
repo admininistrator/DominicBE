@@ -6,6 +6,7 @@ from app.schemas.chat_schemas import (
     ChatRequest,
     ChatResponse,
     SessionCreateRequest,
+    SessionRenameRequest,
     SessionMessageResponse,
     SessionResponse,
     UsageResponse,
@@ -13,6 +14,8 @@ from app.schemas.chat_schemas import (
 from app.services.chat_service import (
     ProviderRequestError,
     create_session,
+    delete_session,
+    rename_session,
     get_session_history,
     get_sessions,
     get_usage,
@@ -113,6 +116,38 @@ def list_user_sessions(
         raise
     except ProviderRequestError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+def delete_chat_session(
+    session_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        deleted = delete_session(db, current_user.username, session_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Session not found.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/sessions/{session_id}", response_model=SessionResponse)
+def rename_chat_session(
+    session_id: int,
+    request: SessionRenameRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    try:
+        result = rename_session(db, current_user.username, session_id, request.title)
+        return SessionResponse(**result)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
