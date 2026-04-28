@@ -37,6 +37,7 @@ Backend FastAPI cho Dominic. Ở thời điểm hiện tại repo này đã có 
 - search knowledge qua `/api/knowledge/search`
 - chat response trả `reply`, `usage`, `request_id`, `sources`, `retrieval`
 - grounded chat theo tài liệu đã chọn, có fallback khi thiếu bằng chứng
+- có thể bật Tavily web search theo từng câu chat khi cấu hình `WEB_SEARCH_ENABLED=true` và `TAVILY_API_KEY` trong `.env`
 
 #### Phase 4 - Frontend RAG UX
 
@@ -88,7 +89,7 @@ Quy ước môi trường cho backend:
 - Trong VS Code, backend nên được chạy qua task hoặc script `scripts/dev_backend.ps1` để luôn khóa đúng interpreter
 
 1. Cài Docker Desktop và bảo đảm lệnh `docker compose` chạy được.
-2. Từ thư mục repo backend, copy `.env.local-rag.example` thành `.env` rồi điền `ANTHROPIC_API_KEY` thật.
+2. Từ thư mục repo backend, copy `.env.local-rag.example` thành `.env` rồi điền `ANTHROPIC_API_KEY` thật. Nếu muốn bật AI web search, điền thêm `TAVILY_API_KEY` và đổi `WEB_SEARCH_ENABLED=true`.
 3. Dựng hạ tầng local:
 
 ```powershell

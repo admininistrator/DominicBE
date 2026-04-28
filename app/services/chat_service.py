@@ -11,6 +11,7 @@ from app.crud import crud_knowledge
 from app.services.retrieval_service import search_knowledge
 from app.services import llm_provider
 from app.services.llm_provider import LLMError
+from app.services.tavily_service import TavilySearchError, search_web
 
 # Local aliases for readability (resolved from settings at module load)
 CONTEXT_WINDOW_SIZE = settings.context_window_size
@@ -92,6 +93,43 @@ def _load_message_documents(payload: str | None) -> list[dict]:
             }
         )
     return normalized_documents
+
+
+def _load_message_sources(payload: str | None) -> list[dict]:
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except Exception:
+        logger.warning("Failed to decode message source payload.", exc_info=True)
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    sources = data.get("sources") or []
+    normalized_sources: list[dict] = []
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+        raw_score = item.get("score")
+        normalized_sources.append(
+            {
+                "document_id": item.get("document_id"),
+                "chunk_id": item.get("chunk_id"),
+                "title": title,
+                "source_type": (item.get("source_type") or "web").strip() or "web",
+                "score": float(raw_score) if raw_score is not None else None,
+                "snippet": (item.get("snippet") or "").strip(),
+                "source_uri": item.get("source_uri"),
+                "rank": item.get("rank"),
+                "url": item.get("url"),
+                "domain": item.get("domain"),
+            }
+        )
+    return normalized_sources
 
 
 def get_usage(db: Session, username: str):
@@ -184,7 +222,11 @@ def get_session_history(db: Session, username: str, session_id: int):
             "output_tokens": int(m.output_tokens or 0),
             "created_at": m.created_at,
             "request_id": m.request_id,
-            "sources": citations_by_request.get(m.request_id, []) if m.role == "assistant" else [],
+            "sources": (
+                citations_by_request.get(m.request_id, []) + _load_message_sources(m.__dict__.get("image_payload_json"))
+                if m.role == "assistant"
+                else []
+            ),
             "retrieval": retrieval_by_request.get(m.request_id) if m.role == "assistant" else None,
         }
         for m in rows
@@ -200,10 +242,13 @@ def _build_citations_by_request(db: Session, request_ids: list[str]) -> dict[str
                 "document_id": citation.document_id,
                 "chunk_id": citation.chunk_id,
                 "title": document.title,
+                "source_type": "knowledge",
                 "score": float(citation.score) if citation.score is not None else None,
                 "snippet": citation.quoted_text or "",
                 "source_uri": document.source_uri,
                 "rank": citation.rank,
+                "url": None,
+                "domain": None,
             }
         )
     return grouped
@@ -233,6 +278,10 @@ def _build_retrieval_by_request(db: Session, request_ids: list[str]) -> dict[str
             "answer_policy": metadata.get("answer_policy"),
             "packed_count": int(metadata.get("packed_count") or 0),
             "packed_token_estimate": int(metadata.get("packed_token_estimate") or 0),
+            "web_search_used": bool(metadata.get("web_search_used")),
+            "web_results_count": int(metadata.get("web_results_count") or 0),
+            "web_search_query": metadata.get("web_search_query"),
+            "web_latency_ms": int(metadata.get("web_latency_ms") or 0),
         }
     return grouped
 
@@ -345,27 +394,65 @@ def _build_sources(results: list[dict]) -> list[dict]:
             "document_id": row["document_id"],
             "chunk_id": row["chunk_id"],
             "title": row["title"],
+            "source_type": "knowledge",
             "score": row.get("score"),
             "rerank_score": row.get("rerank_score"),
             "snippet": row.get("snippet") or "",
             "source_uri": row.get("source_uri"),
             "rank": index,
+            "url": None,
+            "domain": None,
         }
         for index, row in enumerate(results, start=1)
     ]
 
 
-def _build_knowledge_context(results: list[dict]) -> str:
+def _build_web_sources(results: list[dict], *, start_rank: int = 1) -> list[dict]:
+    return [
+        {
+            "document_id": None,
+            "chunk_id": None,
+            "title": row.get("title") or row.get("url") or f"Web source {index}",
+            "source_type": "web",
+            "score": row.get("score"),
+            "rerank_score": None,
+            "snippet": row.get("snippet") or "",
+            "source_uri": row.get("url"),
+            "rank": start_rank + index - 1,
+            "url": row.get("url"),
+            "domain": row.get("domain"),
+        }
+        for index, row in enumerate(results, start=1)
+    ]
+
+
+def _build_evidence_context(knowledge_results: list[dict], web_results: list[dict] | None = None) -> str:
     blocks: list[str] = []
-    for index, row in enumerate(results, start=1):
+    source_index = 1
+
+    for row in knowledge_results:
         blocks.append(
             "\n".join(
                 [
-                    f"[Source {index}] title={row['title']} document_id={row['document_id']} chunk_id={row['chunk_id']} score={float(row.get('score') or 0):.3f}",
+                    f"[Source {source_index}] type=knowledge title={row['title']} document_id={row['document_id']} chunk_id={row['chunk_id']} score={float(row.get('score') or 0):.3f}",
                     row.get("content") or row.get("snippet") or "",
                 ]
             )
         )
+
+        source_index += 1
+
+    for row in web_results or []:
+        blocks.append(
+            "\n".join(
+                [
+                    f"[Source {source_index}] type=web title={row.get('title') or row.get('url') or 'Web result'} url={row.get('url') or ''} domain={row.get('domain') or ''} score={float(row.get('score') or 0):.3f}",
+                    row.get("snippet") or "",
+                ]
+            )
+        )
+        source_index += 1
+
     return "\n\n".join(blocks)
 
 
@@ -395,8 +482,10 @@ def _compose_system_prompt(
     retrieval_result: dict | None,
     *,
     knowledge_document_id: int | None = None,
+    web_search_result: dict | None = None,
 ) -> str:
     retrieved_results = (retrieval_result or {}).get("packed_results") or (retrieval_result or {}).get("results") or []
+    web_results = (web_search_result or {}).get("results") or []
     evidence_strength = (retrieval_result or {}).get("evidence_strength") or "none"
     answer_policy = (retrieval_result or {}).get("answer_policy") or "grounded"
     fallback_used = bool((retrieval_result or {}).get("fallback_used"))
@@ -413,8 +502,13 @@ def _compose_system_prompt(
             + summary_text
         )
 
-    if retrieved_results:
-        sections.append("Knowledge-base evidence for this turn:\n" + _build_knowledge_context(retrieved_results))
+    if retrieved_results or web_results:
+        sections.append("Evidence for this turn:\n" + _build_evidence_context(retrieved_results, web_results))
+
+    if web_results:
+        sections.append(
+            "Web search evidence may be used for recent or external facts that are not covered by the uploaded knowledge base. When you rely on those results, prefer the cited sources over unsupported claims."
+        )
 
     if evidence_strength == "grounded":
         sections.append(
@@ -515,11 +609,17 @@ def _apply_answer_guardrails(
     sources: list[dict],
     *,
     knowledge_document_id: int | None = None,
+    web_search_result: dict | None = None,
 ) -> tuple[str, list[dict], str]:
     answer_policy = _determine_answer_policy(
         retrieval_result,
         knowledge_document_id=knowledge_document_id,
     )
+    web_results = (web_search_result or {}).get("results") or []
+
+    if web_results and knowledge_document_id is None:
+        web_policy = "grounded" if answer_policy == "grounded" else "web_grounded"
+        return ai_content, sources, web_policy
 
     if not settings.answer_guardrails_enabled:
         return ai_content, sources, answer_policy
@@ -558,6 +658,10 @@ def _build_retrieval_payload(retrieval_result: dict | None) -> dict | None:
         "answer_policy": retrieval_result.get("answer_policy"),
         "packed_count": int(retrieval_result.get("packed_count") or 0),
         "packed_token_estimate": int(retrieval_result.get("packed_token_estimate") or 0),
+        "web_search_used": bool(retrieval_result.get("web_search_used")),
+        "web_results_count": int(retrieval_result.get("web_results_count") or 0),
+        "web_search_query": retrieval_result.get("web_search_query"),
+        "web_latency_ms": int(retrieval_result.get("web_latency_ms") or 0),
     }
 
 
@@ -582,6 +686,7 @@ def handle_chat(
     session_id: int,
     user_message: str,
     knowledge_document_id: int | None = None,
+    use_web_search: bool = False,
     images: list[str] | None = None,
     image_media_types: list[str] | None = None,
 ):
@@ -651,6 +756,13 @@ def handle_chat(
         retrieval_result["packed_count"] = len(packed_results)
         retrieval_result["packed_token_estimate"] = packed_token_estimate
         retrieval_result["packed_results"] = packed_results
+        web_search_result = {"used": False, "query": None, "latency_ms": 0, "results": []}
+        if use_web_search:
+            web_search_result = search_web(user_message, max_results=settings.web_search_max_results)
+        retrieval_result["web_search_used"] = bool(web_search_result.get("used"))
+        retrieval_result["web_results_count"] = len(web_search_result.get("results") or [])
+        retrieval_result["web_search_query"] = web_search_result.get("query")
+        retrieval_result["web_latency_ms"] = int(web_search_result.get("latency_ms") or 0)
         retrieval_result["answer_policy"] = _determine_answer_policy(
             retrieval_result,
             knowledge_document_id=knowledge_document_id,
@@ -663,14 +775,24 @@ def handle_chat(
                     "packed_count": len(packed_results),
                     "packed_token_estimate": packed_token_estimate,
                     "answer_policy": retrieval_result["answer_policy"],
+                    "web_search_used": retrieval_result["web_search_used"],
+                    "web_results_count": retrieval_result["web_results_count"],
+                    "web_search_query": retrieval_result["web_search_query"],
+                    "web_latency_ms": retrieval_result["web_latency_ms"],
                 },
             )
 
-        sources = _build_sources(packed_results)
+        knowledge_sources = _build_sources(packed_results)
+        web_sources = _build_web_sources(
+            web_search_result.get("results") or [],
+            start_rank=len(knowledge_sources) + 1,
+        )
+        sources = [*knowledge_sources, *web_sources]
         system_prompt = _compose_system_prompt(
             summary_text,
             retrieval_result,
             knowledge_document_id=knowledge_document_id,
+            web_search_result=web_search_result,
         )
         request_messages = _build_request_messages(formatted_messages, user_message)
 
@@ -728,6 +850,7 @@ def handle_chat(
             retrieval_result,
             sources,
             knowledge_document_id=knowledge_document_id,
+            web_search_result=web_search_result,
         )
         retrieval_result["answer_policy"] = answer_policy
         if retrieval_result.get("retrieval_id"):
@@ -745,6 +868,8 @@ def handle_chat(
             error_message=None,
         )
 
+        persisted_web_sources = [source for source in sources if source.get("source_type") == "web"]
+
         crud_chat.create_message(
             db=db,
             role="assistant",
@@ -752,6 +877,7 @@ def handle_chat(
             session_id=session_id,
             content=ai_content,
             request_id=request_id,
+            sources=persisted_web_sources or None,
             input_tokens=0,
             output_tokens=out_tokens,
             status="success",
@@ -769,6 +895,7 @@ def handle_chat(
                     "quoted_text": source.get("snippet") or "",
                 }
                 for source in sources
+                if source.get("source_type") == "knowledge"
             ],
         )
 
@@ -797,6 +924,20 @@ def handle_chat(
             error_message=e.detail,
         )
         raise ProviderRequestError.from_llm_error(e) from e
+
+    except TavilySearchError as e:
+        logger.warning(
+            "Tavily search failed username=%s session_id=%s: %s",
+            username, session_id, e.detail,
+            exc_info=True,
+        )
+        crud_chat.update_message_tokens_and_status(
+            db=db,
+            message_id=user_msg.id,
+            status="error",
+            error_message=e.detail,
+        )
+        raise ProviderRequestError(e.status_code, e.detail) from e
 
     except Exception as e:
         crud_chat.update_message_tokens_and_status(

@@ -9,6 +9,7 @@ class ChatRequest(BaseModel):
     session_id: int
     message: str
     knowledge_document_id: int | None = Field(default=None, ge=1)
+    use_web_search: bool = False
     # Vision: list of base64-encoded image strings or data-URIs.
     # Only used when LLM_VISION_ENABLED=true and the model supports vision.
     images: list[str] = Field(default_factory=list)
@@ -25,14 +26,17 @@ class ChatRequest(BaseModel):
 
 
 class CitationSource(BaseModel):
-    document_id: int
-    chunk_id: int
+    document_id: int | None = None
+    chunk_id: int | None = None
     title: str
+    source_type: str = "knowledge"
     score: float | None = None
     rerank_score: float | None = None
     snippet: str
     source_uri: str | None = None
     rank: int | None = None
+    url: str | None = None
+    domain: str | None = None
 
 
 class RetrievalMetadata(BaseModel):
@@ -52,6 +56,10 @@ class RetrievalMetadata(BaseModel):
     answer_policy: str | None = None
     packed_count: int = 0
     packed_token_estimate: int = 0
+    web_search_used: bool = False
+    web_results_count: int = 0
+    web_search_query: str | None = None
+    web_latency_ms: int | None = None
 
 
 class TokenUsage(BaseModel):

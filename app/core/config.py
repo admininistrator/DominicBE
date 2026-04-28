@@ -238,6 +238,24 @@ class Settings(BaseSettings):
         ge=1,
         le=20,
     )
+    web_search_enabled: bool = Field(default=False, alias="WEB_SEARCH_ENABLED")
+    web_search_max_results: int = Field(default=5, alias="WEB_SEARCH_MAX_RESULTS", ge=1, le=10)
+    web_search_topic: Literal["general", "news"] = Field(
+        default="general",
+        alias="WEB_SEARCH_TOPIC",
+    )
+    tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
+    tavily_base_url: str = Field(default="https://api.tavily.com", alias="TAVILY_BASE_URL")
+    tavily_search_depth: Literal["basic", "advanced"] = Field(
+        default="advanced",
+        alias="TAVILY_SEARCH_DEPTH",
+    )
+    tavily_timeout_seconds: float = Field(
+        default=12.0,
+        alias="TAVILY_TIMEOUT_SECONDS",
+        ge=1.0,
+        le=60.0,
+    )
     chunk_size: int = Field(default=800, alias="CHUNK_SIZE", ge=100)
     chunk_overlap: int = Field(default=100, alias="CHUNK_OVERLAP", ge=0)
     knowledge_max_upload_size_mb: int = Field(

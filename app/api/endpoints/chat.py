@@ -204,6 +204,7 @@ def send_message(
             request.session_id,
             request.message,
             knowledge_document_id=request.knowledge_document_id,
+            use_web_search=request.use_web_search,
             images=request.images or None,
             image_media_types=request.image_media_types or None,
         )
