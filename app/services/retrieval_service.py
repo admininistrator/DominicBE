@@ -1,16 +1,23 @@
 """Knowledge retrieval service for Phase 2 searchable indexing."""
 from __future__ import annotations
 
+import logging
 import unicodedata
 import time
 from math import sqrt
 import re
+from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_knowledge
 from app.services.knowledge_service import compute_text_embedding
+from app.services import vector_store
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 QUERY_EXPANSION_RULES: dict[str, list[str]] = {
@@ -68,8 +75,8 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-def _extract_embedding(metadata_json: dict | None, fallback_text: str) -> list[float]:
-    embedding = (metadata_json or {}).get("embedding")
+def _extract_embedding(metadata_json: Any, fallback_text: str) -> list[float]:
+    embedding = ensure_json_mapping(metadata_json).get("embedding")
     if isinstance(embedding, list) and embedding:
         try:
             return [float(value) for value in embedding]
@@ -204,17 +211,66 @@ def search_knowledge(
     rewritten_query, query_expansions = _expand_query(normalized_query)
     query_embedding = compute_text_embedding(rewritten_query)
 
-    candidates = crud_knowledge.list_searchable_chunks(
-        db,
-        normalized_owner,
-        document_id=document_id,
-        indexed_only=True,
-    )
+    session_scope = "all"
+    if document_id is None and session_id is not None:
+        session_scope = (
+            "session"
+            if crud_knowledge.has_indexed_documents_for_session(db, normalized_owner, session_id)
+            else "global"
+        )
+
+    semantic_scores_by_chunk_id: dict[int, float] = {}
+    candidates = []
+
+    if vector_store.is_external_vector_store_enabled():
+        try:
+            vector_hits = vector_store.search_similar_chunks(
+                normalized_owner,
+                query_embedding,
+                top_k=max(effective_top_k, settings.retrieval_max_rerank_candidates),
+                document_id=document_id,
+                session_id=session_id,
+                session_scope=session_scope,
+            )
+            semantic_scores_by_chunk_id = {
+                int(hit["chunk_id"]): round(max(0.0, float(hit.get("score") or 0.0)), 6)
+                for hit in vector_hits
+            }
+            chunk_order = {
+                int(hit["chunk_id"]): index
+                for index, hit in enumerate(vector_hits)
+            }
+            candidates = crud_knowledge.list_searchable_chunks_by_ids(
+                db,
+                normalized_owner,
+                list(chunk_order.keys()),
+                document_id=document_id,
+                session_id=session_id,
+                session_scope=session_scope,
+                indexed_only=True,
+            )
+            candidates.sort(key=lambda row: chunk_order.get(int(row[0].id), len(chunk_order)))
+        except Exception as exc:
+            logger.warning("Qdrant retrieval failed, falling back to database search: %s", exc)
+            semantic_scores_by_chunk_id = {}
+
+    if not candidates:
+        candidates = crud_knowledge.list_searchable_chunks(
+            db,
+            normalized_owner,
+            document_id=document_id,
+            session_id=session_id,
+            session_scope=session_scope,
+            indexed_only=True,
+        )
 
     scored_results: list[dict] = []
     for chunk, document in candidates:
-        chunk_embedding = _extract_embedding(chunk.metadata_json, chunk.content)
-        semantic_score = round(max(0.0, _cosine_similarity(query_embedding, chunk_embedding)), 6)
+        if semantic_scores_by_chunk_id:
+            semantic_score = semantic_scores_by_chunk_id.get(int(chunk.id), 0.0)
+        else:
+            chunk_embedding = _extract_embedding(chunk.metadata_json, chunk.content)
+            semantic_score = round(max(0.0, _cosine_similarity(query_embedding, chunk_embedding)), 6)
         lexical_score = _lexical_overlap_score(rewritten_query, chunk.content)
         score = _hybrid_score(semantic_score, lexical_score)
         if score < settings.retrieval_min_score and lexical_score < settings.retrieval_min_lexical_score:
@@ -244,9 +300,21 @@ def search_knowledge(
     results = reranked_results[:effective_top_k]
 
     fallback_used = False
-    if not results and document_id is not None and candidates:
+    fallback_candidates_source = candidates
+    if not results and document_id is not None:
+        if not fallback_candidates_source:
+            fallback_candidates_source = crud_knowledge.list_searchable_chunks(
+                db,
+                normalized_owner,
+                document_id=document_id,
+                session_id=session_id,
+                session_scope=session_scope,
+                indexed_only=True,
+            )
+
+    if not results and document_id is not None and fallback_candidates_source:
         fallback_candidates: list[dict] = []
-        for chunk, document in candidates:
+        for chunk, document in fallback_candidates_source:
             fallback_candidates.append(
                 {
                     "document_id": document.id,
@@ -305,6 +373,7 @@ def search_knowledge(
             "evidence_strength": evidence_strength,
             "embedding_provider": settings.embedding_provider,
             "vector_store_provider": settings.vector_store_provider,
+            "session_scope": session_scope,
         },
     )
 
@@ -324,6 +393,7 @@ def search_knowledge(
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
         "evidence_strength": evidence_strength,
+        "session_scope": session_scope,
         "results": results,
     }
 

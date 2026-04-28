@@ -1,0 +1,31 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Backend: uvicorn (.venv)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\scripts\\dev_backend.ps1"
+      ],
+      "isBackground": true,
+      "problemMatcher": [],
+      "group": "build"
+    },
+    {
+      "label": "Backend: alembic upgrade (.venv)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "alembic",
+        "upgrade",
+        "head"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

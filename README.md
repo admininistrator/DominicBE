@@ -1,9 +1,213 @@
+# DominicBE
+
+Backend FastAPI cho Dominic. Ở thời điểm hiện tại repo này đã có knowledge ingestion, retrieval và grounded chat; `RAG_UPGRADE_PLAN.md` nên được xem là tài liệu kế hoạch lịch sử, không còn phản ánh đầy đủ trạng thái thực tế của code.
+
+## Trạng thái hiện tại (verified 2026-04-25)
+
+### Các kiểm tra đã chạy trong workspace này
+
+- `c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/auth_smoke_test.py` -> pass
+- `c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/knowledge_smoke_test.py` -> pass
+- `c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/rag_chat_smoke_test.py` -> pass
+- `c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/rag_eval_smoke_test.py` -> pass
+- `c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/test_image_processor.py` -> pass
+- `c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/test_ocr_injection.py` -> pass
+- session-scoped knowledge API check bằng `TestClient` + SQLite in-memory -> pass
+- frontend `npm run build` tại `Dominic/chatbot-ui` -> pass
+- frontend `npm run lint` tại `Dominic/chatbot-ui` -> fail (14 lỗi; lỗi đầu tiên là biến `activeSessionId` chưa dùng trong `src/components/ChatInput/ChatInput.jsx`)
+
+### Khả năng backend hiện có
+
+#### Phase 1 - Foundation hardening
+
+- auth với register, login, bearer token, `/api/auth/me`
+- password hashing, đổi mật khẩu, admin-issued reset token, public reset-password flow
+- quản lý chat session, thống kê usage theo rolling window, conversation summary memory
+- migration Alembic, debug endpoint bị khóa mặc định, phân quyền admin/user
+
+#### Phase 2 - Knowledge ingestion MVP
+
+- ingest text và upload file qua `/api/knowledge/documents/ingest` và `/api/knowledge/documents/upload`
+- tạo document, chunks, ingestion jobs, reindex, soft delete
+- trích xuất/chunk/index tài liệu và xem lại chunks/jobs qua API
+- knowledge document có thể gắn với `session_id` để dùng riêng cho một đoạn chat
+
+#### Phase 3 - Retrieval integration
+
+- search knowledge qua `/api/knowledge/search`
+- chat response trả `reply`, `usage`, `request_id`, `sources`, `retrieval`
+- grounded chat theo tài liệu đã chọn, có fallback khi thiếu bằng chứng
+
+#### Phase 4 - Frontend RAG UX
+
+- frontend build pass và đã có UI cho knowledge panel, source drawer, retrieval badge
+- knowledge có thể import trực tiếp từ ô chat và nhóm theo chat session / global document
+- chưa có browser E2E test trong repo; lint frontend hiện chưa sạch
+
+#### Phase 5 - RAG quality improvements
+
+- query expansion, hybrid lexical + semantic scoring, reranking, context packing
+- answer guardrails với các policy `grounded`, `cautious_general`, `insufficient_evidence`
+- khi evidence yếu, câu trả lời bị hạ mức chắc chắn hoặc trả về thông báo thiếu bằng chứng
+
+#### Phase 6 - Production readiness
+
+- retrieval analytics, audit logs, cost metrics endpoint, soft delete
+- admin hard delete đã dọn đồng bộ Postgres metadata, MinIO artifacts và Qdrant points
+- `/metrics` endpoint cho Prometheus-style HTTP metrics và `X-Request-ID` header cho request tracing cơ bản
+- async indexing qua FastAPI `BackgroundTasks`
+- background worker tách rời và live production deployment path chưa được xác thực trong lần rà soát này
+
+### Giới hạn hiện tại
+
+- embedding hiện là local/hash embedding cho MVP, chưa phải semantic embedding production-grade
+- backend hiện đã có abstraction cho `DATABASE_URL`, object storage và Qdrant, nhưng chưa được xác thực end-to-end với một cụm Postgres + MinIO/S3 + Qdrant thật trong workspace này
+- live provider connection với Anthropic/LiteLLM không được kiểm tra trong workspace này vì phụ thuộc API key/env thật
+- frontend chạy được và build được, nhưng vẫn còn debt lint/code cleanup
+
+### Ghi chú môi trường
+
+- để chạy được trên Python 3.13 với code hiện tại, `requirements.txt` cần `sqlalchemy>=2.0.38,<2.1`
+- với FastAPI/Starlette hiện có, `httpx` cần pin `>=0.27,<0.28` để `TestClient` hoạt động ổn định
+
+### Storage architecture đã sẵn sàng trong code
+
+- app DB có thể dùng `DATABASE_URL` tổng quát; nếu không set thì backend vẫn fallback về cấu hình MySQL cũ
+- object storage hỗ trợ `OBJECT_STORAGE_PROVIDER=local` mặc định và có thể chuyển sang `s3`/`minio` để lưu file gốc + normalized text snapshot
+- vector store hỗ trợ `VECTOR_STORE_PROVIDER=database` mặc định và có thể chuyển sang `qdrant` để retrieval top-k chạy qua vector DB thay vì quét chunks trong SQL
+- luồng mặc định hiện đã được re-validate sau thay đổi kiến trúc bằng `scripts/knowledge_smoke_test.py` và `scripts/rag_chat_smoke_test.py`
+
+### Cách chạy local với Postgres + MinIO + Qdrant
+
+Repo hiện có sẵn stack local mẫu tại `deploy/docker-compose.local-rag.yml` và file env mẫu tại `.env.local-rag.example`.
+
+Quy ước môi trường cho backend:
+
+- Chỉ dùng một Python env duy nhất của repo: `c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe`
+- Không dùng `DominicProject` hoặc gọi trần `uvicorn`, `alembic`, `pip` từ PATH toàn cục vì dễ lệch dependency với repo
+- Trong VS Code, backend nên được chạy qua task hoặc script `scripts/dev_backend.ps1` để luôn khóa đúng interpreter
+
+1. Cài Docker Desktop và bảo đảm lệnh `docker compose` chạy được.
+2. Từ thư mục repo backend, copy `.env.local-rag.example` thành `.env` rồi điền `ANTHROPIC_API_KEY` thật.
+3. Dựng hạ tầng local:
+
+```powershell
+docker compose -f deploy/docker-compose.local-rag.yml up -d
+```
+
+4. Kiểm tra các service đã lên:
+
+```powershell
+docker compose -f deploy/docker-compose.local-rag.yml ps
+```
+
+5. Chạy migration backend để tạo schema trong Postgres:
+
+```powershell
+c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe -m alembic upgrade head
+```
+
+6. Chạy backend:
+
+```powershell
+c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe -m uvicorn app.main:app --reload
+```
+
+7. Mốc kiểm tra sau khi lên local stack:
+  - Postgres: `127.0.0.1:5432`
+  - Qdrant API: `http://127.0.0.1:6333/dashboard`
+  - MinIO API: `http://127.0.0.1:9000`
+  - MinIO Console: `http://127.0.0.1:9001`
+8. Tài khoản mặc định của MinIO local mẫu:
+  - access key: `minioadmin`
+  - secret key: `minioadmin123`
+  - bucket: `dominic-knowledge`
+9. Sau khi backend chạy, hãy upload lại ít nhất một tài liệu để tài liệu đó được ghi vào Postgres metadata, MinIO artifact store và Qdrant collection.
+10. Nếu muốn dừng stack local:
+
+```powershell
+docker compose -f deploy/docker-compose.local-rag.yml down
+```
+
+Muốn xóa toàn bộ data local để làm sạch từ đầu:
+
+```powershell
+docker compose -f deploy/docker-compose.local-rag.yml down -v
+```
+
+### Migrate dữ liệu từ MySQL cũ sang Postgres mới
+
+Schema Postgres được tạo bởi Alembic, nhưng dữ liệu cũ từ MySQL phải được copy riêng bằng script one-off `scripts/migrate_mysql_to_postgres.py`.
+
+1. Điền URL MySQL cũ vào biến `SOURCE_DATABASE_URL`.
+2. Nếu muốn, điền `TARGET_DATABASE_URL`; nếu bỏ trống thì script sẽ dùng `DATABASE_URL` hiện tại của app.
+3. Chạy lệnh migrate:
+
+```powershell
+c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/migrate_mysql_to_postgres.py --truncate-target
+```
+
+4. Script sẽ copy các bảng theo thứ tự khóa ngoại: `users`, `chat_sessions`, `chat_summaries`, `messages`, `knowledge_documents`, `knowledge_chunks`, `ingestion_jobs`, `retrieval_events`, `answer_citations`, `audit_logs`.
+5. Sau khi copy xong, script sẽ tự reset sequence `id` trong Postgres để insert mới không bị đụng khóa chính cũ.
+
+### Backfill knowledge cũ sang MinIO + Qdrant
+
+Sau khi migrate relational data từ MySQL sang Postgres, các knowledge document cũ vẫn cần được backfill vào object storage và vector store để kiến trúc 3-storage chạy đầy đủ cho dữ liệu lịch sử.
+
+1. Đảm bảo `.env` đang dùng:
+  - `DATABASE_URL` trỏ Postgres mới
+  - `OBJECT_STORAGE_PROVIDER=minio` hoặc `s3`
+  - `VECTOR_STORE_PROVIDER=qdrant`
+2. Chạy script backfill:
+
+```powershell
+c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/backfill_three_storage.py
+```
+
+3. Script sẽ:
+  - ghi normalized text snapshot của document vào object storage
+  - ghi `source-status/unavailable.json` cho document legacy không còn source bytes gốc
+  - upsert lại vectors của chunks hiện có vào Qdrant mà không đổi `chunk_id`
+4. Nếu chỉ muốn xử lý một document:
+
+```powershell
+c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/backfill_three_storage.py --document-id 8
+```
+
+5. Nếu chỉ muốn xử lý theo owner:
+
+```powershell
+c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe scripts/backfill_three_storage.py --owner test_user
+```
+
+Ngoài script CLI, admin cũng có thể trigger cùng logic qua API:
+
+```http
+POST /api/knowledge/admin/backfill-three-storage
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{
+  "document_ids": [8],
+  "owner_username": null,
+  "limit": 10,
+  "write_object_artifacts": true,
+  "upsert_vectors": true,
+  "write_source_manifest": true,
+  "fail_fast": false
+}
+```
+
+Response trả về số document được chọn, số thành công/thất bại, tổng vector points đã upsert, và kết quả chi tiết theo từng document.
+
+---
+
 # DominicBE deployment guide (AWS EC2 - Singapore)
 
 This backend is a FastAPI app using:
 - FastAPI + Gunicorn/Uvicorn
 - MySQL
-- Anthropic API
+- LiteLLM provider layer (Anthropic mặc định)
 
 This guide is written for deploying to **AWS EC2 in Singapore (`ap-southeast-1`)**.
 It assumes:
@@ -316,6 +520,9 @@ If it starts correctly, open another SSH tab and test:
 ```bash
 curl http://127.0.0.1:8000/
 curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/health/postgres
+curl http://127.0.0.1:8000/health/minio
+curl http://127.0.0.1:8000/health/qdrant
 ```
 
 Expected:
@@ -327,8 +534,10 @@ Expected:
 and
 
 ```json
-{"ok":true}
+{"ok":true,"service":"Dominic Backend","dependencies":{"postgres":{"ok":true},"minio":{"ok":true},"qdrant":{"ok":true}}}
 ```
+
+Use the three dedicated routes when you need to isolate whether a deployment issue is coming from Postgres, MinIO, or Qdrant specifically.
 
 Press `Ctrl+C` to stop after confirming.
 
@@ -558,12 +767,18 @@ Run these checks in order.
 
 ```bash
 curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/health/postgres
+curl http://127.0.0.1:8000/health/minio
+curl http://127.0.0.1:8000/health/qdrant
 ```
 
 ### 18.2 Backend through Nginx
 
 ```bash
 curl http://YOUR_DOMAIN_OR_EC2_IP/health
+curl http://YOUR_DOMAIN_OR_EC2_IP/health/postgres
+curl http://YOUR_DOMAIN_OR_EC2_IP/health/minio
+curl http://YOUR_DOMAIN_OR_EC2_IP/health/qdrant
 ```
 
 ### 18.3 Database connectivity
@@ -780,12 +995,18 @@ On the server:
 
 ```bash
 curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/health/postgres
+curl http://127.0.0.1:8000/health/minio
+curl http://127.0.0.1:8000/health/qdrant
 ```
 
 If using Nginx publicly:
 
 ```bash
 curl http://YOUR_DOMAIN_OR_EC2_IP/health
+curl http://YOUR_DOMAIN_OR_EC2_IP/health/postgres
+curl http://YOUR_DOMAIN_OR_EC2_IP/health/minio
+curl http://YOUR_DOMAIN_OR_EC2_IP/health/qdrant
 ```
 
 If you changed only Python app code, normally you only need:

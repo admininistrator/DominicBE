@@ -2,16 +2,23 @@ from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 import logging
 import sys
+from time import perf_counter
+from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
+
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from app.api.deps import get_current_user_optional
 from app.crud import crud_auth
 from app.api.endpoints import auth, chat, knowledge
 from app.core.config import settings
-from app.core.database import engine
+from app.core.database import check_database_health, engine
+from app.services.object_storage import check_object_storage_health
+from app.services.vector_store import check_vector_store_health
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,6 +26,22 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("uvicorn.error")
+
+HTTP_REQUESTS_TOTAL = Counter(
+    "dominic_http_requests_total",
+    "Total HTTP requests handled by the backend.",
+    ["method", "path", "status_code"],
+)
+HTTP_REQUEST_LATENCY_SECONDS = Histogram(
+    "dominic_http_request_latency_seconds",
+    "HTTP request latency in seconds.",
+    ["method", "path"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+HTTP_REQUESTS_IN_PROGRESS = Gauge(
+    "dominic_http_requests_in_progress",
+    "Current in-flight HTTP requests.",
+)
 
 
 def _get_package_version(name: str) -> str:
@@ -87,6 +110,40 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    request.state.request_id = request_id
+    started_at = perf_counter()
+    status_code = 500
+    response: Response | None = None
+    route_path = request.url.path
+
+    HTTP_REQUESTS_IN_PROGRESS.inc()
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", route_path)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        HTTP_REQUESTS_IN_PROGRESS.dec()
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", route_path)
+        duration = perf_counter() - started_at
+        HTTP_REQUESTS_TOTAL.labels(request.method, route_path, str(status_code)).inc()
+        HTTP_REQUEST_LATENCY_SECONDS.labels(request.method, route_path).observe(duration)
+        logger.info(
+            "request completed request_id=%s method=%s path=%s status=%s duration_ms=%.2f",
+            request_id,
+            request.method,
+            route_path,
+            status_code,
+            duration * 1000,
+        )
+
+
 @app.get("/")
 def root():
     return {"service": settings.app_name, "status": "running"}
@@ -94,7 +151,41 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    checks = {
+        "postgres": check_database_health(),
+        "minio": check_object_storage_health(),
+        "qdrant": check_vector_store_health(),
+    }
+    payload = {
+        "ok": all(check.get("ok") for check in checks.values()),
+        "service": settings.app_name,
+        "dependencies": checks,
+    }
+    return _health_response(payload)
+
+
+def _health_response(payload: dict):
+    return JSONResponse(status_code=200 if payload.get("ok") else 503, content=payload)
+
+
+@app.get("/health/postgres")
+def health_postgres():
+    return _health_response(check_database_health())
+
+
+@app.get("/health/minio")
+def health_minio():
+    return _health_response(check_object_storage_health())
+
+
+@app.get("/health/qdrant")
+def health_qdrant():
+    return _health_response(check_vector_store_health())
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/debug/env", include_in_schema=False)

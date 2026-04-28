@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -42,6 +42,8 @@ class Settings(BaseSettings):
         default="http://localhost:5173,http://127.0.0.1:5173",
         alias="CORS_ORIGINS",
     )
+
+    database_url: str | None = Field(default=None, alias="DATABASE_URL")
 
     db_host: str = Field(default="127.0.0.1", alias="DB_HOST")
     db_port: int = Field(default=3306, alias="DB_PORT", ge=1, le=65535)
@@ -154,8 +156,17 @@ class Settings(BaseSettings):
 
     embedding_provider: str = Field(default="local", alias="EMBEDDING_PROVIDER")
     embedding_model: str = Field(default="local-hash-v1", alias="EMBEDDING_MODEL")
+    embedding_dimensions: int = Field(default=64, alias="EMBEDDING_DIMENSIONS", ge=1)
     vector_store_provider: str = Field(default="database", alias="VECTOR_STORE_PROVIDER")
     vector_store_url: str | None = Field(default=None, alias="VECTOR_STORE_URL")
+    vector_store_api_key: str | None = Field(default=None, alias="VECTOR_STORE_API_KEY")
+    vector_store_collection: str = Field(default="knowledge_chunks", alias="VECTOR_STORE_COLLECTION")
+    vector_store_timeout_seconds: float = Field(
+        default=10.0,
+        alias="VECTOR_STORE_TIMEOUT_SECONDS",
+        ge=0.1,
+    )
+    vector_store_prefer_grpc: bool = Field(default=False, alias="VECTOR_STORE_PREFER_GRPC")
     retrieval_top_k: int = Field(default=5, alias="RETRIEVAL_TOP_K", ge=1)
     retrieval_min_score: float = Field(default=0.15, alias="RETRIEVAL_MIN_SCORE", ge=0.0, le=1.0)
     retrieval_min_lexical_score: float = Field(
@@ -236,6 +247,18 @@ class Settings(BaseSettings):
         le=200,
     )
 
+    object_storage_provider: str = Field(default="local", alias="OBJECT_STORAGE_PROVIDER")
+    object_storage_bucket: str = Field(default="dominic-knowledge", alias="OBJECT_STORAGE_BUCKET")
+    object_storage_endpoint: str | None = Field(default=None, alias="OBJECT_STORAGE_ENDPOINT")
+    object_storage_access_key: str | None = Field(default=None, alias="OBJECT_STORAGE_ACCESS_KEY")
+    object_storage_secret_key: str | None = Field(default=None, alias="OBJECT_STORAGE_SECRET_KEY")
+    object_storage_region: str | None = Field(default=None, alias="OBJECT_STORAGE_REGION")
+    object_storage_secure: bool = Field(default=True, alias="OBJECT_STORAGE_SECURE")
+    object_storage_local_path: str = Field(
+        default=str(PROJECT_ROOT / ".storage"),
+        alias="OBJECT_STORAGE_LOCAL_PATH",
+    )
+
     # Phase 6: retry policy for background indexing
     ingestion_max_retries: int = Field(default=3, alias="INGESTION_MAX_RETRIES", ge=0, le=10)
     ingestion_retry_delay_seconds: float = Field(default=2.0, alias="INGESTION_RETRY_DELAY_SECONDS", ge=0.0)
@@ -267,12 +290,20 @@ class Settings(BaseSettings):
 
     @property
     def sqlalchemy_database_url(self) -> str:
+        if (self.database_url or "").strip():
+            return self.database_url.strip()
+
         encoded_password = quote_plus(self.db_password)
         return (
             f"mysql+pymysql://{self.db_user}:{encoded_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
             f"?charset={self.db_charset}"
         )
+
+    @property
+    def sqlalchemy_dialect_name(self) -> str:
+        parsed = urlparse(self.sqlalchemy_database_url)
+        return (parsed.scheme or "").split("+", 1)[0].lower()
 
 
 @lru_cache

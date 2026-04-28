@@ -5,6 +5,8 @@ Quy tắc lập trình cho DominicBE
 - Domain chính: Xử lí ngôn ngữ tự nhiên, RAG
 
 2. Quy tắc chung
+- Sử dụng duy nhất môi trường Python của repo: `.venv`
+- Khi chạy backend, migration, script smoke test hoặc debug, luôn gọi qua `.venv/Scripts/python.exe` trên Windows hoặc `.venv/bin/python` trên Linux
 - Code phải rõ ràng, dễ hiểu, dễ bảo trì
 - Tại mỗi phần, hãy chỉ ra dự án hiện tại đã làm được gì, chưa làm được gì, và cần làm gì tiếp theo
 - Tập trung vào việc hoàn thiện các tính năng cơ bản trước khi mở rộng thêm

@@ -1,5 +1,6 @@
 """Knowledge ingestion service – chunking, indexing skeleton for RAG."""
 import hashlib
+import json
 import logging
 import re
 import time
@@ -8,10 +9,13 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_knowledge
+from app.models.knowledge_models import KnowledgeDocument
+from app.services import object_storage, vector_store
 
 logger = logging.getLogger("uvicorn.error")
-LOCAL_EMBEDDING_DIMENSIONS = 64
+LOCAL_EMBEDDING_DIMENSIONS = settings.embedding_dimensions
 
 
 # ---------------------------------------------------------------------------
@@ -80,15 +84,18 @@ def prepare_chunks_for_indexing(document_id: int, checksum: str, chunks: list[di
 
     for chunk in chunks:
         content = chunk["content"]
+        embedding = compute_text_embedding(content)
         metadata_json = {
             **(chunk.get("metadata_json") or {}),
-            "embedding": compute_text_embedding(content),
             "index_provider": settings.vector_store_provider,
             "embedding_provider": settings.embedding_provider,
         }
+        if vector_store.should_store_embeddings_in_database():
+            metadata_json["embedding"] = embedding
         prepared.append(
             {
                 **chunk,
+                "embedding": embedding,
                 "embedding_model": embedding_model,
                 "vector_id": build_vector_id(document_id, chunk["chunk_index"], checksum),
                 "metadata_json": metadata_json,
@@ -537,8 +544,10 @@ def _execute_indexing(db: Session, doc_id: int, job_id: int) -> dict:
     )
 
     indexed_chunks = prepare_chunks_for_indexing(doc_id, checksum, chunks)
+    vector_store.delete_document_chunks(doc.owner_username, doc.id)
     crud_knowledge.delete_chunks_by_document(db, doc_id)
     chunk_rows = crud_knowledge.create_chunks_bulk(db, doc_id, indexed_chunks)
+    vector_store.upsert_document_chunks(doc, chunk_rows, indexed_chunks)
 
     logger.info(
         "Indexed doc=%s job=%s embedding_provider=%s model=%s vector_store=%s",
@@ -558,6 +567,52 @@ def _execute_indexing(db: Session, doc_id: int, job_id: int) -> dict:
     }
 
 
+def _merge_document_artifacts(existing_metadata: dict | None, new_artifacts: dict) -> dict:
+    normalized_metadata = ensure_json_mapping(existing_metadata)
+    existing_artifacts = ensure_json_mapping(normalized_metadata.get("artifacts")).copy()
+    existing_artifacts.update(new_artifacts)
+    return {**normalized_metadata, "artifacts": existing_artifacts}
+
+
+def _persist_document_artifacts(
+    db: Session,
+    doc,
+    normalized_text: str,
+    *,
+    source_bytes: bytes | None = None,
+    source_filename: str | None = None,
+    mime_type: str | None = None,
+) -> None:
+    if not object_storage.is_object_storage_enabled():
+        return
+
+    artifact_updates: dict = {}
+
+    if source_bytes:
+        source_artifact = object_storage.store_document_artifact(
+            owner_username=doc.owner_username,
+            document_id=doc.id,
+            artifact_kind="source",
+            artifact_name=source_filename or doc.title,
+            content=source_bytes,
+            content_type=mime_type,
+        )
+        artifact_updates["source"] = source_artifact
+
+    normalized_artifact = object_storage.store_document_artifact(
+        owner_username=doc.owner_username,
+        document_id=doc.id,
+        artifact_kind="normalized-text",
+        artifact_name=f"{doc.title}.txt",
+        content=normalized_text.encode("utf-8"),
+        content_type="text/plain; charset=utf-8",
+    )
+    artifact_updates["normalized_text"] = normalized_artifact
+
+    merged_metadata = _merge_document_artifacts(doc.metadata_json, artifact_updates)
+    crud_knowledge.update_document_metadata(db, doc.id, merged_metadata)
+
+
 # ---------------------------------------------------------------------------
 # Ingestion pipeline (synchronous for now, async/background later)
 # ---------------------------------------------------------------------------
@@ -571,6 +626,9 @@ def create_document_record(
     source_uri: Optional[str] = None,
     mime_type: Optional[str] = None,
     metadata: Optional[dict] = None,
+    session_id: Optional[int] = None,
+    source_bytes: bytes | None = None,
+    source_filename: str | None = None,
 ) -> dict:
     """Create document + job records synchronously and return IDs immediately.
 
@@ -609,7 +667,28 @@ def create_document_record(
         raw_text=normalized_text,
         checksum=checksum,
         metadata_json=metadata,
+        session_id=session_id,
     )
+
+    try:
+        _persist_document_artifacts(
+            db,
+            doc,
+            normalized_text,
+            source_bytes=source_bytes,
+            source_filename=source_filename or normalized_title,
+            mime_type=mime_type,
+        )
+    except Exception:
+        delete_document_storage(
+            db,
+            doc.id,
+            delete_object_artifacts=True,
+            delete_vectors=True,
+            hard_delete=True,
+        )
+        raise
+
     job = crud_knowledge.create_ingestion_job(db, doc.id)
     return {"document_id": doc.id, "job_id": job.id, "status": "pending", "checksum": checksum}
 
@@ -665,6 +744,9 @@ def ingest_document(
     source_uri: Optional[str] = None,
     mime_type: Optional[str] = None,
     metadata: Optional[dict] = None,
+    session_id: Optional[int] = None,
+    source_bytes: bytes | None = None,
+    source_filename: str | None = None,
 ) -> dict:
     """Full synchronous ingestion: create doc → chunk → index.
 
@@ -701,7 +783,28 @@ def ingest_document(
         raw_text=normalized_text,
         checksum=checksum,
         metadata_json=metadata,
+        session_id=session_id,
     )
+
+    try:
+        _persist_document_artifacts(
+            db,
+            doc,
+            normalized_text,
+            source_bytes=source_bytes,
+            source_filename=source_filename or normalized_title,
+            mime_type=mime_type,
+        )
+    except Exception:
+        delete_document_storage(
+            db,
+            doc.id,
+            delete_object_artifacts=True,
+            delete_vectors=True,
+            hard_delete=True,
+        )
+        raise
+
     job = crud_knowledge.create_ingestion_job(db, doc.id)
 
     try:
@@ -717,6 +820,7 @@ def ingest_uploaded_file(
     filename: str,
     content: bytes,
     mime_type: str | None = None,
+    session_id: int | None = None,
 ) -> dict:
     """Convenience: extract text from file bytes, then run full ingestion."""
     raw_text = extract_text_from_file(content, filename, mime_type)
@@ -728,6 +832,9 @@ def ingest_uploaded_file(
         source_type="upload",
         source_uri=filename,
         mime_type=mime_type,
+        session_id=session_id,
+        source_bytes=content,
+        source_filename=filename,
     )
 
 
@@ -745,4 +852,208 @@ def reindex_document(db: Session, doc_id: int) -> dict:
     except Exception as e:
         logger.error("Reindex failed for doc %d: %s", doc_id, e)
         raise
+
+
+def delete_document_storage(
+    db: Session,
+    doc_id: int,
+    *,
+    delete_object_artifacts: bool,
+    delete_vectors: bool,
+    hard_delete: bool,
+) -> dict:
+    doc = db.query(KnowledgeDocument).filter(KnowledgeDocument.id == doc_id).first()
+    if not doc:
+        raise ValueError("Document not found.")
+
+    result = {
+        "document_id": int(doc.id),
+        "title": doc.title,
+        "owner_username": doc.owner_username,
+        "database": "deleted" if hard_delete else "soft-deleted",
+        "object_storage": "skipped",
+        "object_storage_deleted_keys": 0,
+        "vector_store": "skipped",
+    }
+
+    if delete_object_artifacts and object_storage.is_object_storage_enabled():
+        artifact_result = object_storage.delete_document_artifacts(doc.owner_username, doc.id)
+        result["object_storage_deleted_keys"] = int(artifact_result.get("deleted_keys") or 0)
+        result["object_storage"] = "deleted" if result["object_storage_deleted_keys"] > 0 else "not-found"
+
+    if delete_vectors and vector_store.is_external_vector_store_enabled():
+        vector_store.delete_document_chunks(doc.owner_username, doc.id)
+        result["vector_store"] = "deleted"
+
+    if hard_delete:
+        crud_knowledge.hard_delete_document(db, doc.id)
+    else:
+        crud_knowledge.delete_document(db, doc.id)
+
+    return result
+
+
+def _prepare_existing_chunks_for_vector_backfill(chunk_rows: list) -> list[dict]:
+    prepared_chunks: list[dict] = []
+    for row in chunk_rows:
+        metadata_json = ensure_json_mapping(row.metadata_json)
+        embedding = metadata_json.get("embedding")
+        normalized_embedding: list[float] = []
+        if isinstance(embedding, list) and embedding:
+            try:
+                normalized_embedding = [float(value) for value in embedding]
+            except (TypeError, ValueError):
+                normalized_embedding = []
+        if not normalized_embedding:
+            normalized_embedding = compute_text_embedding(row.content)
+        prepared_chunks.append(
+            {
+                "chunk_index": int(row.chunk_index),
+                "embedding": normalized_embedding,
+            }
+        )
+    return prepared_chunks
+
+
+def backfill_document_storage(
+    db: Session,
+    doc_id: int,
+    *,
+    write_object_artifacts: bool = True,
+    upsert_vectors: bool = True,
+    write_source_manifest: bool = True,
+) -> dict:
+    doc = crud_knowledge.get_document(db, doc_id)
+    if not doc:
+        raise ValueError("Document not found.")
+    if not doc.raw_text:
+        raise ValueError("Document has no raw text to backfill.")
+
+    normalized_text = normalize_text_for_ingestion(doc.raw_text)
+    if not normalized_text:
+        raise ValueError("Document has no valid normalized text to backfill.")
+
+    doc_metadata = ensure_json_mapping(doc.metadata_json)
+    existing_artifacts = ensure_json_mapping(doc_metadata.get("artifacts"))
+
+    result = {
+        "document_id": int(doc.id),
+        "title": doc.title,
+        "owner_username": doc.owner_username,
+        "object_storage": "skipped",
+        "vector_store": "skipped",
+        "vector_points": 0,
+        "source_manifest": False,
+    }
+
+    if write_object_artifacts and object_storage.is_object_storage_enabled():
+        _persist_document_artifacts(
+            db,
+            doc,
+            normalized_text,
+            source_filename=doc.source_uri or doc.title,
+            mime_type=doc.mime_type,
+        )
+        result["object_storage"] = "stored"
+
+        if write_source_manifest and "source" not in existing_artifacts:
+            source_manifest_artifact = object_storage.store_document_artifact(
+                owner_username=doc.owner_username,
+                document_id=doc.id,
+                artifact_kind="source-status",
+                artifact_name="unavailable.json",
+                content=json.dumps(
+                    {
+                        "status": "unavailable",
+                        "reason": "legacy_document_has_no_source_bytes",
+                        "source_type": doc.source_type,
+                        "source_uri": doc.source_uri,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8"),
+                content_type="application/json",
+            )
+            merged_metadata = _merge_document_artifacts(doc.metadata_json, {"source_status": source_manifest_artifact})
+            updated_doc = crud_knowledge.update_document_metadata(db, doc.id, merged_metadata)
+            if updated_doc is not None:
+                doc = updated_doc
+            result["source_manifest"] = True
+
+    if upsert_vectors and vector_store.is_external_vector_store_enabled():
+        chunk_rows = crud_knowledge.get_chunks_by_document(db, doc.id)
+        if chunk_rows:
+            prepared_chunks = _prepare_existing_chunks_for_vector_backfill(chunk_rows)
+            vector_store.delete_document_chunks(doc.owner_username, doc.id)
+            vector_store.upsert_document_chunks(doc, chunk_rows, prepared_chunks)
+            result["vector_store"] = "upserted"
+            result["vector_points"] = len(prepared_chunks)
+        else:
+            result["vector_store"] = "no-chunks"
+
+    return result
+
+
+def backfill_documents_storage(
+    db: Session,
+    *,
+    document_ids: list[int] | None = None,
+    owner_username: str | None = None,
+    limit: int | None = None,
+    write_object_artifacts: bool = True,
+    upsert_vectors: bool = True,
+    write_source_manifest: bool = True,
+    fail_fast: bool = False,
+) -> dict:
+    query = db.query(KnowledgeDocument).filter(KnowledgeDocument.deleted_at.is_(None)).order_by(KnowledgeDocument.id.asc())
+    if document_ids:
+        query = query.filter(KnowledgeDocument.id.in_(document_ids))
+    if owner_username:
+        query = query.filter(KnowledgeDocument.owner_username == owner_username)
+    if limit is not None and limit > 0:
+        query = query.limit(limit)
+
+    documents = query.all()
+    results: list[dict] = []
+    success_count = 0
+    error_count = 0
+    total_vector_points = 0
+
+    for document in documents:
+        try:
+            result = backfill_document_storage(
+                db,
+                document.id,
+                write_object_artifacts=write_object_artifacts,
+                upsert_vectors=upsert_vectors,
+                write_source_manifest=write_source_manifest,
+            )
+            results.append({**result, "status": "ok", "error": None})
+            success_count += 1
+            total_vector_points += int(result.get("vector_points") or 0)
+        except Exception as exc:
+            db.rollback()
+            error_count += 1
+            results.append(
+                {
+                    "document_id": int(document.id),
+                    "title": document.title,
+                    "owner_username": document.owner_username,
+                    "object_storage": "error",
+                    "vector_store": "error",
+                    "vector_points": 0,
+                    "source_manifest": False,
+                    "status": "error",
+                    "error": str(exc),
+                }
+            )
+            if fail_fast:
+                raise
+
+    return {
+        "selected_documents": len(documents),
+        "success_count": success_count,
+        "error_count": error_count,
+        "total_vector_points": total_vector_points,
+        "results": results,
+    }
 

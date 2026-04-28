@@ -15,6 +15,7 @@ class KnowledgeDocumentCreateRequest(BaseModel):
     mime_type: str | None = None
     raw_text: str | None = None
     metadata: dict[str, Any] | None = None
+    session_id: int | None = Field(default=None, ge=1)
 
 
 class KnowledgeDocumentResponse(ORMBaseSchema):
@@ -26,6 +27,7 @@ class KnowledgeDocumentResponse(ORMBaseSchema):
     mime_type: str | None = None
     status: str
     checksum: str | None = None
+    session_id: int | None = None
     metadata_json: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
@@ -100,6 +102,36 @@ class KnowledgeSearchResponse(BaseModel):
     fallback_reason: str | None = None
     evidence_strength: str | None = None
     results: list[KnowledgeSearchResult]
+
+
+class ThreeStorageBackfillRequest(BaseModel):
+    document_ids: list[int] = Field(default_factory=list)
+    owner_username: str | None = None
+    limit: int | None = Field(default=None, ge=1, le=1000)
+    write_object_artifacts: bool = True
+    upsert_vectors: bool = True
+    write_source_manifest: bool = True
+    fail_fast: bool = False
+
+
+class ThreeStorageBackfillItem(BaseModel):
+    document_id: int
+    title: str
+    owner_username: str
+    object_storage: str
+    vector_store: str
+    vector_points: int = 0
+    source_manifest: bool = False
+    status: str
+    error: str | None = None
+
+
+class ThreeStorageBackfillResponse(BaseModel):
+    selected_documents: int
+    success_count: int
+    error_count: int
+    total_vector_points: int
+    results: list[ThreeStorageBackfillItem]
 
 
 class CitationSource(BaseModel):

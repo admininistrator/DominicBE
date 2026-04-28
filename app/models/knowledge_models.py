@@ -23,6 +23,7 @@ class KnowledgeDocument(Base):
         server_default="uploaded",
         index=True,
     )
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="SET NULL"), nullable=True, index=True)
     checksum = Column(String(128), nullable=True, index=True)
     raw_text = Column(Text, nullable=True)
     metadata_json = Column(JSON, nullable=True)

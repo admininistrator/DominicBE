@@ -2,6 +2,9 @@
 import sys, io
 sys.path.insert(0, '.')
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from app.services.llm_provider import (
     _preprocess_image, _append_text_to_last_user, _inject_images
 )

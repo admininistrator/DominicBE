@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core.database import SessionLocal
 from app.crud import crud_knowledge
-from app.services.knowledge_service import ingest_uploaded_file, extract_text_from_file
+from app.services.knowledge_service import delete_document_storage, ingest_uploaded_file, extract_text_from_file
 from app.services.retrieval_service import search_knowledge
 
 DOCX_PATH = os.path.join(os.path.dirname(__file__), "test_assignments.docx")
@@ -34,7 +34,13 @@ try:
             # Check raw_text quality
             raw_len = len(doc.raw_text or "")
             print(f"  Doc #{doc.id}: '{doc.title}' raw_text={raw_len} chars → {'xóa (quá ngắn)' if raw_len < 100 else 'xóa (re-upload mới)'}")
-            crud_knowledge.hard_delete_document(db, doc.id)
+            delete_document_storage(
+                db,
+                doc.id,
+                delete_object_artifacts=True,
+                delete_vectors=True,
+                hard_delete=True,
+            )
 
     # 2. Re-upload with new extractor
     sep("Upload lại với extractor mới")

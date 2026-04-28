@@ -59,7 +59,7 @@ def main() -> None:
         headers = {"Authorization": f"Bearer {token}"}
 
         invalid_ingest_response = client.post(
-            "/api/knowledge/ingest",
+            "/api/knowledge/documents/ingest",
             json={"title": "Invalid doc", "source_type": "text"},
             headers=headers,
         )
@@ -187,7 +187,7 @@ def main() -> None:
         assert job_detail_response.json()["status"] == "completed"
 
         duplicate_ingest_response = client.post(
-            "/api/knowledge/ingest",
+            "/api/knowledge/documents/ingest",
             json={
                 "title": "Product FAQ Duplicate",
                 "source_type": "text",
@@ -201,7 +201,7 @@ def main() -> None:
         assert duplicate_payload["job_id"] != text_job_id
 
         upload_response = client.post(
-            "/api/knowledge/upload",
+            "/api/knowledge/documents/upload",
             headers=headers,
             files={
                 "file": (
@@ -217,7 +217,7 @@ def main() -> None:
         assert upload_payload["chunks_count"] >= 1
 
         unsupported_upload_response = client.post(
-            "/api/knowledge/upload",
+            "/api/knowledge/documents/upload",
             headers=headers,
             files={
                 "file": (

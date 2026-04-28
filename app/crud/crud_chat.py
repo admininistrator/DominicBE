@@ -1,7 +1,6 @@
 import json
 
-from sqlalchemy import inspect
-from sqlalchemy.orm import Session, load_only
+from sqlalchemy.orm import Session
 from secrets import compare_digest
 from app.models.chat_models import Message, User, ChatSummary, ChatSession
 from app.core.security import (
@@ -17,40 +16,18 @@ from datetime import timedelta
 from sqlalchemy import func
 
 
-_MESSAGE_IMAGE_PAYLOAD_SUPPORT: dict[str, bool] = {}
-
-
-def _bind_cache_key(db: Session) -> str:
-    bind = db.get_bind()
-    return str(getattr(getattr(bind, "engine", bind), "url", "default"))
-
-
-def message_image_payload_supported(db: Session) -> bool:
-    cache_key = _bind_cache_key(db)
-    if cache_key not in _MESSAGE_IMAGE_PAYLOAD_SUPPORT:
-        inspector = inspect(db.get_bind())
-        columns = {column["name"] for column in inspector.get_columns("messages")}
-        _MESSAGE_IMAGE_PAYLOAD_SUPPORT[cache_key] = "image_payload_json" in columns
-    return _MESSAGE_IMAGE_PAYLOAD_SUPPORT[cache_key]
-
-
-def _message_query(db: Session):
-    attrs = [
-        Message.id,
-        Message.session_id,
-        Message.request_id,
-        Message.sender_username,
-        Message.role,
-        Message.content,
-        Message.input_tokens,
-        Message.output_tokens,
-        Message.status,
-        Message.error_message,
-        Message.created_at,
-    ]
-    if message_image_payload_supported(db):
-        attrs.append(Message.image_payload_json)
-    return db.query(Message).options(load_only(*attrs))
+def _encode_message_payload(
+    images: list[str] | None = None,
+    documents: list[dict] | None = None,
+) -> str | None:
+    normalized_images = [image for image in (images or []) if image]
+    normalized_documents = [document for document in (documents or []) if document]
+    if not normalized_images and not normalized_documents:
+        return None
+    return json.dumps({
+        "images": normalized_images,
+        "documents": normalized_documents,
+    })
 
 def create_message(
     db: Session,
@@ -60,6 +37,7 @@ def create_message(
     content: str,
     request_id: str | None,
     images: list[str] | None = None,
+    documents: list[dict] | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     status: str = "pending",
@@ -67,29 +45,27 @@ def create_message(
 ):
     if not request_id:
         request_id = str(uuid4())
-    values = {
-        "session_id": session_id,
-        "request_id": request_id,
-        "role": role,
-        "sender_username": sender_username,
-        "content": content,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "status": status,
-        "error_message": error_message,
-    }
-    if images and message_image_payload_supported(db):
-        values["image_payload_json"] = json.dumps(images)
-
-    insert_result = db.execute(Message.__table__.insert().values(**values))
+    db_message = Message(
+        session_id=session_id,
+        request_id=request_id,
+        role=role,
+        sender_username=sender_username,
+        content=content,
+        image_payload_json=_encode_message_payload(images, documents),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        status=status,
+        error_message=error_message,
+    )
+    db.add(db_message)
     db.commit()
-    message_id = insert_result.inserted_primary_key[0]
-    return _message_query(db).filter(Message.id == message_id).first()
+    db.refresh(db_message)
+    return db_message
 
 
 def get_user_history(db: Session, username: str):
     return (
-        _message_query(db)
+        db.query(Message)
         .filter(Message.sender_username == username)
         .order_by(Message.created_at.asc())
         .all()
@@ -156,7 +132,7 @@ def touch_chat_session(db: Session, session_id: int):
 
 def get_session_messages(db: Session, username: str, session_id: int):
     return (
-        _message_query(db)
+        db.query(Message)
         .filter(
             Message.sender_username == username,
             Message.session_id == session_id,
@@ -168,7 +144,7 @@ def get_session_messages(db: Session, username: str, session_id: int):
 
 def get_recent_user_history(db: Session, username: str, session_id: int, limit: int):
     rows = (
-        _message_query(db)
+        db.query(Message)
         .filter(
             Message.sender_username == username,
             Message.session_id == session_id,
@@ -182,7 +158,7 @@ def get_recent_user_history(db: Session, username: str, session_id: int, limit: 
 
 def get_messages_for_summary(db: Session, username: str, session_id: int, after_id: int, before_id: int):
     return (
-        _message_query(db)
+        db.query(Message)
         .filter(
             Message.sender_username == username,
             Message.session_id == session_id,
@@ -379,7 +355,7 @@ def update_message_tokens_and_status(
     status: str | None = None,
     error_message: str | None = None,
 ):
-    msg = _message_query(db).filter(Message.id == message_id).first()
+    msg = db.query(Message).filter(Message.id == message_id).first()
     if not msg:
         return None
 

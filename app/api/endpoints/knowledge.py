@@ -18,10 +18,15 @@ from app.schemas.knowledge_schemas import (
     RetrievalAnalyticsResponse,
     KnowledgeSearchRequest,
     KnowledgeSearchResponse,
+    ThreeStorageBackfillRequest,
+    ThreeStorageBackfillResponse,
 )
 from app.services.retrieval_service import search_knowledge
+from app.services import vector_store
 from app.services.knowledge_service import (
+    backfill_documents_storage,
     create_document_record,
+    delete_document_storage,
     extract_text_from_file,
     ingest_document,
     ingest_uploaded_file,
@@ -60,6 +65,48 @@ def get_admin_analytics(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/admin/backfill-three-storage", response_model=ThreeStorageBackfillResponse)
+def backfill_three_storage(
+    request: ThreeStorageBackfillRequest,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    try:
+        summary = backfill_documents_storage(
+            db,
+            document_ids=request.document_ids,
+            owner_username=request.owner_username,
+            limit=request.limit,
+            write_object_artifacts=request.write_object_artifacts,
+            upsert_vectors=request.upsert_vectors,
+            write_source_manifest=request.write_source_manifest,
+            fail_fast=request.fail_fast,
+        )
+        _audit(
+            db,
+            admin_user.username,
+            "knowledge.backfill_three_storage",
+            resource_type="knowledge",
+            detail_json={
+                "document_ids": request.document_ids,
+                "owner_username": request.owner_username,
+                "limit": request.limit,
+                "write_object_artifacts": request.write_object_artifacts,
+                "upsert_vectors": request.upsert_vectors,
+                "write_source_manifest": request.write_source_manifest,
+                "fail_fast": request.fail_fast,
+                "success_count": summary["success_count"],
+                "error_count": summary["error_count"],
+                "total_vector_points": summary["total_vector_points"],
+            },
+        )
+        return ThreeStorageBackfillResponse(**summary)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ---------------------------------------------------------------------------
 # Upload file
 # ---------------------------------------------------------------------------
@@ -69,6 +116,7 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     async_index: bool = False,
+    session_id: int | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -77,6 +125,8 @@ async def upload_document(
     Pass ``async_index=true`` to return immediately with ``status=pending`` and
     run chunking + embedding in a background task.  Poll ``GET /jobs/{job_id}``
     to track progress.
+
+    Pass ``session_id`` to associate the document with a specific chat session.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
@@ -102,6 +152,9 @@ async def upload_document(
                 source_type="upload",
                 source_uri=file.filename,
                 mime_type=file.content_type,
+                session_id=session_id,
+                source_bytes=content,
+                source_filename=file.filename,
             )
             background_tasks.add_task(
                 run_indexing_pipeline,
@@ -111,7 +164,7 @@ async def upload_document(
             )
             _audit(db, current_user.username, "document.upload",
                    resource_type="document", resource_id=record["document_id"],
-                   detail_json={"filename": file.filename, "async": True})
+                   detail_json={"filename": file.filename, "async": True, "session_id": session_id})
             return IngestionResult(**record)
         else:
             result = ingest_uploaded_file(
@@ -120,10 +173,11 @@ async def upload_document(
                 filename=file.filename,
                 content=content,
                 mime_type=file.content_type,
+                session_id=session_id,
             )
             _audit(db, current_user.username, "document.upload",
                    resource_type="document", resource_id=result["document_id"],
-                   detail_json={"filename": file.filename, "async": False})
+                   detail_json={"filename": file.filename, "async": False, "session_id": session_id})
             return IngestionResult(**result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -147,6 +201,8 @@ def ingest_text(
 
     Pass ``async_index=true`` to return immediately and run indexing in the
     background.  Poll ``GET /jobs/{job_id}`` to track progress.
+
+    Pass ``session_id`` in the request body to associate with a chat session.
     """
     if not request.raw_text and request.source_type == "text":
         raise HTTPException(status_code=400, detail="raw_text is required for source_type='text'.")
@@ -162,6 +218,7 @@ def ingest_text(
                 source_uri=request.source_uri,
                 mime_type=request.mime_type,
                 metadata=request.metadata,
+                session_id=request.session_id,
             )
             background_tasks.add_task(
                 run_indexing_pipeline,
@@ -180,10 +237,11 @@ def ingest_text(
                 source_uri=request.source_uri,
                 mime_type=request.mime_type,
                 metadata=request.metadata,
+                session_id=request.session_id,
             )
             _audit(db, current_user.username, "document.ingest",
                    resource_type="document", resource_id=result["document_id"],
-                   detail_json={"title": request.title, "async": False})
+                   detail_json={"title": request.title, "async": False, "session_id": request.session_id})
             return IngestionResult(**result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -224,10 +282,23 @@ def search_documents(
 def list_documents(
     skip: int = 0,
     limit: int = 50,
+    session_id: int | None = None,
+    session_filter: str = "all",
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    docs = crud_knowledge.list_documents(db, current_user.username, skip, limit)
+    """List knowledge documents.
+
+    ``session_filter`` values:
+    - ``all`` (default): return all documents
+    - ``session``: return only documents for the given ``session_id``
+    - ``global``: return only documents with no session (global/legacy)
+    """
+    docs = crud_knowledge.list_documents(
+        db, current_user.username, skip, limit,
+        session_id=session_id,
+        session_id_filter=session_filter,
+    )
     return docs
 
 
@@ -312,10 +383,26 @@ def delete_document(
     doc = crud_knowledge.get_document(db, doc_id)
     if not doc or doc.owner_username != current_user.username:
         raise HTTPException(status_code=404, detail="Document not found.")
-    crud_knowledge.delete_document(db, doc_id)
+    try:
+        cleanup = delete_document_storage(
+            db,
+            doc_id,
+            delete_object_artifacts=False,
+            delete_vectors=True,
+            hard_delete=False,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     _audit(db, current_user.username, "document.delete",
            resource_type="document", resource_id=doc_id,
-           detail_json={"title": doc.title, "soft_delete": True})
+           detail_json={
+               "title": doc.title,
+               "soft_delete": True,
+               "vector_store": cleanup["vector_store"],
+               "object_storage": cleanup["object_storage"],
+           })
 
 
 # ---------------------------------------------------------------------------
@@ -398,15 +485,26 @@ def hard_delete_document(
     db: Session = Depends(get_db),
 ):
     """Admin-only: permanently delete a document and all related records."""
-    from app.models.knowledge_models import KnowledgeDocument as KDModel
-    doc_raw = db.query(KDModel).filter(KDModel.id == doc_id).first()
-    if not doc_raw:
-        raise HTTPException(status_code=404, detail="Document not found.")
-    title = doc_raw.title
-    owner = doc_raw.owner_username
-    crud_knowledge.hard_delete_document(db, doc_id)
+    try:
+        cleanup = delete_document_storage(
+            db,
+            doc_id,
+            delete_object_artifacts=True,
+            delete_vectors=True,
+            hard_delete=True,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     _audit(db, _admin.username, "document.hard_delete",
            resource_type="document", resource_id=doc_id,
-           detail_json={"title": title, "owner": owner})
+           detail_json={
+               "title": cleanup["title"],
+               "owner": cleanup["owner_username"],
+               "object_storage": cleanup["object_storage"],
+               "object_storage_deleted_keys": cleanup["object_storage_deleted_keys"],
+               "vector_store": cleanup["vector_store"],
+           })
 
 

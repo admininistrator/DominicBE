@@ -21,48 +21,21 @@ LONG_TEXT = (
     "Customers can submit refund evidence through the support portal. " * 40
 ).strip()
 
-
-class _FakeTokenInfo:
-    def __init__(self, input_tokens: int):
-        self.input_tokens = input_tokens
-
-
-class _FakeUsage:
-    def __init__(self, input_tokens: int, output_tokens: int):
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-
-
-class _FakeContentBlock:
-    def __init__(self, text: str):
-        self.text = text
-
-
-class _FakeResponse:
-    def __init__(self, text: str, *, input_tokens: int = 120, output_tokens: int = 48):
-        self.content = [_FakeContentBlock(text)]
-        self.usage = _FakeUsage(input_tokens=input_tokens, output_tokens=output_tokens)
-
-
-class _FakeMessagesAPI:
-    def count_tokens(self, **kwargs):
-        total_chars = len(kwargs.get("system") or "")
-        total_chars += sum(len((msg.get("content") or "")) for msg in kwargs.get("messages", []))
-        return _FakeTokenInfo(max(1, total_chars // 4))
-
-    def create(self, **kwargs):
-        system_prompt = kwargs.get("system") or ""
-        assert "Knowledge-base evidence for this turn" in system_prompt
-        assert "Product FAQ" in system_prompt
-        assert "refund requests are reviewed within 5 business days" in system_prompt.lower()
-        return _FakeResponse(
-            "Theo Product FAQ, yêu cầu hoàn tiền được xem xét trong vòng 5 ngày làm việc. [Source 1]"
-        )
-
-
-class _FakeAnthropicClient:
-    def __init__(self):
-        self.messages = _FakeMessagesAPI()
+def _fake_complete(*, messages, system=None, max_tokens=1024, **kwargs):
+    assert system
+    assert "Knowledge-base evidence for this turn" in system
+    assert "Product FAQ" in system
+    assert "refund requests are reviewed within 5 business days" in system.lower()
+    assert messages
+    assert max_tokens >= 1
+    return {
+        "text": "Theo Product FAQ, yêu cầu hoàn tiền được xem xét trong vòng 5 ngày làm việc. [Source 1]",
+        "input_tokens": 120,
+        "output_tokens": 48,
+        "model": "test/fake-model",
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
 
 
 def main() -> None:
@@ -85,9 +58,9 @@ def main() -> None:
         finally:
             db.close()
 
-    original_get_client = chat_service._get_client
+    original_complete = chat_service.llm_provider.complete
     app.dependency_overrides[get_db] = override_get_db
-    chat_service._get_client = lambda: _FakeAnthropicClient()
+    chat_service.llm_provider.complete = _fake_complete
 
     try:
         with TestClient(app) as client:
@@ -187,7 +160,7 @@ def main() -> None:
             assert "chưa có đủ bằng chứng" in weak_payload["reply"].lower()
 
     finally:
-        chat_service._get_client = original_get_client
+        chat_service.llm_provider.complete = original_complete
         app.dependency_overrides.clear()
 
     print("RAG_CHAT_SMOKE_OK")

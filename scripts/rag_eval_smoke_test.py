@@ -21,44 +21,18 @@ LONG_TEXT = (
     "Customers can submit refund evidence through the support portal. " * 30
 ).strip()
 
-
-class _FakeTokenInfo:
-    def __init__(self, input_tokens: int):
-        self.input_tokens = input_tokens
-
-
-class _FakeUsage:
-    def __init__(self, input_tokens: int, output_tokens: int):
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-
-
-class _FakeContentBlock:
-    def __init__(self, text: str):
-        self.text = text
-
-
-class _FakeResponse:
-    def __init__(self, text: str, *, input_tokens: int = 100, output_tokens: int = 40):
-        self.content = [_FakeContentBlock(text)]
-        self.usage = _FakeUsage(input_tokens=input_tokens, output_tokens=output_tokens)
-
-
-class _FakeMessagesAPI:
-    def count_tokens(self, **kwargs):
-        total_chars = len(kwargs.get("system") or "")
-        total_chars += sum(len((msg.get("content") or "")) for msg in kwargs.get("messages", []))
-        return _FakeTokenInfo(max(1, total_chars // 4))
-
-    def create(self, **kwargs):
-        return _FakeResponse(
-            "Theo Product FAQ, yêu cầu hoàn tiền được xem xét trong vòng 5 ngày làm việc. [Source 1]"
-        )
-
-
-class _FakeAnthropicClient:
-    def __init__(self):
-        self.messages = _FakeMessagesAPI()
+def _fake_complete(*, messages, system=None, max_tokens=1024, **kwargs):
+    assert messages
+    assert system
+    assert max_tokens >= 1
+    return {
+        "text": "Theo Product FAQ, yêu cầu hoàn tiền được xem xét trong vòng 5 ngày làm việc. [Source 1]",
+        "input_tokens": 100,
+        "output_tokens": 40,
+        "model": "test/fake-model",
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
 
 
 def main() -> None:
@@ -81,9 +55,9 @@ def main() -> None:
         finally:
             db.close()
 
-    original_get_client = chat_service._get_client
+    original_complete = chat_service.llm_provider.complete
     app.dependency_overrides[get_db] = override_get_db
-    chat_service._get_client = lambda: _FakeAnthropicClient()
+    chat_service.llm_provider.complete = _fake_complete
 
     try:
         with TestClient(app) as client:
@@ -198,7 +172,7 @@ def main() -> None:
             assert filtered_payload["summary"]["total_events"] >= 2
 
     finally:
-        chat_service._get_client = original_get_client
+        chat_service.llm_provider.complete = original_complete
         app.dependency_overrides.clear()
 
     print("RAG_EVAL_SMOKE_OK")

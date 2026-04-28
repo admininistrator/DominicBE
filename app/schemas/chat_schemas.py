@@ -59,6 +59,12 @@ class TokenUsage(BaseModel):
     output_tokens: int
 
 
+class MessageDocument(BaseModel):
+    id: int | None = None
+    title: str
+    session_id: int | None = None
+
+
 class ChatResponse(BaseModel):
     success: bool
     reply: str
@@ -105,6 +111,7 @@ class SessionMessageResponse(BaseModel):
     role: str
     content: str
     images: list[str] = Field(default_factory=list)
+    documents: list[MessageDocument] = Field(default_factory=list)
     input_tokens: int
     output_tokens: int
     created_at: datetime

@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.json_utils import ensure_json_mapping
 from app.models.knowledge_models import (
     AnswerCitation,
     AuditLog,
@@ -30,6 +31,7 @@ def create_document(
     raw_text: Optional[str] = None,
     checksum: Optional[str] = None,
     metadata_json: Optional[dict] = None,
+    session_id: Optional[int] = None,
 ) -> KnowledgeDocument:
     doc = KnowledgeDocument(
         owner_username=owner_username,
@@ -40,6 +42,7 @@ def create_document(
         raw_text=raw_text,
         checksum=checksum,
         metadata_json=metadata_json,
+        session_id=session_id,
         status="uploaded",
     )
     db.add(doc)
@@ -72,10 +75,31 @@ def get_document_by_owner_and_checksum(
     )
 
 
-def list_documents(db: Session, owner_username: str, skip: int = 0, limit: int = 50):
-    return (
+def list_documents(
+    db: Session,
+    owner_username: str,
+    skip: int = 0,
+    limit: int = 50,
+    session_id: Optional[int] = None,
+    session_id_filter: str = "all",
+):
+    """List documents for a user.
+
+    session_id_filter values:
+    - "all" (default): return all documents regardless of session_id
+    - "session": return only documents with the given session_id
+    - "global": return only documents with session_id IS NULL
+    """
+    query = (
         db.query(KnowledgeDocument)
         .filter(KnowledgeDocument.owner_username == owner_username, KnowledgeDocument.deleted_at.is_(None))
+    )
+    if session_id_filter == "session" and session_id is not None:
+        query = query.filter(KnowledgeDocument.session_id == session_id)
+    elif session_id_filter == "global":
+        query = query.filter(KnowledgeDocument.session_id.is_(None))
+    return (
+        query
         .order_by(KnowledgeDocument.created_at.desc())
         .offset(skip)
         .limit(limit)
@@ -153,11 +177,62 @@ def delete_chunks_by_document(db: Session, document_id: int):
     db.commit()
 
 
+def list_searchable_chunks_by_ids(
+    db: Session,
+    owner_username: str,
+    chunk_ids: list[int],
+    *,
+    document_id: int | None = None,
+    session_id: int | None = None,
+    session_scope: str = "all",
+    indexed_only: bool = True,
+):
+    if not chunk_ids:
+        return []
+
+    query = (
+        db.query(KnowledgeChunk, KnowledgeDocument)
+        .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
+        .filter(
+            KnowledgeChunk.id.in_(chunk_ids),
+            KnowledgeDocument.owner_username == owner_username,
+            KnowledgeDocument.deleted_at.is_(None),
+        )
+    )
+    if indexed_only:
+        query = query.filter(KnowledgeDocument.status == "indexed")
+    if document_id is not None:
+        query = query.filter(KnowledgeDocument.id == document_id)
+    elif session_scope == "session" and session_id is not None:
+        query = query.filter(KnowledgeDocument.session_id == session_id)
+    elif session_scope == "global":
+        query = query.filter(KnowledgeDocument.session_id.is_(None))
+    return query.all()
+
+
+def update_document_metadata(
+    db: Session,
+    doc_id: int,
+    metadata_updates: dict | None,
+) -> Optional[KnowledgeDocument]:
+    doc = get_document(db, doc_id)
+    if not doc:
+        return None
+
+    merged_metadata = {**ensure_json_mapping(doc.metadata_json), **(metadata_updates or {})}
+    doc.metadata_json = merged_metadata
+    db.commit()
+    db.refresh(doc)
+    return doc
+
+
 def list_searchable_chunks(
     db: Session,
     owner_username: str,
     document_id: int | None = None,
     *,
+    session_id: int | None = None,
+    session_scope: str = "all",
     indexed_only: bool = True,
 ):
     query = (
@@ -169,7 +244,29 @@ def list_searchable_chunks(
         query = query.filter(KnowledgeDocument.status == "indexed")
     if document_id is not None:
         query = query.filter(KnowledgeDocument.id == document_id)
+    elif session_scope == "session" and session_id is not None:
+        query = query.filter(KnowledgeDocument.session_id == session_id)
+    elif session_scope == "global":
+        query = query.filter(KnowledgeDocument.session_id.is_(None))
     return query.order_by(KnowledgeDocument.id.asc(), KnowledgeChunk.chunk_index.asc()).all()
+
+
+def has_indexed_documents_for_session(
+    db: Session,
+    owner_username: str,
+    session_id: int,
+) -> bool:
+    return (
+        db.query(KnowledgeDocument.id)
+        .filter(
+            KnowledgeDocument.owner_username == owner_username,
+            KnowledgeDocument.deleted_at.is_(None),
+            KnowledgeDocument.status == "indexed",
+            KnowledgeDocument.session_id == session_id,
+        )
+        .first()
+        is not None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +353,7 @@ def update_retrieval_event_metadata(
     event = db.query(RetrievalEvent).filter(RetrievalEvent.id == retrieval_id).first()
     if not event:
         return None
-    merged_metadata = {**(event.metadata_json or {}), **(metadata_updates or {})}
+    merged_metadata = {**ensure_json_mapping(event.metadata_json), **(metadata_updates or {})}
     event.metadata_json = merged_metadata
     db.commit()
     db.refresh(event)
@@ -366,7 +463,7 @@ def get_retrieval_analytics(db: Session, *, username: str | None = None, recent_
 
     serialized_recent_events: list[dict] = []
     for event in recent_events:
-        metadata = event.metadata_json or {}
+        metadata = ensure_json_mapping(event.metadata_json)
         returned = int(metadata.get("returned") or 0)
         evidence_strength = metadata.get("evidence_strength") or "none"
         answer_policy = metadata.get("answer_policy") or "unknown"
@@ -398,7 +495,7 @@ def get_retrieval_analytics(db: Session, *, username: str | None = None, recent_
         )
 
     for event in events:
-        metadata = event.metadata_json or {}
+        metadata = ensure_json_mapping(event.metadata_json)
         returned = int(metadata.get("returned") or 0)
         evidence_strength = metadata.get("evidence_strength") or "none"
         answer_policy = metadata.get("answer_policy") or "unknown"

@@ -5,6 +5,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_chat
 from app.crud import crud_knowledge
 from app.services.retrieval_service import search_knowledge
@@ -58,7 +59,39 @@ def _load_message_images(payload: str | None) -> list[str]:
     except Exception:
         logger.warning("Failed to decode message image payload.", exc_info=True)
         return []
+    if isinstance(data, dict):
+        images = data.get("images") or []
+        return [item for item in images if isinstance(item, str) and item]
     return [item for item in data if isinstance(item, str) and item]
+
+
+def _load_message_documents(payload: str | None) -> list[dict]:
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except Exception:
+        logger.warning("Failed to decode message document payload.", exc_info=True)
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    documents = data.get("documents") or []
+    normalized_documents: list[dict] = []
+    for item in documents:
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+        normalized_documents.append(
+            {
+                "id": item.get("id"),
+                "title": title,
+                "session_id": item.get("session_id"),
+            }
+        )
+    return normalized_documents
 
 
 def get_usage(db: Session, username: str):
@@ -146,6 +179,7 @@ def get_session_history(db: Session, username: str, session_id: int):
             "role": m.role,
             "content": m.content,
             "images": _load_message_images(m.__dict__.get("image_payload_json")),
+            "documents": _load_message_documents(m.__dict__.get("image_payload_json")),
             "input_tokens": int(m.input_tokens or 0),
             "output_tokens": int(m.output_tokens or 0),
             "created_at": m.created_at,
@@ -179,7 +213,7 @@ def _build_retrieval_by_request(db: Session, request_ids: list[str]) -> dict[str
     rows = crud_knowledge.list_retrieval_events_by_request_ids(db, request_ids)
     grouped: dict[str, dict] = {}
     for event in rows:
-        metadata = event.metadata_json or {}
+        metadata = ensure_json_mapping(event.metadata_json)
         if not event.request_id:
             continue
         grouped[event.request_id] = {
@@ -561,6 +595,23 @@ def handle_chat(
         knowledge_document = crud_knowledge.get_document(db, knowledge_document_id)
         if not knowledge_document or knowledge_document.owner_username != username:
             raise ValueError("Knowledge document not found.")
+        if knowledge_document.session_id is not None and knowledge_document.session_id != session_id:
+            raise ValueError("Knowledge document does not belong to this chat session.")
+
+    session_documents = crud_knowledge.list_documents(
+        db,
+        username,
+        session_id=session_id,
+        session_id_filter="session",
+    )
+    session_document_attachments = [
+        {
+            "id": document.id,
+            "title": document.title,
+            "session_id": document.session_id,
+        }
+        for document in session_documents
+    ]
 
     daily_limit = int(user.max_tokens_per_day or 10000)
     rolling = crud_chat.get_rolling_token_usage(db, username, window_hours=ROLLING_WINDOW_HOURS)
@@ -581,6 +632,7 @@ def handle_chat(
         content=user_message,
         request_id=request_id,
         images=images or None,
+        documents=session_document_attachments or None,
         status="pending",
     )
 

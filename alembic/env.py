@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import Column, MetaData, String, Table, engine_from_config, inspect, pool
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
@@ -21,6 +21,36 @@ if config.config_file_name is not None:
 config.set_main_option("sqlalchemy.url", settings.sqlalchemy_database_url)
 
 target_metadata = Base.metadata
+
+
+def ensure_version_table_shape(connection) -> None:
+    metadata = MetaData()
+    version_table = Table(
+        "alembic_version",
+        metadata,
+        Column("version_num", String(255), primary_key=True),
+    )
+    metadata.create_all(connection, tables=[version_table], checkfirst=True)
+
+    inspector = inspect(connection)
+    columns = inspector.get_columns("alembic_version")
+    version_column = next((column for column in columns if column["name"] == "version_num"), None)
+    if version_column is None:
+        return
+
+    current_length = getattr(version_column.get("type"), "length", None)
+    if current_length is not None and current_length >= 255:
+        return
+
+    dialect_name = connection.dialect.name
+    if dialect_name == "postgresql":
+        connection.exec_driver_sql(
+            "ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(255)"
+        )
+    elif dialect_name.startswith("mysql"):
+        connection.exec_driver_sql(
+            "ALTER TABLE alembic_version MODIFY version_num VARCHAR(255) NOT NULL"
+        )
 
 
 def run_migrations_offline() -> None:
@@ -45,6 +75,8 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        with connection.begin():
+            ensure_version_table_shape(connection)
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
