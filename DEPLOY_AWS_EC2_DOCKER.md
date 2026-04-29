@@ -322,6 +322,40 @@ http://127.0.0.1:9001
 
 ## 13. Quy trình update sau khi bạn push code lên GitHub
 
+### 13.0 Cách đơn giản nhất: dùng script một lệnh
+
+Repo backend hiện có sẵn script `scripts/deploy_ec2.sh` để gom các bước `git pull + docker compose up -d --build + health check` vào một lệnh.
+
+Lần đầu trên EC2, nhớ cấp quyền chạy:
+
+```bash
+cd /opt/dominic/DominicBE
+chmod +x scripts/deploy_ec2.sh
+```
+
+Sau mỗi lần bạn push code lên GitHub, chỉ cần SSH vào EC2 rồi chạy:
+
+```bash
+cd /opt/dominic/DominicBE
+./scripts/deploy_ec2.sh
+```
+
+Một vài biến thể hữu ích:
+
+```bash
+./scripts/deploy_ec2.sh --target backend
+./scripts/deploy_ec2.sh --target frontend
+./scripts/deploy_ec2.sh --skip-pull
+./scripts/deploy_ec2.sh --no-build
+```
+
+Script này giả định layout EC2 hiện tại của bạn là:
+
+- `/opt/dominic/DominicBE`
+- `/opt/dominic/Dominic/chatbot-ui`
+
+Nếu khác layout, truyền path riêng bằng `--backend-repo` và `--frontend-repo`.
+
 ### 13.1 SSH vào EC2
 
 ```bash

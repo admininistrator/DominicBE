@@ -223,6 +223,7 @@ Response trả về số document được chọn, số thành công/thất bạ
 - copy `.env.ec2.example` thành `.env.ec2` và điền secret/domain thật
 - chạy `docker compose --env-file .env.ec2 -f deploy/docker-compose.ec2.yml up -d --build`
 - cấu hình Nginx host cho `dominicapp.dev` và `api.dominicapp.dev`
+- các lần update sau có thể dùng `./scripts/deploy_ec2.sh` trên EC2 thay cho việc gõ lại từng lệnh
 
 Guide chi tiết từng bước nằm ở `DEPLOY_AWS_EC2_DOCKER.md`.
 
