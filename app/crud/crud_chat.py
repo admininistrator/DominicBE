@@ -20,16 +20,19 @@ def _encode_message_payload(
     images: list[str] | None = None,
     documents: list[dict] | None = None,
     sources: list[dict] | None = None,
+    assistant_meta: dict | None = None,
 ) -> str | None:
     normalized_images = [image for image in (images or []) if image]
     normalized_documents = [document for document in (documents or []) if document]
     normalized_sources = [source for source in (sources or []) if source]
-    if not normalized_images and not normalized_documents and not normalized_sources:
+    normalized_assistant_meta = assistant_meta or None
+    if not normalized_images and not normalized_documents and not normalized_sources and not normalized_assistant_meta:
         return None
     return json.dumps({
         "images": normalized_images,
         "documents": normalized_documents,
         "sources": normalized_sources,
+        "assistant_meta": normalized_assistant_meta,
     })
 
 def create_message(
@@ -42,6 +45,7 @@ def create_message(
     images: list[str] | None = None,
     documents: list[dict] | None = None,
     sources: list[dict] | None = None,
+    assistant_meta: dict | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     status: str = "pending",
@@ -55,7 +59,7 @@ def create_message(
         role=role,
         sender_username=sender_username,
         content=content,
-        image_payload_json=_encode_message_payload(images, documents, sources),
+        image_payload_json=_encode_message_payload(images, documents, sources, assistant_meta),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         status=status,

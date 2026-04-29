@@ -1,15 +1,8 @@
-"""Unified LLM provider layer using LiteLLM.
+"""Unified LLM provider layer using LiteLLM over 9router.
 
-Provides a single interface to call any model (Anthropic, OpenAI, Gemini, Azure, etc.)
-by changing only the model string in config.  No other code needs to change when
-switching providers.
-
-Model string examples:
-    "anthropic/claude-3-5-haiku-latest"   ← Anthropic
-    "openai/gpt-4o"                       ← OpenAI
-    "gemini/gemini-1.5-pro"               ← Google Gemini
-    "azure/gpt-4o"                        ← Azure OpenAI
-    "ollama/llama3"                       ← local Ollama
+Chat and vision requests are normalized onto the OpenAI-compatible 9router
+gateway so the rest of the application can switch among a small allowlist of
+user-facing model names without changing call sites.
 
 Image processing pipeline (applied automatically):
     1. Resize  – longest side ≤ LLM_IMAGE_MAX_DIMENSION (default 1 568 px)
@@ -19,20 +12,19 @@ Image processing pipeline (applied automatically):
                  When OCR text is extracted, the image bytes are *not* sent to
                  the vision model → significant token savings.
 
-Prompt caching (Anthropic only, transparent no-op for other providers):
-    When LLM_PROMPT_CACHING_ENABLED=true and the system prompt is long
-    enough (≥ LLM_PROMPT_CACHING_MIN_CHARS), ``cache_control`` blocks are
-    injected so Anthropic can cache the prefix.
-    Cache read cost: 10 % of normal.  Cache write: 125 % (amortised fast).
+Prompt caching hooks are retained for backward compatibility, but the current
+9router flow does not add provider-specific cache directives.
 """
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import mimetypes
 from typing import Any
 
 import litellm
+import requests
 from litellm import ModelResponse
 from litellm.exceptions import (
     AuthenticationError,
@@ -53,90 +45,371 @@ litellm.set_verbose = False
 
 # ── Model resolution ──────────────────────────────────────────────────────────
 
+DEFAULT_9ROUTER_MODEL = "gpt-5.4"
+
+MODEL_TARGET_ALIASES = {
+    "deepseek-v4-pro": "deepseek_v4_pro_target",
+}
+
+KILOCODE_REASONING_MODELS = {
+    "openai/kc/moonshotai/kimi-k2.6",
+    "openai/kc/qwen/qwen3.6-plus",
+}
+
+KILOCODE_REASONING_EFFORT_MAP = {
+    "instant": "none",
+    "thinking": "minimal",
+}
+
+
+def list_supported_chat_models() -> list[str]:
+    configured = settings.supported_chat_models
+    return configured or [DEFAULT_9ROUTER_MODEL]
+
+
+def _normalize_9router_model_name(model_name: str | None) -> str:
+    normalized = (model_name or "").strip()
+    if not normalized:
+        return ""
+    if normalized.startswith("openai/"):
+        normalized = normalized.split("/", 1)[1]
+    if normalized.startswith("gh/"):
+        normalized = normalized.split("/", 1)[1]
+    return normalized
+
+
+def _validate_9router_model_name(model_name: str | None) -> str:
+    normalized = _normalize_9router_model_name(model_name)
+    if not normalized:
+        return ""
+
+    supported = list_supported_chat_models()
+    if normalized not in supported:
+        raise RuntimeError(
+            "Unsupported chat model '%s'. Supported models: %s"
+            % (normalized, ", ".join(supported))
+        )
+    return normalized
+
+
+def _resolve_configured_model_name(model_name: str | None, *, source: str) -> str:
+    normalized = _normalize_9router_model_name(model_name)
+    if not normalized:
+        return ""
+
+    supported = list_supported_chat_models()
+    if normalized not in supported:
+        logger.warning(
+            "Ignoring unsupported configured model from %s: %s. Falling back to %s.",
+            source,
+            normalized,
+            DEFAULT_9ROUTER_MODEL,
+        )
+        return ""
+    return normalized
+
+
+def _to_litellm_model(model_name: str) -> str:
+    normalized = _normalize_9router_model_name(model_name)
+    if not normalized:
+        return ""
+
+    target_setting_name = MODEL_TARGET_ALIASES.get(normalized)
+    if target_setting_name:
+        configured_target = getattr(settings, target_setting_name, "")
+        target = (configured_target or "").strip()
+        if target:
+            return f"openai/{target}"
+
+    if "/" in normalized:
+        return f"openai/{normalized}"
+
+    return f"openai/gh/{normalized}"
+
+
+def _normalize_reasoning_effort(value: str | None) -> str | None:
+    normalized = (value or "").strip().lower()
+    return normalized or None
+
+
+def _provider_reasoning_effort(model_str: str, value: str | None) -> str | None:
+    normalized = _normalize_reasoning_effort(value)
+    if not normalized:
+        return None
+    if model_str in KILOCODE_REASONING_MODELS:
+        return KILOCODE_REASONING_EFFORT_MAP.get(normalized)
+    return normalized
+
+
+def _supports_reasoning_effort(model_str: str) -> bool:
+    return model_str.startswith("openai/gh/gpt-") or model_str in {
+        "openai/gh/claude-sonnet-4.6",
+        "openai/gh/claude-opus-4.6",
+    } or model_str in KILOCODE_REASONING_MODELS
+
 def resolve_model(model: str | None = None) -> str:
-    """Return the full LiteLLM model string to use.
+    """Return the full LiteLLM model string for the 9router-backed chat model."""
+    explicit = _validate_9router_model_name(model)
+    if explicit:
+        return _to_litellm_model(explicit)
 
-    Priority:
-    1. Explicit ``model`` argument
-    2. ``LLM_MODEL`` env / settings (e.g. "anthropic/claude-3-5-haiku-latest")
-    3. Legacy ``ANTHROPIC_MODEL`` env prefixed with "anthropic/"
-    4. Hardcoded safe default
-    """
-    if model and model.strip():
-        return model.strip()
-
-    configured = (settings.llm_model or "").strip()
+    configured = _resolve_configured_model_name(settings.llm_model, source="LLM_MODEL")
     if configured:
-        return configured
+        return _to_litellm_model(configured)
 
-    # Backward-compat: use anthropic_model with provider prefix
-    legacy = (settings.anthropic_model or "").strip()
-    if legacy:
-        if "/" not in legacy:
-            return f"anthropic/{legacy}"
-        return legacy
+    configured = _resolve_configured_model_name(
+        settings.github_copilot_model_name,
+        source="MODEL_GITHUB_COPILOT",
+    )
+    if configured:
+        return _to_litellm_model(configured)
 
-    return "anthropic/claude-3-5-haiku-latest"
+    return _to_litellm_model(DEFAULT_9ROUTER_MODEL)
 
 
 def resolve_vision_model(model: str | None = None) -> str:
     """Return vision-capable model string."""
-    if model and model.strip():
-        return model.strip()
-    configured = (settings.llm_vision_model or "").strip()
+    explicit = _validate_9router_model_name(model)
+    if explicit:
+        return _to_litellm_model(explicit)
+
+    configured = _resolve_configured_model_name(settings.llm_vision_model, source="LLM_VISION_MODEL")
     if configured:
-        return configured
-    # Fall back to main model – most modern models are vision-capable
+        return _to_litellm_model(configured)
+
     return resolve_model()
 
 
 # ── API key / extra kwargs per provider ──────────────────────────────────────
 
 def _provider_name(model_str: str) -> str:
-    """Extract provider name from a LiteLLM model string (e.g. 'anthropic/...' → 'anthropic')."""
-    return model_str.split("/")[0].lower() if "/" in model_str else "anthropic"
+    """Extract provider name from a LiteLLM model string."""
+    return model_str.split("/")[0].lower() if "/" in model_str else "openai"
 
 
 def _provider_kwargs(model_str: str) -> dict[str, Any]:
-    """Inject provider-specific API keys / base URLs into litellm call kwargs."""
-    kwargs: dict[str, Any] = {}
-    provider = model_str.split("/")[0].lower() if "/" in model_str else "anthropic"
+    """Inject 9router API credentials into the LiteLLM call."""
+    if not model_str.startswith("openai/"):
+        raise RuntimeError(
+            "Only 9router-backed 'openai/*' chat models are supported in this project."
+        )
 
-    if provider == "anthropic":
-        api_key = (settings.anthropic_api_key or "").strip()
-        if not api_key:
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY is not set. "
-                "Configure it in .env or environment variables."
-            )
-        kwargs["api_key"] = api_key
-        base_url = (settings.anthropic_base_url or "").strip()
-        if base_url:
-            kwargs["api_base"] = base_url
+    api_key = (settings.github_copilot_api_key or "").strip() or (settings.openai_api_key or "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "GITHUB_COPILOT_API_KEY is not set. Configure it in .env or environment variables."
+        )
 
-    elif provider in ("openai", "azure"):
-        api_key = (settings.openai_api_key or "").strip()
-        if not api_key:
-            raise RuntimeError(
-                "OPENAI_API_KEY is not set. "
-                "Configure it in .env or environment variables."
-            )
-        kwargs["api_key"] = api_key
-        base_url = (settings.openai_base_url or "").strip()
-        if base_url:
-            kwargs["api_base"] = base_url
+    base_url = (settings.ninerouter_base_url or "").strip() or (settings.openai_base_url or "").strip()
+    if not base_url:
+        raise RuntimeError(
+            "NINEROUTER_BASE_URL is not set. Configure it in .env or environment variables."
+        )
 
-    elif provider == "gemini":
-        api_key = (settings.gemini_api_key or "").strip()
-        if not api_key:
-            raise RuntimeError(
-                "GEMINI_API_KEY is not set. "
-                "Configure it in .env or environment variables."
-            )
-        kwargs["api_key"] = api_key
+    return {
+        "api_key": api_key,
+        "api_base": base_url,
+    }
 
-    # For other providers (ollama, cohere, etc.) litellm handles auth from env.
-    return kwargs
+
+def _uses_direct_9router_http(model_str: str) -> bool:
+    return model_str.startswith("openai/gh/gemini-")
+
+
+def _uses_direct_9router_chat_http(model_str: str) -> bool:
+    return model_str == "openai/kc/minimax/minimax-m2.7"
+
+
+def _uses_direct_9router_reasoning_chat_http(model_str: str, reasoning_effort: str | None) -> bool:
+    return model_str in KILOCODE_REASONING_MODELS and bool(reasoning_effort)
+
+
+def _extract_json_from_9router_response(response: requests.Response) -> dict[str, Any]:
+    try:
+        return response.json()
+    except ValueError:
+        pass
+
+    text = response.text or ""
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate or candidate == "data: [DONE]":
+            continue
+        if candidate.startswith("data: "):
+            candidate = candidate[6:].strip()
+        try:
+            return json.loads(candidate)
+        except ValueError:
+            continue
+
+    raise ValueError("9router response did not contain a valid JSON payload")
+
+
+def _extract_text_for_token_estimate(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "text":
+                parts.append(str(item.get("text") or ""))
+                continue
+            if item_type == "input_text":
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def _estimate_token_count_from_text(text: str) -> int:
+    normalized = (text or "").strip()
+    if not normalized:
+        return 0
+    return max(1, len(normalized) // max(1, settings.token_estimate_chars_per_token))
+
+
+def _estimate_token_count_from_messages(messages: list[dict[str, Any]]) -> int:
+    total_chars = 0
+    for message in messages:
+        total_chars += len(_extract_text_for_token_estimate(message.get("content")))
+    if total_chars <= 0:
+        return 0
+    return max(1, total_chars // max(1, settings.token_estimate_chars_per_token))
+
+
+def _complete_via_9router_http(
+    *,
+    model_str: str,
+    call_messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float | None,
+    reasoning_effort: str | None,
+    extra_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    base_url = (extra_kwargs.get("api_base") or "").rstrip("/")
+    api_key = (extra_kwargs.get("api_key") or "").strip()
+    if not base_url or not api_key:
+        raise RuntimeError("Missing 9router credentials for direct Gemini call")
+
+    payload: dict[str, Any] = {
+        "model": model_str.split("openai/", 1)[1],
+        "input": call_messages,
+        "stream": False,
+    }
+    if max_tokens:
+        payload["max_output_tokens"] = max_tokens
+    if temperature is not None:
+        payload["temperature"] = temperature
+
+    response = requests.post(
+        f"{base_url}/responses",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=120,
+    )
+    if response.status_code == 401:
+        raise LLMError(401, "Xác thực thất bại với provider 'openai'. Kiểm tra API key.")
+    if response.status_code == 429:
+        raise LLMError(429, "Provider đang giới hạn tốc độ. Vui lòng thử lại sau.")
+    if response.status_code >= 500:
+        raise LLMError(503, "Provider 'openai' tạm thời không khả dụng. Thử lại sau.")
+    if response.status_code >= 400:
+        detail = response.text.strip()[:200] or "Yêu cầu không hợp lệ"
+        raise LLMError(400, f"Yêu cầu không hợp lệ: {detail}")
+
+    data = _extract_json_from_9router_response(response)
+    choices = data.get("choices") or []
+    message = choices[0].get("message") if choices else {}
+    usage = data.get("usage") or {}
+    text = message.get("content") or ""
+    input_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    output_tokens = int(usage.get("completion_tokens", 0) or 0)
+    if input_tokens <= 0:
+        input_tokens = _estimate_token_count_from_messages(call_messages)
+    if output_tokens <= 0:
+        output_tokens = _estimate_token_count_from_text(text)
+    return {
+        "text": text,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "model": data.get("model") or model_str,
+    }
+
+
+def _complete_via_9router_chat_http(
+    *,
+    model_str: str,
+    call_messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float | None,
+    reasoning_effort: str | None,
+    extra_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    base_url = (extra_kwargs.get("api_base") or "").rstrip("/")
+    api_key = (extra_kwargs.get("api_key") or "").strip()
+    if not base_url or not api_key:
+        raise RuntimeError("Missing 9router credentials for direct chat call")
+
+    payload: dict[str, Any] = {
+        "model": model_str.split("openai/", 1)[1],
+        "messages": call_messages,
+        "stream": False,
+    }
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
+
+    response = requests.post(
+        f"{base_url}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=120,
+    )
+    if response.status_code == 401:
+        raise LLMError(401, "Xác thực thất bại với provider 'openai'. Kiểm tra API key.")
+    if response.status_code == 429:
+        raise LLMError(429, "Provider đang giới hạn tốc độ. Vui lòng thử lại sau.")
+    if response.status_code >= 500:
+        raise LLMError(503, "Provider 'openai' tạm thời không khả dụng. Thử lại sau.")
+    if response.status_code >= 400:
+        detail = response.text.strip()[:200] or "Yêu cầu không hợp lệ"
+        raise LLMError(400, f"Yêu cầu không hợp lệ: {detail}")
+
+    data = _extract_json_from_9router_response(response)
+    choices = data.get("choices") or []
+    message = choices[0].get("message") if choices else {}
+    usage = data.get("usage") or {}
+    text = message.get("content") or ""
+    input_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    output_tokens = int(usage.get("completion_tokens", 0) or 0)
+    if input_tokens <= 0:
+        input_tokens = _estimate_token_count_from_messages(call_messages)
+    if output_tokens <= 0:
+        output_tokens = _estimate_token_count_from_text(text)
+    return {
+        "text": text,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "model": data.get("model") or model_str,
+    }
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
@@ -217,77 +490,15 @@ def _preprocess_image(image_data: str | bytes, media_type: str) -> tuple[str | b
         return image_data, media_type, None
 
 
-# ── Prompt caching (Anthropic only) ──────────────────────────────────────────
+# ── Prompt caching hook (currently a no-op for 9router) ─────────────────────
 
 def _apply_prompt_caching(
     call_messages: list[dict],
     system: str | None,
     model_str: str,
 ) -> tuple[list[dict], str | None]:
-    """Inject Anthropic ``cache_control`` blocks where beneficial.
-
-    Rules:
-    - Only applied when provider == "anthropic" and caching is enabled.
-    - System prompt: cached when len(system) ≥ LLM_PROMPT_CACHING_MIN_CHARS.
-    - Last two human turns: mark with cache_control so repeated queries
-      against the same long context get cache hits on the knowledge block.
-
-    Returns:
-        (modified_messages, modified_system)
-        modified_system is None when it should be passed as a system message
-        inside the messages list (Anthropic SDK style).
-    """
-    if not settings.llm_prompt_caching_enabled:
-        return call_messages, system
-    if _provider_name(model_str) != "anthropic":
-        return call_messages, system
-
-    min_chars = settings.llm_prompt_caching_min_chars
-    cached_system = system
-
-    # Cache system prompt when large enough
-    if system and len(system) >= min_chars:
-        # LiteLLM forwards cache_control when system is passed as a list of blocks
-        # We signal this by attaching metadata to the system string – but since
-        # LiteLLM doesn't support that directly, we instead prepend a system
-        # message with cache_control content array.
-        cached_system = None  # will be injected into messages below
-        system_block = {
-            "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": system,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-        }
-        call_messages = [system_block] + call_messages
-        logger.debug("Prompt caching: system prompt cached (%d chars)", len(system))
-
-    # Cache the last user message that has substantial context (e.g. RAG block).
-    # We find user messages with long content and add cache_control to their
-    # last text block.
-    cacheable_indices = [
-        i for i, m in enumerate(call_messages)
-        if m.get("role") == "user"
-        and isinstance(m.get("content"), str)
-        and len(m["content"]) >= min_chars
-    ]
-    # Cache at most the 2 most recent long user messages
-    for idx in cacheable_indices[-2:]:
-        msg = call_messages[idx]
-        content = msg["content"]
-        if isinstance(content, str):
-            call_messages[idx] = {
-                **msg,
-                "content": [
-                    {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
-                ],
-            }
-            logger.debug("Prompt caching: user message idx=%d cached (%d chars)", idx, len(content))
-
-    return call_messages, cached_system
+    del model_str
+    return call_messages, system
 
 
 # ── Core completion ───────────────────────────────────────────────────────────
@@ -309,6 +520,7 @@ def complete(
     images: list[str | bytes] | None = None,
     image_media_types: list[str] | None = None,
     temperature: float | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict:
     """Call the configured LLM and return a normalized response dict.
 
@@ -383,10 +595,45 @@ def complete(
     if temperature is not None:
         call_kwargs["temperature"] = temperature
 
+    effective_reasoning_effort = _normalize_reasoning_effort(reasoning_effort) or _normalize_reasoning_effort(settings.llm_reasoning_effort)
+    provider_reasoning_effort = _provider_reasoning_effort(model_str, effective_reasoning_effort)
+    if provider_reasoning_effort and _supports_reasoning_effort(model_str):
+        call_kwargs["reasoning_effort"] = provider_reasoning_effort
+        if model_str in {"openai/gh/claude-sonnet-4.6", "openai/gh/claude-opus-4.6"} | KILOCODE_REASONING_MODELS:
+            call_kwargs["allowed_openai_params"] = ["reasoning_effort"]
+    elif effective_reasoning_effort:
+        logger.info(
+            "Ignoring reasoning_effort=%s for unsupported model=%s",
+            effective_reasoning_effort,
+            model_str,
+        )
+
     logger.debug(
         "LiteLLM call model=%s messages=%d vision_imgs=%d ocr_imgs=%d max_tokens=%d",
         model_str, len(call_messages), len(processed_images), len(ocr_texts), max_tokens,
     )
+
+    if _uses_direct_9router_http(model_str):
+        return _complete_via_9router_http(
+            model_str=model_str,
+            call_messages=call_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=effective_reasoning_effort,
+            extra_kwargs=extra_kwargs,
+        )
+    if _uses_direct_9router_chat_http(model_str) or _uses_direct_9router_reasoning_chat_http(
+        model_str,
+        provider_reasoning_effort,
+    ):
+        return _complete_via_9router_chat_http(
+            model_str=model_str,
+            call_messages=call_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=provider_reasoning_effort,
+            extra_kwargs=extra_kwargs,
+        )
 
     try:
         response: ModelResponse = litellm.completion(**call_kwargs)

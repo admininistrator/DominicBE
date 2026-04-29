@@ -72,11 +72,12 @@ async def lifespan(app: FastAPI):
         "AUTH_ACCESS_TOKEN_EXPIRE_MINUTES = %s",
         settings.auth_access_token_expire_minutes,
     )
-    logger.info("anthropic package version = %s", _get_package_version("anthropic"))
-    logger.info("ANTHROPIC_API_KEY set = %s", bool(settings.anthropic_api_key))
-    logger.info("ANTHROPIC_MODEL = %s", settings.anthropic_model)
-    logger.info("ANTHROPIC_BASE_URL = %s", settings.anthropic_base_url or "(default)")
-    logger.info("ANTHROPIC_FORCE_IPV4 = %s", settings.anthropic_force_ipv4)
+    logger.info("litellm package version = %s", _get_package_version("litellm"))
+    logger.info("GITHUB_COPILOT_API_KEY set = %s", bool(settings.github_copilot_api_key))
+    logger.info("MODEL_GITHUB_COPILOT = %s", settings.github_copilot_model_name)
+    logger.info("LLM_MODEL = %s", settings.llm_model or "(resolved from MODEL_GITHUB_COPILOT)")
+    logger.info("NINEROUTER_BASE_URL = %s", settings.ninerouter_base_url)
+    logger.info("LLM_CONTEXT_WINDOW = %s", settings.llm_context_window)
     if settings.auth_secret_key == "change-this-in-production":
         logger.warning(
             "AUTH_SECRET_KEY is using the default value. Set a strong secret in non-local environments."
@@ -209,10 +210,12 @@ def debug_env(current_user=Depends(get_current_user_optional)):
         "db_name": settings.db_name,
         "db_user": settings.db_user,
         "db_password_set": bool(settings.db_password),
-        "anthropic_api_key_set": bool(settings.anthropic_api_key),
-        "anthropic_model": settings.anthropic_model,
-        "anthropic_base_url": settings.anthropic_base_url or "(default)",
-        "anthropic_force_ipv4": settings.anthropic_force_ipv4,
+        "github_copilot_api_key_set": bool(settings.github_copilot_api_key),
+        "default_chat_model": settings.github_copilot_model_name,
+        "llm_model": settings.llm_model or "(resolved from MODEL_GITHUB_COPILOT)",
+        "supported_chat_models": settings.supported_chat_models,
+        "ninerouter_base_url": settings.ninerouter_base_url,
+        "llm_context_window": settings.llm_context_window,
         "db_url_masked": _mask_db_url(settings.sqlalchemy_database_url),
     }
 

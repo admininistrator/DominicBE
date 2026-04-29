@@ -1,0 +1,16 @@
+[Unit]
+Description=Dominic Docker Compose stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dominic/DominicBE
+ExecStart=/usr/bin/docker compose --env-file /opt/dominic/DominicBE/.env.ec2 -f /opt/dominic/DominicBE/deploy/docker-compose.ec2.yml up -d --build
+ExecStop=/usr/bin/docker compose --env-file /opt/dominic/DominicBE/.env.ec2 -f /opt/dominic/DominicBE/deploy/docker-compose.ec2.yml down
+RemainAfterExit=yes
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

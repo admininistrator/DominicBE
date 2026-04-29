@@ -17,3 +17,4 @@ Quy tắc lập trình cho DominicBE
 - Luôn giữ cho codebase sạch sẽ, tránh để lại code thừa hoặc không sử dụng
 - Khi thêm tính năng mới, hãy đảm bảo nó được tích hợp tốt với các phần đã có
 - Luôn cập nhật README.md và tài liệu liên quan khi có thay đổi về API hoặc cách sử dụng
+- Khi thêm mới các nút, component nói chung trên UI, cần đảm bảo tính tương thích với các nút, component khác, đi theo phong cách của UI hiện tại

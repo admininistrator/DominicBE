@@ -203,7 +203,36 @@ Response trả về số document được chọn, số thành công/thất bạ
 
 ---
 
-# DominicBE deployment guide (AWS EC2 - Singapore)
+## Dockerized AWS deployment hiện tại
+
+### Đã làm được
+
+- backend đã có `Dockerfile` production và entrypoint tự chạy `alembic upgrade head`
+- frontend đã có `Dockerfile` multi-stage để build Vite và phục vụ bằng Nginx
+- repo backend có `deploy/docker-compose.ec2.yml` để dựng `frontend + backend + postgres + minio + qdrant`
+- repo backend có Nginx config mẫu và systemd service mẫu cho EC2
+
+### Chưa bao gồm trong stack này
+
+- `9router` chưa được đóng gói trong compose production này
+- nếu muốn chat hoạt động, bạn vẫn phải cấu hình `GITHUB_COPILOT_API_KEY` và `NINEROUTER_BASE_URL` thật
+
+### Cần làm tiếp khi triển khai
+
+- clone `DominicBE` và `Dominic` thành hai thư mục sibling trên EC2
+- copy `.env.ec2.example` thành `.env.ec2` và điền secret/domain thật
+- chạy `docker compose --env-file .env.ec2 -f deploy/docker-compose.ec2.yml up -d --build`
+- cấu hình Nginx host cho `dominicapp.dev` và `api.dominicapp.dev`
+
+Guide chi tiết từng bước nằm ở `DEPLOY_AWS_EC2_DOCKER.md`.
+
+---
+
+# Legacy deployment guide (deprecated - MySQL + systemd)
+
+Phần bên dưới là guide cũ cho thời điểm backend còn đi theo hướng `MySQL + systemd` và frontend chưa được đưa về AWS.
+
+Nếu bạn triển khai trạng thái code hiện tại, hãy ưu tiên dùng guide mới ở `DEPLOY_AWS_EC2_DOCKER.md`.
 
 This backend is a FastAPI app using:
 - FastAPI + Gunicorn/Uvicorn

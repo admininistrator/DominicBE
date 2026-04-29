@@ -1,7 +1,24 @@
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
+
+from app.core.config import settings
+
+
+def _allowed_reasoning_efforts_for_model(model_name: str | None) -> set[str]:
+    normalized = (model_name or "").strip().lower()
+    if not normalized:
+        return {"low", "medium", "high"}
+    if normalized.startswith("gpt-"):
+        return {"low", "medium", "high"}
+    if normalized == "claude-sonnet-4.6":
+        return {"low", "medium", "high"}
+    if normalized == "claude-opus-4.6":
+        return {"low", "medium", "high", "xhigh"}
+    if normalized in {"kc/moonshotai/kimi-k2.6", "kc/qwen/qwen3.6-plus"}:
+        return {"instant", "thinking"}
+    return set()
 
 
 class ChatRequest(BaseModel):
@@ -10,6 +27,8 @@ class ChatRequest(BaseModel):
     message: str
     knowledge_document_id: int | None = Field(default=None, ge=1)
     use_web_search: bool = False
+    model: str | None = None
+    reasoning_effort: str | None = None
     # Vision: list of base64-encoded image strings or data-URIs.
     # Only used when LLM_VISION_ENABLED=true and the model supports vision.
     images: list[str] = Field(default_factory=list)
@@ -23,6 +42,63 @@ class ChatRequest(BaseModel):
         if len(v) > 10:
             raise ValueError("Maximum 10 images per message.")
         return v
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+
+        normalized = value.strip()
+        if not normalized:
+            return None
+
+        if normalized.startswith("openai/gh/"):
+            normalized = normalized.split("openai/gh/", 1)[1]
+        elif normalized.startswith("openai/"):
+            normalized = normalized.split("openai/", 1)[1]
+        if normalized.startswith("gh/"):
+            normalized = normalized.split("gh/", 1)[1]
+
+        if normalized not in settings.supported_chat_models:
+            raise ValueError(
+                "Unsupported chat model. Supported models: " + ", ".join(settings.supported_chat_models)
+            )
+        return normalized
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _validate_reasoning_effort(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+
+        normalized = value.strip().lower()
+        if not normalized:
+            return None
+
+        if normalized not in {"low", "medium", "high", "xhigh", "instant", "thinking"}:
+            raise ValueError(
+                "Unsupported reasoning effort. Supported values: low, medium, high, xhigh, instant, thinking"
+            )
+
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_reasoning_effort_for_model(self):
+        if not self.reasoning_effort:
+            return self
+
+        allowed_efforts = _allowed_reasoning_efforts_for_model(self.model)
+        if self.model and self.reasoning_effort not in allowed_efforts:
+            raise ValueError(
+                "Unsupported reasoning effort '%s' for model '%s'. Supported values: %s"
+                % (
+                    self.reasoning_effort,
+                    self.model,
+                    ", ".join(sorted(allowed_efforts)) or "none",
+                )
+            )
+        return self
 
 
 class CitationSource(BaseModel):
@@ -73,12 +149,19 @@ class MessageDocument(BaseModel):
     session_id: int | None = None
 
 
+class AssistantMessageMeta(BaseModel):
+    model: str | None = None
+    reasoning_effort: str | None = None
+    display_text: str | None = None
+
+
 class ChatResponse(BaseModel):
     success: bool
     reply: str
     usage: TokenUsage
     request_id: Optional[str] = None
     sources: list[CitationSource] = Field(default_factory=list)
+    assistant_meta: AssistantMessageMeta | None = None
     retrieval: RetrievalMetadata | None = None
 
 
@@ -120,6 +203,7 @@ class SessionMessageResponse(BaseModel):
     content: str
     images: list[str] = Field(default_factory=list)
     documents: list[MessageDocument] = Field(default_factory=list)
+    assistant_meta: AssistantMessageMeta | None = None
     input_tokens: int
     output_tokens: int
     created_at: datetime

@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -22,6 +23,8 @@ SUMMARY_TRIGGER_MESSAGES = settings.summary_trigger_messages
 TOKEN_ESTIMATE_CHARS_PER_TOKEN = settings.token_estimate_chars_per_token
 
 logger = logging.getLogger("uvicorn.error")
+
+SOURCE_CITATION_PATTERN = re.compile(r"\[Source\s+(\d+)\]")
 
 
 class ProviderRequestError(Exception):
@@ -132,6 +135,64 @@ def _load_message_sources(payload: str | None) -> list[dict]:
     return normalized_sources
 
 
+def _load_message_assistant_meta(payload: str | None) -> dict | None:
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except Exception:
+        logger.warning("Failed to decode message assistant meta payload.", exc_info=True)
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    assistant_meta = data.get("assistant_meta") or {}
+    if not isinstance(assistant_meta, dict):
+        return None
+
+    model_name = (assistant_meta.get("model") or "").strip()
+    reasoning_effort = (assistant_meta.get("reasoning_effort") or "").strip().lower() or None
+    display_text = (assistant_meta.get("display_text") or "").strip()
+    if not model_name and not display_text:
+        return None
+
+    return {
+        "model": model_name or None,
+        "reasoning_effort": reasoning_effort,
+        "display_text": display_text or model_name,
+    }
+
+
+def _resolve_display_model_name(model_name: str | None) -> str:
+    explicit = (model_name or "").strip()
+    if explicit:
+        if explicit.startswith("openai/gh/"):
+            return explicit.split("openai/gh/", 1)[1]
+        if explicit.startswith("openai/"):
+            return explicit.split("openai/", 1)[1]
+        if explicit.startswith("gh/"):
+            return explicit.split("gh/", 1)[1]
+        return explicit
+
+    resolved = llm_provider.resolve_model(model_name)
+    if resolved.startswith("openai/gh/"):
+        return resolved.split("openai/gh/", 1)[1]
+    if resolved.startswith("openai/"):
+        return resolved.split("openai/", 1)[1]
+    return resolved
+
+
+def _build_assistant_meta(model_name: str | None, reasoning_effort: str | None) -> dict:
+    display_model = _resolve_display_model_name(model_name)
+    normalized_effort = (reasoning_effort or "").strip().lower() or None
+    display_text = f"{display_model} {normalized_effort}" if normalized_effort else display_model
+    return {
+        "model": display_model,
+        "reasoning_effort": normalized_effort,
+        "display_text": display_text,
+    }
+
+
 def get_usage(db: Session, username: str):
     user = crud_chat.get_user_by_username(db, username)
     if not user:
@@ -218,6 +279,7 @@ def get_session_history(db: Session, username: str, session_id: int):
             "content": m.content,
             "images": _load_message_images(m.__dict__.get("image_payload_json")),
             "documents": _load_message_documents(m.__dict__.get("image_payload_json")),
+            "assistant_meta": _load_message_assistant_meta(m.__dict__.get("image_payload_json")) if m.role == "assistant" else None,
             "input_tokens": int(m.input_tokens or 0),
             "output_tokens": int(m.output_tokens or 0),
             "created_at": m.created_at,
@@ -483,18 +545,31 @@ def _compose_system_prompt(
     *,
     knowledge_document_id: int | None = None,
     web_search_result: dict | None = None,
+    knowledge_base_active: bool = True,
 ) -> str:
     retrieved_results = (retrieval_result or {}).get("packed_results") or (retrieval_result or {}).get("results") or []
     web_results = (web_search_result or {}).get("results") or []
     evidence_strength = (retrieval_result or {}).get("evidence_strength") or "none"
     answer_policy = (retrieval_result or {}).get("answer_policy") or "grounded"
     fallback_used = bool((retrieval_result or {}).get("fallback_used"))
-    sections = [
-        "You are Dominic, a helpful assistant.",
-        "If knowledge-base sources are provided below, prioritize them for answers about uploaded documents.",
-        "When using those sources, cite them inline as [Source 1], [Source 2], etc.",
-        "Never fabricate sources or claim a document says something unless it is supported by the evidence block below.",
-    ]
+    sections = ["You are Dominic, a helpful assistant."]
+
+    if knowledge_base_active:
+        sections.extend(
+            [
+                "If knowledge-base sources are provided below, prioritize them for answers about uploaded documents.",
+                "When using those sources, cite them inline as [Source 1], [Source 2], etc.",
+                "Never fabricate sources or claim a document says something unless it is supported by the evidence block below.",
+            ]
+        )
+    elif web_results:
+        sections.append(
+            "No knowledge-base documents are attached for this turn. Treat the Tavily web evidence below as the primary factual grounding source, cite it inline as [Source 1], [Source 2], etc., and do not invent unsupported facts."
+        )
+    else:
+        sections.append(
+            "No knowledge-base evidence is attached to this session. Answer normally using the user's prompt and conversation context."
+        )
 
     if summary_text:
         sections.append(
@@ -509,6 +584,9 @@ def _compose_system_prompt(
         sections.append(
             "Web search evidence may be used for recent or external facts that are not covered by the uploaded knowledge base. When you rely on those results, prefer the cited sources over unsupported claims."
         )
+
+    if not knowledge_base_active:
+        return "\n\n".join(section for section in sections if section)
 
     if evidence_strength == "grounded":
         sections.append(
@@ -603,6 +681,89 @@ def _build_insufficient_evidence_reply(knowledge_document_id: int | None = None)
     )
 
 
+def _build_web_search_payload(web_search_result: dict | None, answer_policy: str | None) -> dict | None:
+    results = (web_search_result or {}).get("results") or []
+    web_used = bool((web_search_result or {}).get("used")) or bool(results)
+    if not web_used:
+        return None
+
+    return {
+        "used": False,
+        "top_k": 0,
+        "returned": 0,
+        "retrieval_id": None,
+        "latency_ms": 0,
+        "document_id": None,
+        "strategy": "web_search",
+        "original_query": (web_search_result or {}).get("query"),
+        "rewritten_query": None,
+        "query_expansions": [],
+        "fallback_used": False,
+        "fallback_reason": None,
+        "evidence_strength": "web" if results else "none",
+        "answer_policy": answer_policy,
+        "packed_count": 0,
+        "packed_token_estimate": 0,
+        "web_search_used": True,
+        "web_results_count": len(results),
+        "web_search_query": (web_search_result or {}).get("query"),
+        "web_latency_ms": int((web_search_result or {}).get("latency_ms") or 0),
+    }
+
+
+def _linkify_web_sources_in_reply(ai_content: str, sources: list[dict]) -> str:
+    text = (ai_content or "").strip()
+    if not text:
+        return ai_content
+
+    web_sources_by_rank: dict[int, dict] = {}
+    for source in sources:
+        if source.get("source_type") != "web" or not source.get("url"):
+            continue
+        rank = source.get("rank")
+        if isinstance(rank, int):
+            web_sources_by_rank[rank] = source
+
+    if not web_sources_by_rank:
+        return ai_content
+
+    used_ranks: list[int] = []
+
+    def replace_citation(match: re.Match[str]) -> str:
+        rank = int(match.group(1))
+        source = web_sources_by_rank.get(rank)
+        if not source:
+            return match.group(0)
+        if rank not in used_ranks:
+            used_ranks.append(rank)
+        return f"[Source {rank}]({source['url']})"
+
+    linked_text = SOURCE_CITATION_PATTERN.sub(replace_citation, text)
+
+    ordered_web_sources = [
+        web_sources_by_rank[rank]
+        for rank in sorted(web_sources_by_rank)
+        if rank in used_ranks
+    ]
+    if not ordered_web_sources:
+        ordered_web_sources = [web_sources_by_rank[rank] for rank in sorted(web_sources_by_rank)]
+
+    footer_lines = [
+        "",
+        "Nguồn web:",
+        *[
+            f"- [Source {source['rank']}: {source.get('title') or source.get('domain') or source['url']}]({source['url']})"
+            for source in ordered_web_sources
+        ],
+    ]
+    footer = "\n".join(footer_lines)
+
+    if footer.strip() and footer.strip() not in linked_text:
+        linked_text = linked_text.rstrip() + "\n\n" + footer.strip()
+
+    return linked_text
+
+
 def _apply_answer_guardrails(
     ai_content: str,
     retrieval_result: dict | None,
@@ -610,12 +771,18 @@ def _apply_answer_guardrails(
     *,
     knowledge_document_id: int | None = None,
     web_search_result: dict | None = None,
+    knowledge_base_active: bool = True,
 ) -> tuple[str, list[dict], str]:
     answer_policy = _determine_answer_policy(
         retrieval_result,
         knowledge_document_id=knowledge_document_id,
     )
     web_results = (web_search_result or {}).get("results") or []
+
+    if not knowledge_base_active:
+        if web_results:
+            return ai_content, sources, "web_grounded"
+        return ai_content, sources, "general_chat"
 
     if web_results and knowledge_document_id is None:
         web_policy = "grounded" if answer_policy == "grounded" else "web_grounded"
@@ -680,6 +847,16 @@ def _build_hybrid_context(db: Session, username: str, session_id: int):
     return summary_text, formatted_messages
 
 
+def _should_use_knowledge_base(
+    *,
+    knowledge_document_id: int | None,
+    session_documents: list,
+) -> bool:
+    if knowledge_document_id is not None:
+        return True
+    return bool(session_documents)
+
+
 def handle_chat(
     db: Session,
     username: str,
@@ -687,6 +864,8 @@ def handle_chat(
     user_message: str,
     knowledge_document_id: int | None = None,
     use_web_search: bool = False,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     images: list[str] | None = None,
     image_media_types: list[str] | None = None,
 ):
@@ -717,6 +896,10 @@ def handle_chat(
         }
         for document in session_documents
     ]
+    knowledge_base_active = _should_use_knowledge_base(
+        knowledge_document_id=knowledge_document_id,
+        session_documents=session_documents,
+    )
 
     daily_limit = int(user.max_tokens_per_day or 10000)
     rolling = crud_chat.get_rolling_token_usage(db, username, window_hours=ROLLING_WINDOW_HOURS)
@@ -743,31 +926,39 @@ def handle_chat(
 
     try:
         summary_text, formatted_messages = _build_hybrid_context(db, username, session_id)
-        retrieval_result = search_knowledge(
-            db=db,
-            owner_username=username,
-            query=user_message,
-            top_k=settings.retrieval_top_k,
-            document_id=knowledge_document_id,
-            session_id=session_id,
-            request_id=request_id,
-        )
-        packed_results, packed_token_estimate = _pack_retrieval_results(retrieval_result.get("results") or [])
-        retrieval_result["packed_count"] = len(packed_results)
-        retrieval_result["packed_token_estimate"] = packed_token_estimate
-        retrieval_result["packed_results"] = packed_results
+        retrieval_result = None
+        packed_results: list[dict] = []
+        packed_token_estimate = 0
+
+        if knowledge_base_active:
+            retrieval_result = search_knowledge(
+                db=db,
+                owner_username=username,
+                query=user_message,
+                top_k=settings.retrieval_top_k,
+                document_id=knowledge_document_id,
+                session_id=session_id,
+                request_id=request_id,
+            )
+            packed_results, packed_token_estimate = _pack_retrieval_results(retrieval_result.get("results") or [])
+            retrieval_result["packed_count"] = len(packed_results)
+            retrieval_result["packed_token_estimate"] = packed_token_estimate
+            retrieval_result["packed_results"] = packed_results
+
         web_search_result = {"used": False, "query": None, "latency_ms": 0, "results": []}
         if use_web_search:
             web_search_result = search_web(user_message, max_results=settings.web_search_max_results)
-        retrieval_result["web_search_used"] = bool(web_search_result.get("used"))
-        retrieval_result["web_results_count"] = len(web_search_result.get("results") or [])
-        retrieval_result["web_search_query"] = web_search_result.get("query")
-        retrieval_result["web_latency_ms"] = int(web_search_result.get("latency_ms") or 0)
-        retrieval_result["answer_policy"] = _determine_answer_policy(
-            retrieval_result,
-            knowledge_document_id=knowledge_document_id,
-        )
-        if retrieval_result.get("retrieval_id"):
+        if retrieval_result is not None:
+            retrieval_result["web_search_used"] = bool(web_search_result.get("used"))
+            retrieval_result["web_results_count"] = len(web_search_result.get("results") or [])
+            retrieval_result["web_search_query"] = web_search_result.get("query")
+            retrieval_result["web_latency_ms"] = int(web_search_result.get("latency_ms") or 0)
+            retrieval_result["answer_policy"] = _determine_answer_policy(
+                retrieval_result,
+                knowledge_document_id=knowledge_document_id,
+            )
+
+        if retrieval_result is not None and retrieval_result.get("retrieval_id"):
             crud_knowledge.update_retrieval_event_metadata(
                 db,
                 retrieval_result["retrieval_id"],
@@ -793,6 +984,7 @@ def handle_chat(
             retrieval_result,
             knowledge_document_id=knowledge_document_id,
             web_search_result=web_search_result,
+            knowledge_base_active=knowledge_base_active,
         )
         request_messages = _build_request_messages(formatted_messages, user_message)
 
@@ -815,20 +1007,27 @@ def handle_chat(
             )
             raise PermissionError(f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded.")
 
-        max_output_tokens = min(MAX_OUTPUT_TOKENS, remaining_tokens - estimated_input_tokens)
+        context_window_remaining = settings.llm_context_window - estimated_input_tokens
+        max_output_tokens = min(
+            MAX_OUTPUT_TOKENS,
+            remaining_tokens - estimated_input_tokens,
+            context_window_remaining,
+        )
         if max_output_tokens <= 0:
             crud_chat.update_message_tokens_and_status(
                 db=db,
                 message_id=user_msg.id,
                 status="error",
-                error_message="No remaining output token budget.",
+                error_message="No remaining output token budget or context window capacity.",
             )
-            raise PermissionError(f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded.")
+            raise PermissionError("Prompt vuot qua gioi han context window hoac quota token hien tai.")
 
         request_kwargs = {
             "messages": request_messages,
             "system": system_prompt or None,
             "max_tokens": max_output_tokens,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
         }
         # Attach images if provided (vision chat)
         if images and settings.llm_vision_enabled:
@@ -837,7 +1036,7 @@ def handle_chat(
 
         logger.info(
             "LiteLLM call username=%s session_id=%s model=%s messages=%d images=%d",
-            username, session_id, _get_model(), len(request_messages), len(images or []),
+            username, session_id, llm_provider.resolve_model(model), len(request_messages), len(images or []),
         )
         llm_result = llm_provider.complete(**request_kwargs)
 
@@ -851,9 +1050,13 @@ def handle_chat(
             sources,
             knowledge_document_id=knowledge_document_id,
             web_search_result=web_search_result,
+            knowledge_base_active=knowledge_base_active,
         )
-        retrieval_result["answer_policy"] = answer_policy
-        if retrieval_result.get("retrieval_id"):
+        ai_content = _linkify_web_sources_in_reply(ai_content, sources)
+        if retrieval_result is not None:
+            retrieval_result["answer_policy"] = answer_policy
+
+        if retrieval_result is not None and retrieval_result.get("retrieval_id"):
             crud_knowledge.update_retrieval_event_metadata(
                 db,
                 retrieval_result["retrieval_id"],
@@ -869,6 +1072,7 @@ def handle_chat(
         )
 
         persisted_web_sources = [source for source in sources if source.get("source_type") == "web"]
+        assistant_meta = _build_assistant_meta(model, reasoning_effort)
 
         crud_chat.create_message(
             db=db,
@@ -878,6 +1082,7 @@ def handle_chat(
             content=ai_content,
             request_id=request_id,
             sources=persisted_web_sources or None,
+            assistant_meta=assistant_meta,
             input_tokens=0,
             output_tokens=out_tokens,
             status="success",
@@ -908,13 +1113,15 @@ def handle_chat(
             "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens},
             "request_id": request_id,
             "sources": sources,
-            "retrieval": _build_retrieval_payload(retrieval_result),
+            "assistant_meta": assistant_meta,
+            "retrieval": _build_retrieval_payload(retrieval_result)
+            or _build_web_search_payload(web_search_result, answer_policy),
         }
 
     except LLMError as e:
         logger.warning(
             "LLM call failed username=%s session_id=%s model=%s: %s",
-            username, session_id, _get_model(), e.detail,
+            username, session_id, llm_provider.resolve_model(model), e.detail,
             exc_info=True,
         )
         crud_chat.update_message_tokens_and_status(

@@ -59,31 +59,28 @@ class Settings(BaseSettings):
     db_read_timeout: int = Field(default=30, alias="DB_READ_TIMEOUT", ge=1)
     db_write_timeout: int = Field(default=30, alias="DB_WRITE_TIMEOUT", ge=1)
 
-    # ── Legacy Anthropic-specific settings (kept for backward compatibility) ────
-    anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
-    anthropic_model: str = Field(
-        default="claude-3-5-haiku-latest",
-        alias="ANTHROPIC_MODEL",
-    )
-    anthropic_base_url: str | None = Field(default=None, alias="ANTHROPIC_BASE_URL")
-    anthropic_force_ipv4: bool = Field(default=False, alias="ANTHROPIC_FORCE_IPV4")
-
-    # ── LiteLLM multi-provider settings ──────────────────────────────────────
-    # Full LiteLLM model string, e.g.:
-    #   "anthropic/claude-3-5-haiku-latest"
-    #   "openai/gpt-4o"
-    #   "gemini/gemini-1.5-pro"
-    #   "azure/gpt-4o"
-    #   "ollama/llama3"
-    # If blank, falls back to anthropic_model with "anthropic/" prefix.
+    # ── 9router-backed LiteLLM settings ──────────────────────────────────────
     llm_model: str = Field(default="", alias="LLM_MODEL")
-    # Separate vision model (optional – defaults to llm_model)
     llm_vision_model: str = Field(default="", alias="LLM_VISION_MODEL")
-
-    # Additional provider API keys (only needed when using that provider)
+    llm_context_window: int = Field(default=200000, alias="LLM_CONTEXT_WINDOW", ge=1)
+    llm_reasoning_effort: str = Field(default="", alias="LLM_REASONING_EFFORT")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_base_url: str | None = Field(default=None, alias="OPENAI_BASE_URL")
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
+    github_copilot_api_key: str = Field(default="", alias="GITHUB_COPILOT_API_KEY")
+    github_copilot_model_name: str = Field(default="gpt-5.4", alias="MODEL_GITHUB_COPILOT")
+    supported_chat_models_raw: str = Field(
+        default="gpt-5.3-codex,gpt-5.4,gemini-3.1-pro-preview,claude-haiku-4.5,gpt-5.4-mini,claude-sonnet-4.6,claude-opus-4.6,deepseek-v4-pro,kc/nvidia/nemotron-3-super-120b-a12b:free,kc/moonshotai/kimi-k2.6,kc/inclusionai/ling-2.6-1t:free,kc/qwen/qwen3.6-plus,kc/minimax/minimax-m2.7",
+        alias="SUPPORTED_CHAT_MODELS",
+    )
+    ninerouter_base_url: str = Field(
+        default="http://127.0.0.1:20128/v1",
+        alias="NINEROUTER_BASE_URL",
+    )
+    deepseek_v4_pro_target: str = Field(
+        default="kc/deepseek/deepseek-chat",
+        alias="DEEPSEEK_V4_PRO_TARGET",
+    )
 
     # Vision / image features
     llm_vision_enabled: bool = Field(default=True, alias="LLM_VISION_ENABLED")
@@ -130,7 +127,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Prompt caching (Anthropic only – transparent no-op for other providers)
+    # Prompt caching hook retained for compatibility; current 9router flow is a no-op.
     llm_prompt_caching_enabled: bool = Field(default=True, alias="LLM_PROMPT_CACHING_ENABLED")
     llm_prompt_caching_min_chars: int = Field(
         default=3000,
@@ -138,8 +135,7 @@ class Settings(BaseSettings):
         ge=100,
         description=(
             "Minimum system-prompt character count to apply cache_control. "
-            "Anthropic requires ≥1024 tokens (~4000 chars) for haiku, "
-            "≥2048 tokens for other models.  3000 chars is a safe default."
+            "This is currently retained only for compatibility with older prompt-caching flows."
         ),
     )
 
@@ -244,6 +240,20 @@ class Settings(BaseSettings):
         default="general",
         alias="WEB_SEARCH_TOPIC",
     )
+    web_search_query_planner_enabled: bool = Field(
+        default=True,
+        alias="WEB_SEARCH_QUERY_PLANNER_ENABLED",
+    )
+    web_search_query_planner_model: str = Field(
+        default="gpt-5.4-mini",
+        alias="WEB_SEARCH_QUERY_PLANNER_MODEL",
+    )
+    web_search_query_planner_max_queries: int = Field(
+        default=4,
+        alias="WEB_SEARCH_QUERY_PLANNER_MAX_QUERIES",
+        ge=2,
+        le=6,
+    )
     tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
     tavily_base_url: str = Field(default="https://api.tavily.com", alias="TAVILY_BASE_URL")
     tavily_search_depth: Literal["basic", "advanced"] = Field(
@@ -305,6 +315,14 @@ class Settings(BaseSettings):
             if item.strip()
         ]
         return origins or ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+    @property
+    def supported_chat_models(self) -> list[str]:
+        return [
+            item.strip()
+            for item in self.supported_chat_models_raw.split(",")
+            if item.strip()
+        ]
 
     @property
     def sqlalchemy_database_url(self) -> str:

@@ -23,7 +23,7 @@ LONG_TEXT = (
 
 def _fake_complete(*, messages, system=None, max_tokens=1024, **kwargs):
     assert system
-    assert "Knowledge-base evidence for this turn" in system
+    assert "Evidence for this turn" in system
     assert "Product FAQ" in system
     assert "refund requests are reviewed within 5 business days" in system.lower()
     assert messages
