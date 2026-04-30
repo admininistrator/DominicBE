@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_REPO="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-DEFAULT_FRONTEND_REPO="$(cd -- "${BACKEND_REPO}/../Dominic/chatbot-ui" 2>/dev/null && pwd || true)"
+DEFAULT_FRONTEND_REPO="$(cd -- "${BACKEND_REPO}/../Dominic" 2>/dev/null && pwd || true)"
 
 FRONTEND_REPO="${DEFAULT_FRONTEND_REPO}"
 BRANCH="main"
