@@ -32,7 +32,7 @@ class Settings(BaseSettings):
         ge=5,
     )
     auth_password_min_length: int = Field(default=8, alias="AUTH_PASSWORD_MIN_LENGTH", ge=1)
-    auth_password_max_length: int = Field(default=64, alias="AUTH_PASSWORD_MAX_LENGTH", ge=8)
+    auth_password_max_length: int = Field(default=16, alias="AUTH_PASSWORD_MAX_LENGTH", ge=8)
 
     host: str = Field(default="0.0.0.0", alias="HOST")
     port: int = Field(default=8000, alias="PORT", ge=1, le=65535)

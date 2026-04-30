@@ -465,7 +465,7 @@ AUTH_SECRET_KEY=replace_with_a_long_random_secret
 AUTH_ALGORITHM=HS256
 AUTH_ACCESS_TOKEN_EXPIRE_MINUTES=10080
 AUTH_PASSWORD_MIN_LENGTH=8
-AUTH_PASSWORD_MAX_LENGTH=64
+AUTH_PASSWORD_MAX_LENGTH=16
 
 ANTHROPIC_API_KEY=your_real_anthropic_key
 ANTHROPIC_MODEL=claude-3-5-haiku-latest
@@ -771,7 +771,7 @@ Note:
 - legacy rows that still have plaintext in `password` can log in once and will be auto-upgraded to `password_hash`
 - do not manually paste plaintext passwords into `password_hash`
 - avoid leading/trailing spaces in user passwords because the backend normalizes them before hashing and verification
-- newly registered passwords are validated with a minimum security policy: at least 8 characters, and should include lowercase, uppercase, digit, and special character
+- newly registered passwords are validated only by length: from 8 to 16 characters
 
 ### Alternative: create an account through the API
 

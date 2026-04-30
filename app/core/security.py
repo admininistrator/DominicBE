@@ -33,16 +33,6 @@ def validate_password_policy(password: str) -> str:
     if len(raw.encode("utf-8")) > 72:
         raise ValueError("Password is too long for bcrypt. Use at most 72 UTF-8 bytes.")
 
-    has_lower = any(char.islower() for char in raw)
-    has_upper = any(char.isupper() for char in raw)
-    has_digit = any(char.isdigit() for char in raw)
-    has_special = any(not char.isalnum() for char in raw)
-
-    if not (has_lower and has_upper and has_digit and has_special):
-        raise ValueError(
-            "Password must include at least 1 lowercase letter, 1 uppercase letter, 1 digit, and 1 special character."
-        )
-
     return raw
 
 
