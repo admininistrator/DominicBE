@@ -99,6 +99,17 @@ def get_chat_session(db: Session, username: str, session_id: int):
     )
 
 
+def count_session_messages(db: Session, username: str, session_id: int) -> int:
+    return (
+        db.query(Message)
+        .filter(
+            Message.sender_username == username,
+            Message.session_id == session_id,
+        )
+        .count()
+    )
+
+
 def list_chat_sessions(db: Session, username: str):
     return (
         db.query(ChatSession)

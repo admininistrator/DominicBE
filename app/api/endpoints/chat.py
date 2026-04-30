@@ -146,6 +146,8 @@ def rename_chat_session(
     try:
         result = rename_session(db, current_user.username, session_id, request.title)
         return SessionResponse(**result)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

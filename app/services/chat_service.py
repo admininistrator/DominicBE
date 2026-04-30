@@ -25,6 +25,11 @@ TOKEN_ESTIMATE_CHARS_PER_TOKEN = settings.token_estimate_chars_per_token
 logger = logging.getLogger("uvicorn.error")
 
 SOURCE_CITATION_PATTERN = re.compile(r"\[Source\s+(\d+)\]")
+AUTO_TITLE_PLACEHOLDER_PATTERN = re.compile(r"^(new chat|chat\s+\d+)$", re.IGNORECASE)
+AUTO_SESSION_TITLE_MODEL = "gpt-5.4-mini"
+AUTO_SESSION_TITLE_MAX_CHARS = 72
+AUTO_SESSION_TITLE_MAX_TOKENS = 24
+AUTO_SESSION_TITLE_MAX_WORDS = 8
 
 
 class ProviderRequestError(Exception):
@@ -257,11 +262,7 @@ def delete_session(db: Session, username: str, session_id: int) -> bool:
 
 
 def rename_session(db: Session, username: str, session_id: int, title: str) -> dict:
-    session = crud_chat.get_chat_session(db, username, session_id)
-    if not session:
-        raise ValueError("Session not found.")
-    row = crud_chat.rename_chat_session(db, username, session_id, title)
-    return {"id": row.id, "username": row.username, "title": row.title, "created_at": row.created_at, "updated_at": row.updated_at}
+    raise PermissionError("Manual chat renaming is disabled.")
 
 
 def get_session_history(db: Session, username: str, session_id: int):
@@ -354,6 +355,123 @@ def _estimate_input_tokens(messages: list[dict], system_prompt: str | None = Non
     if system_prompt:
         total_chars += len(system_prompt)
     return max(1, total_chars // TOKEN_ESTIMATE_CHARS_PER_TOKEN)
+
+
+def _is_generated_session_title(title: str | None) -> bool:
+    normalized = (title or "").strip()
+    if not normalized:
+        return True
+    return bool(AUTO_TITLE_PLACEHOLDER_PATTERN.fullmatch(normalized))
+
+
+def _truncate_session_title(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if not normalized:
+        return ""
+
+    words = normalized.split(" ")
+    if len(words) > AUTO_SESSION_TITLE_MAX_WORDS:
+        normalized = " ".join(words[:AUTO_SESSION_TITLE_MAX_WORDS]).rstrip(" .,:;|-")
+
+    if len(normalized) > AUTO_SESSION_TITLE_MAX_CHARS:
+        normalized = normalized[:AUTO_SESSION_TITLE_MAX_CHARS].rstrip()
+        if " " in normalized:
+            normalized = normalized.rsplit(" ", 1)[0].rstrip()
+
+    return normalized.rstrip(" .,:;|-")
+
+
+def _fallback_session_title(user_message: str, assistant_reply: str | None = None) -> str:
+    fallback_candidates = [assistant_reply or "", user_message]
+    cleanup_patterns = [
+        r"^(hãy|vui lòng|xin hãy)\s+",
+        r"^(giúp tôi|cho tôi|tôi muốn|tôi cần)\s+",
+        r"^(please|can you|could you|help me)\s+",
+    ]
+
+    for candidate in fallback_candidates:
+        normalized = re.sub(r"\s+", " ", (candidate or "").strip())
+        if not normalized:
+            continue
+
+        first_chunk = re.split(r"[\n.!?;]+", normalized, maxsplit=1)[0].strip()
+        for pattern in cleanup_patterns:
+            first_chunk = re.sub(pattern, "", first_chunk, flags=re.IGNORECASE).strip()
+
+        truncated = _truncate_session_title(first_chunk)
+        if truncated and not _is_generated_session_title(truncated):
+            return truncated
+
+    return "New chat"
+
+
+def _normalize_session_title_candidate(candidate: str | None, *, fallback: str, user_message: str | None = None) -> str:
+    normalized = re.sub(r"\s+", " ", (candidate or "").replace("\n", " ")).strip()
+    normalized = normalized.strip("'\"`").strip()
+    normalized = re.sub(r"^title\s*:\s*", "", normalized, flags=re.IGNORECASE)
+    normalized = normalized.rstrip(" .,:;|-_")
+    normalized_prompt = re.sub(r"\s+", " ", (user_message or "").strip()).lower()
+
+    if not normalized or _is_generated_session_title(normalized):
+        return fallback
+
+    if normalized.lower() == normalized_prompt:
+        return fallback
+
+    if len(normalized.split()) > AUTO_SESSION_TITLE_MAX_WORDS:
+        return fallback
+
+    normalized = _truncate_session_title(normalized)
+
+    return normalized or fallback
+
+
+def _generate_session_title(user_message: str, assistant_reply: str | None = None) -> str:
+    fallback_title = _fallback_session_title(user_message, assistant_reply)
+    normalized_reply = re.sub(r"\s+", " ", (assistant_reply or "").strip())
+    if len(normalized_reply) > 800:
+        normalized_reply = normalized_reply[:800].rstrip()
+    prompt = (
+        "Create a concise title for a new chat session based on the first user prompt and the assistant's first reply. "
+        "Return only the title, with no quotes, no markdown, and no explanation. "
+        "Keep it under 7 words when possible and make it specific to the actual topic resolved in the exchange.\n\n"
+        f"User message:\n{user_message.strip()}\n\n"
+        f"Assistant reply:\n{normalized_reply or '(empty)'}"
+    )
+    try:
+        result = llm_provider.complete(
+            messages=[{"role": "user", "content": prompt}],
+            model=AUTO_SESSION_TITLE_MODEL,
+            max_tokens=AUTO_SESSION_TITLE_MAX_TOKENS,
+        )
+        return _normalize_session_title_candidate(
+            result.get("text"),
+            fallback=fallback_title,
+            user_message=user_message,
+        )
+    except Exception:
+        logger.info("Session auto-title generation failed; using fallback title.", exc_info=True)
+        return fallback_title
+
+
+def _maybe_autotitle_session(
+    db: Session,
+    username: str,
+    session,
+    user_message: str,
+    assistant_reply: str | None,
+    existing_message_count: int,
+) -> str | None:
+    if existing_message_count != 0:
+        return None
+    if not _is_generated_session_title(getattr(session, "title", None)):
+        return None
+
+    next_title = _generate_session_title(user_message, assistant_reply)
+    renamed_session = crud_chat.rename_chat_session(db, username, session.id, next_title)
+    if not renamed_session:
+        return None
+    return renamed_session.title
 
 
 def _build_summary_prompt(old_summary: str, messages: list) -> str:
@@ -875,6 +993,7 @@ def handle_chat(
     session = crud_chat.get_chat_session(db, username, session_id)
     if not session:
         raise ValueError("Session not found.")
+    existing_message_count = crud_chat.count_session_messages(db, username, session_id)
     if knowledge_document_id is not None:
         knowledge_document = crud_knowledge.get_document(db, knowledge_document_id)
         if not knowledge_document or knowledge_document.owner_username != username:
@@ -1052,6 +1171,7 @@ def handle_chat(
             web_search_result=web_search_result,
             knowledge_base_active=knowledge_base_active,
         )
+        autotitle_source_reply = ai_content
         ai_content = _linkify_web_sources_in_reply(ai_content, sources)
         if retrieval_result is not None:
             retrieval_result["answer_policy"] = answer_policy
@@ -1086,6 +1206,15 @@ def handle_chat(
             input_tokens=0,
             output_tokens=out_tokens,
             status="success",
+        )
+
+        _maybe_autotitle_session(
+            db,
+            username,
+            session,
+            user_message,
+            autotitle_source_reply,
+            existing_message_count,
         )
 
         crud_knowledge.replace_answer_citations(
