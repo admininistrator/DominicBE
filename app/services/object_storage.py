@@ -7,8 +7,9 @@ from pathlib import Path
 from time import perf_counter
 
 from app.core.config import settings
+from app.core.logging import get_logger
 
-logger = logging.getLogger("uvicorn.error")
+logger = get_logger(__name__)
 
 
 def _sanitize_component(value: str) -> str:

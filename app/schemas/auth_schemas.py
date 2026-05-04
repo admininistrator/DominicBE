@@ -1,16 +1,24 @@
 """Schemas for auth endpoints."""
 from datetime import datetime
-from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.core.security import validate_username_policy
 
 
-class LoginRequest(BaseModel):
+class _UsernameInputModel(BaseModel):
+    @field_validator("username", check_fields=False)
+    @classmethod
+    def _validate_username(cls, value: str) -> str:
+        return validate_username_policy(value, field_name="Username", min_length=1, max_length=255)
+
+
+class LoginRequest(_UsernameInputModel):
     username: str
     password: str
 
 
-class RegisterRequest(BaseModel):
+class RegisterRequest(_UsernameInputModel):
     username: str = Field(min_length=3, max_length=255)
     password: str
     confirm_password: str
@@ -27,7 +35,12 @@ class LoginResponse(BaseModel):
     username: str
     role: str = "user"
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
 
 
 class MeResponse(BaseModel):
@@ -47,7 +60,7 @@ class ChangePasswordRequest(BaseModel):
         return self
 
 
-class ResetPasswordRequest(BaseModel):
+class ResetPasswordRequest(_UsernameInputModel):
     """Admin issues a reset token for a target user."""
     username: str
     expire_minutes: int = Field(default=30, ge=5, le=1440)
@@ -59,7 +72,7 @@ class ResetPasswordResponse(BaseModel):
     expire_minutes: int
 
 
-class ConsumeResetTokenRequest(BaseModel):
+class ConsumeResetTokenRequest(_UsernameInputModel):
     username: str
     reset_token: str
     new_password: str
@@ -72,7 +85,7 @@ class ConsumeResetTokenRequest(BaseModel):
         return self
 
 
-class SetRoleRequest(BaseModel):
+class SetRoleRequest(_UsernameInputModel):
     username: str
     role: str = Field(pattern="^(user|admin)$")
 

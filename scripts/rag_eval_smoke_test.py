@@ -11,9 +11,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.api.deps import get_db
+from app.core.config import settings
 from app.core.database import Base
 from app.main import app
 from app.services import chat_service
+
+
+API_PREFIX = "/api/v1"
+
+
+def api_path(path: str) -> str:
+    return f"{API_PREFIX}{path}"
 
 
 LONG_TEXT = (
@@ -58,11 +66,13 @@ def main() -> None:
     original_complete = chat_service.llm_provider.complete
     app.dependency_overrides[get_db] = override_get_db
     chat_service.llm_provider.complete = _fake_complete
+    original_rate_limit_enabled = settings.rate_limit_enabled
+    settings.rate_limit_enabled = False
 
     try:
         with TestClient(app) as client:
             register_response = client.post(
-                "/api/auth/register",
+                api_path("/auth/register"),
                 json={
                     "username": "test_user",
                     "password": "StrongPass1!",
@@ -74,7 +84,7 @@ def main() -> None:
             headers = {"Authorization": f"Bearer {token}"}
 
             ingest_response = client.post(
-                "/api/knowledge/documents/ingest",
+                api_path("/knowledge/documents/ingest"),
                 json={
                     "title": "Product FAQ",
                     "source_type": "text",
@@ -86,7 +96,7 @@ def main() -> None:
             document_id = ingest_response.json()["document_id"]
 
             search_response = client.post(
-                "/api/knowledge/search",
+                api_path("/knowledge/search"),
                 json={
                     "query": "Chính sách hoàn tiền xử lý bao lâu?",
                     "top_k": 3,
@@ -100,7 +110,7 @@ def main() -> None:
             assert search_payload["returned"] >= 1
 
             session_response = client.post(
-                "/api/chat/sessions",
+                api_path("/chat/sessions"),
                 json={"title": "Eval chat"},
                 headers=headers,
             )
@@ -108,7 +118,7 @@ def main() -> None:
             session_id = session_response.json()["id"]
 
             chat_response = client.post(
-                "/api/chat/",
+                api_path("/chat/"),
                 json={
                     "session_id": session_id,
                     "message": "Chính sách hoàn tiền xử lý trong bao lâu?",
@@ -122,7 +132,7 @@ def main() -> None:
             assert chat_payload["retrieval"]["answer_policy"] == "grounded"
 
             insufficient_response = client.post(
-                "/api/chat/",
+                api_path("/chat/"),
                 json={
                     "session_id": session_id,
                     "message": "Bảo hành thiết bị trong bao lâu?",
@@ -136,7 +146,7 @@ def main() -> None:
             assert insufficient_payload["sources"] == []
 
             analytics_response = client.get(
-                "/api/knowledge/admin/analytics",
+                api_path("/knowledge/admin/analytics"),
                 params={"recent_limit": 10},
                 headers=headers,
             )
@@ -162,7 +172,7 @@ def main() -> None:
             assert any(event["scoped"] is True for event in analytics_payload["recent_events"])
 
             filtered_analytics_response = client.get(
-                "/api/knowledge/admin/analytics",
+                api_path("/knowledge/admin/analytics"),
                 params={"username": "test_user", "recent_limit": 5},
                 headers=headers,
             )
@@ -172,6 +182,7 @@ def main() -> None:
             assert filtered_payload["summary"]["total_events"] >= 2
 
     finally:
+        settings.rate_limit_enabled = original_rate_limit_enabled
         chat_service.llm_provider.complete = original_complete
         app.dependency_overrides.clear()
 

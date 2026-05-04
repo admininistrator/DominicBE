@@ -1,11 +1,14 @@
 import logging
 import json
 import re
+from collections.abc import Iterator
+from dataclasses import dataclass
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_chat
 from app.crud import crud_knowledge
@@ -22,7 +25,7 @@ SUMMARY_MAX_TOKENS = settings.summary_max_tokens
 SUMMARY_TRIGGER_MESSAGES = settings.summary_trigger_messages
 TOKEN_ESTIMATE_CHARS_PER_TOKEN = settings.token_estimate_chars_per_token
 
-logger = logging.getLogger("uvicorn.error")
+logger = get_logger(__name__)
 
 SOURCE_CITATION_PATTERN = re.compile(r"\[Source\s+(\d+)\]")
 AUTO_TITLE_PLACEHOLDER_PATTERN = re.compile(r"^(new chat|chat\s+\d+)$", re.IGNORECASE)
@@ -41,6 +44,25 @@ class ProviderRequestError(Exception):
     @classmethod
     def from_llm_error(cls, e: LLMError) -> "ProviderRequestError":
         return cls(e.status_code, e.detail)
+
+
+@dataclass
+class PreparedChatTurn:
+    username: str
+    session_id: int
+    session: object
+    user_message: str
+    knowledge_document_id: int | None
+    model: str | None
+    reasoning_effort: str | None
+    existing_message_count: int
+    knowledge_base_active: bool
+    request_id: str
+    user_msg_id: int
+    request_kwargs: dict
+    retrieval_result: dict | None
+    web_search_result: dict
+    sources: list[dict]
 
 
 def _format_exception_chain(exc: BaseException | None) -> str:
@@ -262,18 +284,47 @@ def delete_session(db: Session, username: str, session_id: int) -> bool:
 
 
 def rename_session(db: Session, username: str, session_id: int, title: str) -> dict:
-    raise PermissionError("Manual chat renaming is disabled.")
-
-
-def get_session_history(db: Session, username: str, session_id: int):
     session = crud_chat.get_chat_session(db, username, session_id)
     if not session:
         raise ValueError("Session not found.")
-    rows = crud_chat.get_session_messages(db, username, session_id)
+
+    renamed_session = crud_chat.rename_chat_session(db, username, session_id, title)
+    if not renamed_session:
+        raise ValueError("Session not found.")
+
+    return {
+        "id": renamed_session.id,
+        "username": renamed_session.username,
+        "title": renamed_session.title,
+        "created_at": renamed_session.created_at,
+        "updated_at": renamed_session.updated_at,
+    }
+
+
+def get_session_history(
+    db: Session,
+    username: str,
+    session_id: int,
+    *,
+    skip: int = 0,
+    limit: int | None = None,
+    before_id: int | None = None,
+):
+    session = crud_chat.get_chat_session(db, username, session_id)
+    if not session:
+        raise ValueError("Session not found.")
+    rows, has_more = crud_chat.get_session_messages(
+        db,
+        username,
+        session_id,
+        skip=skip,
+        limit=limit,
+        before_id=before_id,
+    )
     assistant_request_ids = [m.request_id for m in rows if m.role == "assistant" and m.request_id]
     citations_by_request = _build_citations_by_request(db, assistant_request_ids)
     retrieval_by_request = _build_retrieval_by_request(db, assistant_request_ids)
-    return [
+    items = [
         {
             "id": m.id,
             "role": m.role,
@@ -294,6 +345,18 @@ def get_session_history(db: Session, username: str, session_id: int):
         }
         for m in rows
     ]
+    next_before_id = items[0]["id"] if has_more and items else None
+    return {
+        "items": items,
+        "pagination": {
+            "skip": skip,
+            "limit": limit,
+            "before_id": before_id,
+            "returned": len(items),
+            "has_more": has_more,
+            "next_before_id": next_before_id,
+        },
+    }
 
 
 def _build_citations_by_request(db: Session, request_ids: list[str]) -> dict[str, list[dict]]:
@@ -975,7 +1038,7 @@ def _should_use_knowledge_base(
     return bool(session_documents)
 
 
-def handle_chat(
+def _prepare_chat_turn(
     db: Session,
     username: str,
     session_id: int,
@@ -986,7 +1049,7 @@ def handle_chat(
     reasoning_effort: str | None = None,
     images: list[str] | None = None,
     image_media_types: list[str] | None = None,
-):
+) -> PreparedChatTurn:
     user = crud_chat.get_user_by_username(db, username)
     if not user:
         raise ValueError(f"User '{username}' not found.")
@@ -1030,7 +1093,6 @@ def handle_chat(
         )
 
     request_id = str(uuid4())
-
     user_msg = crud_chat.create_message(
         db=db,
         role="user",
@@ -1043,209 +1105,280 @@ def handle_chat(
         status="pending",
     )
 
-    try:
-        summary_text, formatted_messages = _build_hybrid_context(db, username, session_id)
-        retrieval_result = None
-        packed_results: list[dict] = []
-        packed_token_estimate = 0
+    summary_text, formatted_messages = _build_hybrid_context(db, username, session_id)
+    retrieval_result = None
+    packed_results: list[dict] = []
+    packed_token_estimate = 0
 
-        if knowledge_base_active:
-            retrieval_result = search_knowledge(
-                db=db,
-                owner_username=username,
-                query=user_message,
-                top_k=settings.retrieval_top_k,
-                document_id=knowledge_document_id,
-                session_id=session_id,
-                request_id=request_id,
-            )
-            packed_results, packed_token_estimate = _pack_retrieval_results(retrieval_result.get("results") or [])
-            retrieval_result["packed_count"] = len(packed_results)
-            retrieval_result["packed_token_estimate"] = packed_token_estimate
-            retrieval_result["packed_results"] = packed_results
-
-        web_search_result = {"used": False, "query": None, "latency_ms": 0, "results": []}
-        if use_web_search:
-            web_search_result = search_web(user_message, max_results=settings.web_search_max_results)
-        if retrieval_result is not None:
-            retrieval_result["web_search_used"] = bool(web_search_result.get("used"))
-            retrieval_result["web_results_count"] = len(web_search_result.get("results") or [])
-            retrieval_result["web_search_query"] = web_search_result.get("query")
-            retrieval_result["web_latency_ms"] = int(web_search_result.get("latency_ms") or 0)
-            retrieval_result["answer_policy"] = _determine_answer_policy(
-                retrieval_result,
-                knowledge_document_id=knowledge_document_id,
-            )
-
-        if retrieval_result is not None and retrieval_result.get("retrieval_id"):
-            crud_knowledge.update_retrieval_event_metadata(
-                db,
-                retrieval_result["retrieval_id"],
-                {
-                    "packed_count": len(packed_results),
-                    "packed_token_estimate": packed_token_estimate,
-                    "answer_policy": retrieval_result["answer_policy"],
-                    "web_search_used": retrieval_result["web_search_used"],
-                    "web_results_count": retrieval_result["web_results_count"],
-                    "web_search_query": retrieval_result["web_search_query"],
-                    "web_latency_ms": retrieval_result["web_latency_ms"],
-                },
-            )
-
-        knowledge_sources = _build_sources(packed_results)
-        web_sources = _build_web_sources(
-            web_search_result.get("results") or [],
-            start_rank=len(knowledge_sources) + 1,
+    if knowledge_base_active:
+        retrieval_result = search_knowledge(
+            db=db,
+            owner_username=username,
+            query=user_message,
+            top_k=settings.retrieval_top_k,
+            document_id=knowledge_document_id,
+            session_id=session_id,
+            request_id=request_id,
         )
-        sources = [*knowledge_sources, *web_sources]
-        system_prompt = _compose_system_prompt(
-            summary_text,
+        packed_results, packed_token_estimate = _pack_retrieval_results(retrieval_result.get("results") or [])
+        retrieval_result["packed_count"] = len(packed_results)
+        retrieval_result["packed_token_estimate"] = packed_token_estimate
+        retrieval_result["packed_results"] = packed_results
+
+    web_search_result = {"used": False, "query": None, "latency_ms": 0, "results": []}
+    if use_web_search:
+        web_search_result = search_web(user_message, max_results=settings.web_search_max_results)
+    if retrieval_result is not None:
+        retrieval_result["web_search_used"] = bool(web_search_result.get("used"))
+        retrieval_result["web_results_count"] = len(web_search_result.get("results") or [])
+        retrieval_result["web_search_query"] = web_search_result.get("query")
+        retrieval_result["web_latency_ms"] = int(web_search_result.get("latency_ms") or 0)
+        retrieval_result["answer_policy"] = _determine_answer_policy(
             retrieval_result,
             knowledge_document_id=knowledge_document_id,
-            web_search_result=web_search_result,
-            knowledge_base_active=knowledge_base_active,
         )
-        request_messages = _build_request_messages(formatted_messages, user_message)
 
-        if not request_messages:
-            crud_chat.update_message_tokens_and_status(
-                db=db,
-                message_id=user_msg.id,
-                status="error",
-                error_message="Current prompt is empty after sanitization.",
-            )
-            raise ValueError("Prompt khong hop le hoac dang rong.")
-
-        estimated_input_tokens = _estimate_input_tokens(request_messages, system_prompt)
-        if estimated_input_tokens >= remaining_tokens:
-            crud_chat.update_message_tokens_and_status(
-                db=db,
-                message_id=user_msg.id,
-                status="error",
-                error_message=f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded before API call.",
-            )
-            raise PermissionError(f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded.")
-
-        context_window_remaining = settings.llm_context_window - estimated_input_tokens
-        max_output_tokens = min(
-            MAX_OUTPUT_TOKENS,
-            remaining_tokens - estimated_input_tokens,
-            context_window_remaining,
+    if retrieval_result is not None and retrieval_result.get("retrieval_id"):
+        crud_knowledge.update_retrieval_event_metadata(
+            db,
+            retrieval_result["retrieval_id"],
+            {
+                "packed_count": len(packed_results),
+                "packed_token_estimate": packed_token_estimate,
+                "answer_policy": retrieval_result["answer_policy"],
+                "web_search_used": retrieval_result["web_search_used"],
+                "web_results_count": retrieval_result["web_results_count"],
+                "web_search_query": retrieval_result["web_search_query"],
+                "web_latency_ms": retrieval_result["web_latency_ms"],
+            },
         )
-        if max_output_tokens <= 0:
-            crud_chat.update_message_tokens_and_status(
-                db=db,
-                message_id=user_msg.id,
-                status="error",
-                error_message="No remaining output token budget or context window capacity.",
-            )
-            raise PermissionError("Prompt vuot qua gioi han context window hoac quota token hien tai.")
 
-        request_kwargs = {
-            "messages": request_messages,
-            "system": system_prompt or None,
-            "max_tokens": max_output_tokens,
-            "model": model,
-            "reasoning_effort": reasoning_effort,
-        }
-        # Attach images if provided (vision chat)
-        if images and settings.llm_vision_enabled:
-            request_kwargs["images"] = images
-            request_kwargs["image_media_types"] = image_media_types or []
+    knowledge_sources = _build_sources(packed_results)
+    web_sources = _build_web_sources(
+        web_search_result.get("results") or [],
+        start_rank=len(knowledge_sources) + 1,
+    )
+    sources = [*knowledge_sources, *web_sources]
+    system_prompt = _compose_system_prompt(
+        summary_text,
+        retrieval_result,
+        knowledge_document_id=knowledge_document_id,
+        web_search_result=web_search_result,
+        knowledge_base_active=knowledge_base_active,
+    )
+    request_messages = _build_request_messages(formatted_messages, user_message)
 
-        logger.info(
-            "LiteLLM call username=%s session_id=%s model=%s messages=%d images=%d",
-            username, session_id, llm_provider.resolve_model(model), len(request_messages), len(images or []),
-        )
-        llm_result = llm_provider.complete(**request_kwargs)
-
-        ai_content = llm_result["text"]
-        in_tokens = llm_result["input_tokens"]
-        out_tokens = llm_result["output_tokens"]
-
-        ai_content, sources, answer_policy = _apply_answer_guardrails(
-            ai_content,
-            retrieval_result,
-            sources,
-            knowledge_document_id=knowledge_document_id,
-            web_search_result=web_search_result,
-            knowledge_base_active=knowledge_base_active,
-        )
-        autotitle_source_reply = ai_content
-        ai_content = _linkify_web_sources_in_reply(ai_content, sources)
-        if retrieval_result is not None:
-            retrieval_result["answer_policy"] = answer_policy
-
-        if retrieval_result is not None and retrieval_result.get("retrieval_id"):
-            crud_knowledge.update_retrieval_event_metadata(
-                db,
-                retrieval_result["retrieval_id"],
-                {"answer_policy": answer_policy},
-            )
-
+    if not request_messages:
         crud_chat.update_message_tokens_and_status(
             db=db,
             message_id=user_msg.id,
-            input_tokens=in_tokens,
-            status="success",
-            error_message=None,
+            status="error",
+            error_message="Current prompt is empty after sanitization.",
         )
+        raise ValueError("Prompt khong hop le hoac dang rong.")
 
-        persisted_web_sources = [source for source in sources if source.get("source_type") == "web"]
-        assistant_meta = _build_assistant_meta(model, reasoning_effort)
-
-        crud_chat.create_message(
+    estimated_input_tokens = _estimate_input_tokens(request_messages, system_prompt)
+    if estimated_input_tokens >= remaining_tokens:
+        crud_chat.update_message_tokens_and_status(
             db=db,
-            role="assistant",
-            sender_username=username,
-            session_id=session_id,
-            content=ai_content,
-            request_id=request_id,
-            sources=persisted_web_sources or None,
-            assistant_meta=assistant_meta,
-            input_tokens=0,
-            output_tokens=out_tokens,
-            status="success",
+            message_id=user_msg.id,
+            status="error",
+            error_message=f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded before API call.",
+        )
+        raise PermissionError(f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded.")
+
+    context_window_remaining = settings.llm_context_window - estimated_input_tokens
+    max_output_tokens = min(
+        MAX_OUTPUT_TOKENS,
+        remaining_tokens - estimated_input_tokens,
+        context_window_remaining,
+    )
+    if max_output_tokens <= 0:
+        crud_chat.update_message_tokens_and_status(
+            db=db,
+            message_id=user_msg.id,
+            status="error",
+            error_message="No remaining output token budget or context window capacity.",
+        )
+        raise PermissionError("Prompt vuot qua gioi han context window hoac quota token hien tai.")
+
+    request_kwargs = {
+        "messages": request_messages,
+        "system": system_prompt or None,
+        "max_tokens": max_output_tokens,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+    }
+    if images and settings.llm_vision_enabled:
+        request_kwargs["images"] = images
+        request_kwargs["image_media_types"] = image_media_types or []
+
+    return PreparedChatTurn(
+        username=username,
+        session_id=session_id,
+        session=session,
+        user_message=user_message,
+        knowledge_document_id=knowledge_document_id,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        existing_message_count=existing_message_count,
+        knowledge_base_active=knowledge_base_active,
+        request_id=request_id,
+        user_msg_id=user_msg.id,
+        request_kwargs=request_kwargs,
+        retrieval_result=retrieval_result,
+        web_search_result=web_search_result,
+        sources=sources,
+    )
+
+
+def _finalize_chat_turn(
+    db: Session,
+    prepared: PreparedChatTurn,
+    *,
+    ai_content: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> dict:
+    sources = list(prepared.sources)
+    retrieval_result = prepared.retrieval_result
+    web_search_result = prepared.web_search_result
+
+    ai_content, sources, answer_policy = _apply_answer_guardrails(
+        ai_content,
+        retrieval_result,
+        sources,
+        knowledge_document_id=prepared.knowledge_document_id,
+        web_search_result=web_search_result,
+        knowledge_base_active=prepared.knowledge_base_active,
+    )
+    autotitle_source_reply = ai_content
+    ai_content = _linkify_web_sources_in_reply(ai_content, sources)
+    if retrieval_result is not None:
+        retrieval_result["answer_policy"] = answer_policy
+
+    if retrieval_result is not None and retrieval_result.get("retrieval_id"):
+        crud_knowledge.update_retrieval_event_metadata(
+            db,
+            retrieval_result["retrieval_id"],
+            {"answer_policy": answer_policy},
         )
 
-        _maybe_autotitle_session(
+    crud_chat.update_message_tokens_and_status(
+        db=db,
+        message_id=prepared.user_msg_id,
+        input_tokens=input_tokens,
+        status="success",
+        error_message=None,
+    )
+
+    persisted_web_sources = [source for source in sources if source.get("source_type") == "web"]
+    assistant_meta = _build_assistant_meta(prepared.model, prepared.reasoning_effort)
+
+    crud_chat.create_message(
+        db=db,
+        role="assistant",
+        sender_username=prepared.username,
+        session_id=prepared.session_id,
+        content=ai_content,
+        request_id=prepared.request_id,
+        sources=persisted_web_sources or None,
+        assistant_meta=assistant_meta,
+        input_tokens=0,
+        output_tokens=output_tokens,
+        status="success",
+    )
+
+    _maybe_autotitle_session(
+        db,
+        prepared.username,
+        prepared.session,
+        prepared.user_message,
+        autotitle_source_reply,
+        prepared.existing_message_count,
+    )
+
+    crud_knowledge.replace_answer_citations(
+        db,
+        prepared.request_id,
+        citations=[
+            {
+                "document_id": source["document_id"],
+                "chunk_id": source["chunk_id"],
+                "rank": source["rank"],
+                "score": source.get("score"),
+                "quoted_text": source.get("snippet") or "",
+            }
+            for source in sources
+            if source.get("source_type") == "knowledge"
+        ],
+    )
+
+    crud_chat.touch_chat_session(db, prepared.session_id)
+    crud_chat.increment_user_tokens(db, prepared.username, input_tokens, output_tokens)
+
+    return {
+        "reply": ai_content,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        "request_id": prepared.request_id,
+        "sources": sources,
+        "assistant_meta": assistant_meta,
+        "retrieval": _build_retrieval_payload(retrieval_result)
+        or _build_web_search_payload(web_search_result, answer_policy),
+    }
+
+
+def _mark_chat_turn_failed(db: Session, prepared: PreparedChatTurn | None, detail: str):
+    if not prepared:
+        return
+    crud_chat.update_message_tokens_and_status(
+        db=db,
+        message_id=prepared.user_msg_id,
+        status="error",
+        error_message=detail,
+    )
+
+
+def handle_chat(
+    db: Session,
+    username: str,
+    session_id: int,
+    user_message: str,
+    knowledge_document_id: int | None = None,
+    use_web_search: bool = False,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    images: list[str] | None = None,
+    image_media_types: list[str] | None = None,
+):
+    prepared: PreparedChatTurn | None = None
+
+    try:
+        prepared = _prepare_chat_turn(
             db,
             username,
-            session,
+            session_id,
             user_message,
-            autotitle_source_reply,
-            existing_message_count,
+            knowledge_document_id=knowledge_document_id,
+            use_web_search=use_web_search,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            images=images,
+            image_media_types=image_media_types,
         )
 
-        crud_knowledge.replace_answer_citations(
+        logger.info(
+            "LiteLLM call username=%s session_id=%s model=%s messages=%d images=%d",
+            username, session_id, llm_provider.resolve_model(model), len(prepared.request_kwargs["messages"]), len(images or []),
+        )
+        llm_result = llm_provider.complete(**prepared.request_kwargs)
+        return _finalize_chat_turn(
             db,
-            request_id,
-            citations=[
-                {
-                    "document_id": source["document_id"],
-                    "chunk_id": source["chunk_id"],
-                    "rank": source["rank"],
-                    "score": source.get("score"),
-                    "quoted_text": source.get("snippet") or "",
-                }
-                for source in sources
-                if source.get("source_type") == "knowledge"
-            ],
+            prepared,
+            ai_content=llm_result["text"],
+            input_tokens=llm_result["input_tokens"],
+            output_tokens=llm_result["output_tokens"],
         )
-
-        crud_chat.touch_chat_session(db, session_id)
-
-        crud_chat.increment_user_tokens(db, username, in_tokens, out_tokens)
-
-        return {
-            "reply": ai_content,
-            "usage": {"input_tokens": in_tokens, "output_tokens": out_tokens},
-            "request_id": request_id,
-            "sources": sources,
-            "assistant_meta": assistant_meta,
-            "retrieval": _build_retrieval_payload(retrieval_result)
-            or _build_web_search_payload(web_search_result, answer_policy),
-        }
 
     except LLMError as e:
         logger.warning(
@@ -1253,12 +1386,7 @@ def handle_chat(
             username, session_id, llm_provider.resolve_model(model), e.detail,
             exc_info=True,
         )
-        crud_chat.update_message_tokens_and_status(
-            db=db,
-            message_id=user_msg.id,
-            status="error",
-            error_message=e.detail,
-        )
+        _mark_chat_turn_failed(db, prepared, e.detail)
         raise ProviderRequestError.from_llm_error(e) from e
 
     except TavilySearchError as e:
@@ -1267,19 +1395,84 @@ def handle_chat(
             username, session_id, e.detail,
             exc_info=True,
         )
-        crud_chat.update_message_tokens_and_status(
-            db=db,
-            message_id=user_msg.id,
-            status="error",
-            error_message=e.detail,
-        )
+        _mark_chat_turn_failed(db, prepared, e.detail)
         raise ProviderRequestError(e.status_code, e.detail) from e
 
     except Exception as e:
-        crud_chat.update_message_tokens_and_status(
-            db=db,
-            message_id=user_msg.id,
-            status="error",
-            error_message=str(e),
+        _mark_chat_turn_failed(db, prepared, str(e))
+        raise
+
+
+def handle_chat_stream(
+    db: Session,
+    username: str,
+    session_id: int,
+    user_message: str,
+    knowledge_document_id: int | None = None,
+    use_web_search: bool = False,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    images: list[str] | None = None,
+    image_media_types: list[str] | None = None,
+) -> Iterator[dict]:
+    prepared: PreparedChatTurn | None = None
+    try:
+        prepared = _prepare_chat_turn(
+            db,
+            username,
+            session_id,
+            user_message,
+            knowledge_document_id=knowledge_document_id,
+            use_web_search=use_web_search,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            images=images,
+            image_media_types=image_media_types,
         )
+
+        yield {"event": "start", "data": {"request_id": prepared.request_id}}
+
+        stream_result: dict | None = None
+        for chunk in llm_provider.stream_complete(**prepared.request_kwargs):
+            chunk_type = chunk.get("type")
+            if chunk_type == "delta":
+                delta_text = chunk.get("text") or ""
+                if delta_text:
+                    yield {
+                        "event": "delta",
+                        "data": {"text": delta_text, "request_id": prepared.request_id},
+                    }
+            elif chunk_type == "complete":
+                stream_result = chunk
+
+        if stream_result is None:
+            raise RuntimeError("Streaming provider completed without a final payload.")
+
+        final_result = _finalize_chat_turn(
+            db,
+            prepared,
+            ai_content=stream_result["text"],
+            input_tokens=stream_result["input_tokens"],
+            output_tokens=stream_result["output_tokens"],
+        )
+        yield {"event": "final", "data": {"success": True, **final_result}}
+
+    except LLMError as e:
+        logger.warning(
+            "LLM stream failed username=%s session_id=%s model=%s: %s",
+            username, session_id, llm_provider.resolve_model(model), e.detail,
+            exc_info=True,
+        )
+        _mark_chat_turn_failed(db, prepared, e.detail)
+        raise ProviderRequestError.from_llm_error(e) from e
+    except TavilySearchError as e:
+        logger.warning(
+            "Tavily search failed during stream username=%s session_id=%s: %s",
+            username, session_id, e.detail,
+            exc_info=True,
+        )
+        _mark_chat_turn_failed(db, prepared, e.detail)
+        raise ProviderRequestError(e.status_code, e.detail) from e
+    except Exception as e:
+        _mark_chat_turn_failed(db, prepared, str(e))
         raise

@@ -20,9 +20,12 @@ Backend FastAPI cho Dominic. Ở thời điểm hiện tại repo này đã có 
 
 #### Phase 1 - Foundation hardening
 
-- auth với register, login, bearer token, `/api/auth/me`
-- password hashing, đổi mật khẩu, admin-issued reset token, public reset-password flow
+- auth với register, login, access + refresh token, `/api/v1/auth/me`, `/api/v1/auth/refresh`, `/api/v1/auth/logout`
+- versioned API path đã có tại `/api/v1/*`; các route cũ `/api/*` vẫn được giữ làm legacy alias để tránh break client hiện tại
+- password hashing, đổi mật khẩu, logout revoke token theo version, admin-issued reset token, public reset-password flow
 - quản lý chat session, thống kê usage theo rolling window, conversation summary memory
+- history messages hỗ trợ phân trang tùy chọn qua `skip`, `limit`, `before_id`; metadata phân trang trả qua các header `X-Message-Pagination-*`
+- input validation đã siết cho username an toàn, chat message tối đa 12000 ký tự, và chat images phải là `data:image/...;base64,...` hợp lệ với media type khớp payload
 - migration Alembic, debug endpoint bị khóa mặc định, phân quyền admin/user
 
 #### Phase 2 - Knowledge ingestion MVP
@@ -464,6 +467,7 @@ ENABLE_DEBUG_ENV=false
 AUTH_SECRET_KEY=replace_with_a_long_random_secret
 AUTH_ALGORITHM=HS256
 AUTH_ACCESS_TOKEN_EXPIRE_MINUTES=10080
+AUTH_REFRESH_TOKEN_EXPIRE_MINUTES=43200
 AUTH_PASSWORD_MIN_LENGTH=8
 AUTH_PASSWORD_MAX_LENGTH=16
 
@@ -473,13 +477,15 @@ ANTHROPIC_BASE_URL=
 ANTHROPIC_FORCE_IPV4=true
 
 DB_HOST=127.0.0.1
-DB_PORT=3306
+DB_PORT=5432
 DB_USER=dominic
 DB_PASSWORD=YOUR_STRONG_DB_PASSWORD
 DB_NAME=chatbot_db
 DB_SSL=false
 DB_SSL_CA=
 DB_CHARSET=utf8mb4
+DB_POOL_SIZE=10
+DB_MAX_OVERFLOW=20
 DB_POOL_RECYCLE=300
 DB_POOL_TIMEOUT=10
 
@@ -494,8 +500,8 @@ WEB_CONCURRENCY=1
 ### Auth settings note
 
 - `AUTH_SECRET_KEY` must be changed in every non-local environment
-- the current Phase 1 login flow uses bearer tokens signed by `AUTH_SECRET_KEY`
-- frontend currently stores the access token in browser `localStorage`
+- the current auth flow issues both access and refresh tokens signed by `AUTH_SECRET_KEY`
+- frontend currently stores the access token and refresh token in browser `localStorage`
 - if you rotate `AUTH_SECRET_KEY`, all existing browser sessions will need to log in again
 
 ### What to enter in `CORS_ORIGINS`
@@ -860,10 +866,10 @@ AUTH_API_SMOKE_OK
 
 ### 18.8 Direct token check
 
-After login or register, call `/api/auth/me` using the returned bearer token:
+After login or register, call `/api/v1/auth/me` using the returned bearer token:
 
 ```bash
-curl http://127.0.0.1:8000/api/auth/me \
+curl http://127.0.0.1:8000/api/v1/auth/me \
   -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
 ```
 
@@ -871,6 +877,21 @@ Expected:
 
 ```json
 {"username":"phase1_user","role":"user"}
+```
+
+Refresh an expired access token with the refresh token:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token":"YOUR_REFRESH_TOKEN"}'
+```
+
+Logout now revokes both the current access token and any refresh token issued at the same auth version:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/auth/logout \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
 ```
 
 ### 18.9 Knowledge ingestion + retrieval smoke test

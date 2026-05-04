@@ -1,7 +1,7 @@
 """Authentication service – separated from chat_service."""
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, normalize_username
+from app.core.security import create_auth_token_pair, decode_refresh_token, normalize_username
 from app.crud import crud_auth
 
 
@@ -12,13 +12,14 @@ class AuthError(Exception):
         self.detail = detail
 
 
-def _build_auth_response(username: str, role: str = "user"):
+def _build_auth_response(username: str, role: str = "user", token_version: int = 0):
     normalized = normalize_username(username)
+    tokens = create_auth_token_pair(normalized, token_version=token_version)
     return {
         "success": True,
         "username": normalized,
         "role": role,
-        "access_token": create_access_token(normalized),
+        **tokens,
         "token_type": "bearer",
     }
 
@@ -27,18 +28,47 @@ def _build_auth_response(username: str, role: str = "user"):
 
 def register_user(db: Session, username: str, password: str):
     user = crud_auth.create_user(db, username=username, password=password)
-    return _build_auth_response(user.username, user.role)
+    return _build_auth_response(
+        user.username,
+        user.role,
+        token_version=int(getattr(user, "auth_token_version", 0) or 0),
+    )
 
 
 def login_user(db: Session, username: str, password: str):
     user = crud_auth.verify_user_credentials(db, username, password)
     if not user:
         raise ValueError("Invalid username or password.")
-    return _build_auth_response(user.username, user.role)
+    return _build_auth_response(
+        user.username,
+        user.role,
+        token_version=int(getattr(user, "auth_token_version", 0) or 0),
+    )
 
 
 def get_me(user):
     return {"username": user.username, "role": user.role}
+
+
+def refresh_auth_tokens(db: Session, refresh_token: str):
+    token_payload = decode_refresh_token(refresh_token)
+    if not token_payload:
+        raise ValueError("Invalid or expired refresh token.")
+
+    user = crud_auth.get_user_by_username(db, token_payload["username"])
+    if not user:
+        raise ValueError("Authenticated user does not exist.")
+
+    current_version = int(getattr(user, "auth_token_version", 0) or 0)
+    if current_version != token_payload["token_version"]:
+        raise ValueError("Refresh token has been revoked.")
+
+    return _build_auth_response(user.username, user.role, token_version=current_version)
+
+
+def logout_user(db: Session, user):
+    crud_auth.revoke_auth_tokens(db, user)
+    return {"success": True, "message": "Logged out successfully."}
 
 
 def change_password(db: Session, user, old_password: str, new_password: str):

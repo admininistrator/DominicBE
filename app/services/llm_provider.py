@@ -21,6 +21,7 @@ import base64
 import json
 import logging
 import mimetypes
+from collections.abc import Iterator
 from typing import Any
 
 import litellm
@@ -35,8 +36,9 @@ from litellm.exceptions import (
 )
 
 from app.core.config import settings
+from app.core.logging import get_logger
 
-logger = logging.getLogger("uvicorn.error")
+logger = get_logger(__name__)
 
 # ── Silence verbose litellm logging ──────────────────────────────────────────
 litellm.suppress_debug_info = True
@@ -678,6 +680,435 @@ def complete(
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
         "model": model_str,
+    }
+
+
+def _coerce_chunk_mapping(chunk: Any) -> dict[str, Any]:
+    if isinstance(chunk, dict):
+        return chunk
+    if hasattr(chunk, "model_dump"):
+        data = chunk.model_dump()
+        if isinstance(data, dict):
+            return data
+    if hasattr(chunk, "dict"):
+        data = chunk.dict()
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def _extract_text_delta_from_stream_payload(payload: dict[str, Any]) -> str:
+    delta = payload.get("delta")
+    if isinstance(delta, str):
+        return delta
+
+    choices = payload.get("choices") or []
+    if choices:
+        first_choice = choices[0] or {}
+        message = first_choice.get("message") or {}
+        message_content = message.get("content")
+        if isinstance(message_content, str):
+            return message_content
+
+        choice_delta = first_choice.get("delta") or {}
+        delta_content = choice_delta.get("content")
+        if isinstance(delta_content, str):
+            return delta_content
+        if isinstance(delta_content, list):
+            return "".join(
+                str(item.get("text") or "")
+                for item in delta_content
+                if isinstance(item, dict)
+            )
+
+    return ""
+
+
+def _extract_text_from_response_payload(payload: dict[str, Any]) -> str:
+
+    response_data = payload.get("response") or {}
+    output = response_data.get("output") or payload.get("output") or []
+    collected: list[str] = []
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content_items = item.get("content") or []
+            if not isinstance(content_items, list):
+                continue
+            for content_item in content_items:
+                if not isinstance(content_item, dict):
+                    continue
+                if content_item.get("type") == "output_text":
+                    text_value = content_item.get("text")
+                    if isinstance(text_value, str):
+                        collected.append(text_value)
+    return "".join(collected)
+
+
+def _extract_usage_from_stream_payload(payload: dict[str, Any]) -> tuple[int | None, int | None]:
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        usage = (payload.get("response") or {}).get("usage")
+    if not isinstance(usage, dict):
+        return None, None
+
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+    output_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
+    try:
+        normalized_input = int(input_tokens) if input_tokens is not None else None
+    except (TypeError, ValueError):
+        normalized_input = None
+    try:
+        normalized_output = int(output_tokens) if output_tokens is not None else None
+    except (TypeError, ValueError):
+        normalized_output = None
+    return normalized_input, normalized_output
+
+
+def _iter_9router_sse_payloads(response: requests.Response) -> Iterator[dict[str, Any]]:
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if raw_line is None:
+            continue
+        line = raw_line.strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            yield payload
+
+
+def _stream_via_9router_http(
+    *,
+    model_str: str,
+    call_messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float | None,
+    reasoning_effort: str | None,
+    extra_kwargs: dict[str, Any],
+) -> Iterator[dict[str, Any]]:
+    del reasoning_effort
+    base_url = (extra_kwargs.get("api_base") or "").rstrip("/")
+    api_key = (extra_kwargs.get("api_key") or "").strip()
+    if not base_url or not api_key:
+        raise RuntimeError("Missing 9router credentials for direct Gemini call")
+
+    payload: dict[str, Any] = {
+        "model": model_str.split("openai/", 1)[1],
+        "input": call_messages,
+        "stream": True,
+    }
+    if max_tokens:
+        payload["max_output_tokens"] = max_tokens
+    if temperature is not None:
+        payload["temperature"] = temperature
+
+    response = requests.post(
+        f"{base_url}/responses",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=120,
+        stream=True,
+    )
+    if response.status_code == 401:
+        raise LLMError(401, "Xác thực thất bại với provider 'openai'. Kiểm tra API key.")
+    if response.status_code == 429:
+        raise LLMError(429, "Provider đang giới hạn tốc độ. Vui lòng thử lại sau.")
+    if response.status_code >= 500:
+        raise LLMError(503, "Provider 'openai' tạm thời không khả dụng. Thử lại sau.")
+    if response.status_code >= 400:
+        detail = response.text.strip()[:200] or "Yêu cầu không hợp lệ"
+        raise LLMError(400, f"Yêu cầu không hợp lệ: {detail}")
+
+    collected_parts: list[str] = []
+    fallback_text = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    response_model = model_str
+
+    try:
+        for payload_chunk in _iter_9router_sse_payloads(response):
+            response_model = payload_chunk.get("model") or (payload_chunk.get("response") or {}).get("model") or response_model
+            payload_input_tokens, payload_output_tokens = _extract_usage_from_stream_payload(payload_chunk)
+            if payload_input_tokens is not None:
+                input_tokens = payload_input_tokens
+            if payload_output_tokens is not None:
+                output_tokens = payload_output_tokens
+
+            delta_text = ""
+            event_type = payload_chunk.get("type")
+            if event_type == "response.output_text.delta":
+                delta_text = payload_chunk.get("delta") or ""
+            elif event_type == "response.output_text.done" and not collected_parts:
+                delta_text = payload_chunk.get("text") or ""
+            elif not event_type:
+                delta_text = _extract_text_delta_from_stream_payload(payload_chunk)
+
+            if not fallback_text:
+                fallback_text = _extract_text_from_response_payload(payload_chunk)
+
+            if delta_text:
+                collected_parts.append(delta_text)
+                yield {"type": "delta", "text": delta_text}
+    finally:
+        response.close()
+
+    full_text = "".join(collected_parts) or fallback_text
+    yield {
+        "type": "complete",
+        "text": full_text,
+        "input_tokens": input_tokens if input_tokens is not None else _estimate_token_count_from_messages(call_messages),
+        "output_tokens": output_tokens if output_tokens is not None else _estimate_token_count_from_text(full_text),
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "model": response_model,
+    }
+
+
+def _stream_via_9router_chat_http(
+    *,
+    model_str: str,
+    call_messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float | None,
+    reasoning_effort: str | None,
+    extra_kwargs: dict[str, Any],
+) -> Iterator[dict[str, Any]]:
+    base_url = (extra_kwargs.get("api_base") or "").rstrip("/")
+    api_key = (extra_kwargs.get("api_key") or "").strip()
+    if not base_url or not api_key:
+        raise RuntimeError("Missing 9router credentials for direct chat call")
+
+    payload: dict[str, Any] = {
+        "model": model_str.split("openai/", 1)[1],
+        "messages": call_messages,
+        "stream": True,
+    }
+    if max_tokens:
+        payload["max_tokens"] = max_tokens
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
+
+    response = requests.post(
+        f"{base_url}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=120,
+        stream=True,
+    )
+    if response.status_code == 401:
+        raise LLMError(401, "Xác thực thất bại với provider 'openai'. Kiểm tra API key.")
+    if response.status_code == 429:
+        raise LLMError(429, "Provider đang giới hạn tốc độ. Vui lòng thử lại sau.")
+    if response.status_code >= 500:
+        raise LLMError(503, "Provider 'openai' tạm thời không khả dụng. Thử lại sau.")
+    if response.status_code >= 400:
+        detail = response.text.strip()[:200] or "Yêu cầu không hợp lệ"
+        raise LLMError(400, f"Yêu cầu không hợp lệ: {detail}")
+
+    collected_parts: list[str] = []
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    response_model = model_str
+
+    try:
+        for payload_chunk in _iter_9router_sse_payloads(response):
+            response_model = payload_chunk.get("model") or response_model
+            payload_input_tokens, payload_output_tokens = _extract_usage_from_stream_payload(payload_chunk)
+            if payload_input_tokens is not None:
+                input_tokens = payload_input_tokens
+            if payload_output_tokens is not None:
+                output_tokens = payload_output_tokens
+
+            delta_text = _extract_text_delta_from_stream_payload(payload_chunk)
+            if delta_text:
+                collected_parts.append(delta_text)
+                yield {"type": "delta", "text": delta_text}
+    finally:
+        response.close()
+
+    full_text = "".join(collected_parts)
+    yield {
+        "type": "complete",
+        "text": full_text,
+        "input_tokens": input_tokens if input_tokens is not None else _estimate_token_count_from_messages(call_messages),
+        "output_tokens": output_tokens if output_tokens is not None else _estimate_token_count_from_text(full_text),
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "model": response_model,
+    }
+
+
+def stream_complete(
+    messages: list[dict],
+    *,
+    system: str | None = None,
+    max_tokens: int = 1024,
+    model: str | None = None,
+    images: list[str | bytes] | None = None,
+    image_media_types: list[str] | None = None,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
+) -> Iterator[dict[str, Any]]:
+    model_str = resolve_model(model) if not images else resolve_vision_model(model)
+    extra_kwargs = _provider_kwargs(model_str)
+
+    processed_images: list[str | bytes] = []
+    processed_media_types: list[str] = []
+    ocr_texts: list[str] = []
+
+    for idx, img in enumerate(images or []):
+        mt = (image_media_types or [])[idx] if idx < len(image_media_types or []) else "image/jpeg"
+        p_img, p_mt, ocr_text = _preprocess_image(img, mt)
+        if ocr_text:
+            ocr_texts.append(ocr_text)
+            logger.info("Image %d: OCR extracted %d chars, skipping vision", idx + 1, len(ocr_text))
+        else:
+            processed_images.append(p_img)
+            processed_media_types.append(p_mt)
+
+    call_messages = list(messages)
+    effective_system = system
+    if ocr_texts:
+        ocr_blocks = "\n\n".join(
+            f"--- Ảnh {i+1} ---\n{t}"
+            for i, t in enumerate(ocr_texts)
+        )
+        ocr_system_note = (
+            "Hệ thống đã tự động trích xuất văn bản từ ảnh đính kèm bằng OCR. "
+            "Hãy sử dụng nội dung dưới đây để trả lời câu hỏi của người dùng một cách tự nhiên, "
+            "như thể bạn đã phân tích ảnh trực tiếp. "
+            "Không đề cập đến việc OCR hay không thể xem ảnh.\n\n"
+            f"Nội dung trích xuất từ ảnh:\n{ocr_blocks}"
+        )
+        effective_system = (effective_system + "\n\n" + ocr_system_note) if effective_system else ocr_system_note
+
+    if processed_images:
+        call_messages = _inject_images(call_messages, processed_images, processed_media_types)
+
+    call_messages, system_after_cache = _apply_prompt_caching(call_messages, effective_system, model_str)
+    if system_after_cache:
+        call_messages = [{"role": "system", "content": system_after_cache}] + call_messages
+
+    call_kwargs: dict[str, Any] = {
+        "model": model_str,
+        "messages": call_messages,
+        "max_tokens": max_tokens,
+        "stream": True,
+        **extra_kwargs,
+    }
+    if temperature is not None:
+        call_kwargs["temperature"] = temperature
+
+    effective_reasoning_effort = _normalize_reasoning_effort(reasoning_effort) or _normalize_reasoning_effort(settings.llm_reasoning_effort)
+    provider_reasoning_effort = _provider_reasoning_effort(model_str, effective_reasoning_effort)
+    if provider_reasoning_effort and _supports_reasoning_effort(model_str):
+        call_kwargs["reasoning_effort"] = provider_reasoning_effort
+        if model_str in {"openai/gh/claude-sonnet-4.6", "openai/gh/claude-opus-4.6"} | KILOCODE_REASONING_MODELS:
+            call_kwargs["allowed_openai_params"] = ["reasoning_effort"]
+    elif effective_reasoning_effort:
+        logger.info(
+            "Ignoring reasoning_effort=%s for unsupported model=%s",
+            effective_reasoning_effort,
+            model_str,
+        )
+
+    logger.debug(
+        "LiteLLM stream call model=%s messages=%d vision_imgs=%d ocr_imgs=%d max_tokens=%d",
+        model_str, len(call_messages), len(processed_images), len(ocr_texts), max_tokens,
+    )
+
+    if _uses_direct_9router_http(model_str):
+        yield from _stream_via_9router_http(
+            model_str=model_str,
+            call_messages=call_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=effective_reasoning_effort,
+            extra_kwargs=extra_kwargs,
+        )
+        return
+
+    if _uses_direct_9router_chat_http(model_str) or _uses_direct_9router_reasoning_chat_http(
+        model_str,
+        provider_reasoning_effort,
+    ):
+        yield from _stream_via_9router_chat_http(
+            model_str=model_str,
+            call_messages=call_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=provider_reasoning_effort,
+            extra_kwargs=extra_kwargs,
+        )
+        return
+
+    collected_parts: list[str] = []
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens = 0
+    cache_write_tokens = 0
+    response_model = model_str
+
+    try:
+        response_stream = litellm.completion(**call_kwargs)
+        for chunk in response_stream:
+            payload = _coerce_chunk_mapping(chunk)
+            if payload:
+                response_model = payload.get("model") or response_model
+                payload_input_tokens, payload_output_tokens = _extract_usage_from_stream_payload(payload)
+                if payload_input_tokens is not None:
+                    input_tokens = payload_input_tokens
+                if payload_output_tokens is not None:
+                    output_tokens = payload_output_tokens
+                usage = payload.get("usage") or {}
+                if isinstance(usage, dict):
+                    cache_read_tokens = int(usage.get("cache_read_input_tokens", cache_read_tokens) or cache_read_tokens)
+                    cache_write_tokens = int(usage.get("cache_creation_input_tokens", cache_write_tokens) or cache_write_tokens)
+
+            delta_text = _extract_text_delta_from_stream_payload(payload)
+            if delta_text:
+                collected_parts.append(delta_text)
+                yield {"type": "delta", "text": delta_text}
+    except AuthenticationError as e:
+        raise LLMError(401, f"Xác thực thất bại với provider '{model_str.split('/')[0]}'. Kiểm tra API key.") from e
+    except RateLimitError as e:
+        raise LLMError(429, "Provider đang giới hạn tốc độ. Vui lòng thử lại sau.") from e
+    except ContextWindowExceededError as e:
+        raise LLMError(400, "Ngữ cảnh vượt quá giới hạn context window của model. Hãy rút ngắn nội dung.") from e
+    except BadRequestError as e:
+        raise LLMError(400, f"Yêu cầu không hợp lệ: {str(e)[:200]}") from e
+    except ServiceUnavailableError as e:
+        raise LLMError(503, f"Provider '{model_str.split('/')[0]}' tạm thời không khả dụng. Thử lại sau.") from e
+    except Exception as e:
+        err_lower = str(e).lower()
+        if "connection" in err_lower or "timeout" in err_lower:
+            raise LLMError(503, f"Không thể kết nối tới provider AI. ({type(e).__name__})") from e
+        raise LLMError(500, f"Lỗi LLM không xác định ({type(e).__name__}): {str(e)[:200]}") from e
+
+    full_text = "".join(collected_parts)
+    yield {
+        "type": "complete",
+        "text": full_text,
+        "input_tokens": input_tokens if input_tokens is not None else _estimate_token_count_from_messages(call_messages),
+        "output_tokens": output_tokens if output_tokens is not None else _estimate_token_count_from_text(full_text),
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "model": response_model,
     }
 
 

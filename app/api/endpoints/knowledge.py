@@ -3,8 +3,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Up
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db, require_admin
+from app.api.error_handling import raise_internal_server_error
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.core.logging import get_logger
+from app.core.security import validate_username_policy
 from app.crud import crud_knowledge
 from app.models.chat_models import User
 from app.schemas.knowledge_schemas import (
@@ -35,6 +38,13 @@ from app.services.knowledge_service import (
 )
 
 router = APIRouter()
+logger = get_logger(__name__)
+
+
+def _validate_optional_username_filter(value: str | None, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return validate_username_policy(value, field_name=field_name, min_length=1, max_length=255)
 
 
 def _audit(db: Session, actor: str, action: str, **kwargs):
@@ -55,14 +65,15 @@ def get_admin_analytics(
     db: Session = Depends(get_db),
 ):
     try:
+        normalized_username = _validate_optional_username_filter(username, field_name="username")
         analytics = crud_knowledge.get_retrieval_analytics(
             db,
-            username=(username or None),
+            username=normalized_username,
             recent_limit=max(1, min(recent_limit, 100)),
         )
         return RetrievalAnalyticsResponse(**analytics)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.get_admin_analytics", exc=e)
 
 
 @router.post("/admin/backfill-three-storage", response_model=ThreeStorageBackfillResponse)
@@ -104,7 +115,7 @@ def backfill_three_storage(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.backfill_three_storage", exc=e)
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +193,7 @@ async def upload_document(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.upload_document", exc=e)
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +257,7 @@ def ingest_text(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.ingest_text", exc=e)
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +282,7 @@ def search_documents(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.search_documents", exc=e)
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +378,7 @@ def reindex(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.reindex", exc=e)
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +405,7 @@ def delete_document(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.delete_document", exc=e)
     _audit(db, current_user.username, "document.delete",
            resource_type="document", resource_id=doc_id,
            detail_json={
@@ -437,10 +448,11 @@ def get_cost_metrics(
 ):
     """Admin-only: aggregated token usage + retrieval latency cost metrics."""
     try:
-        data = crud_knowledge.get_cost_metrics(db, username=username or None)
+        normalized_username = _validate_optional_username_filter(username, field_name="username")
+        data = crud_knowledge.get_cost_metrics(db, username=normalized_username)
         return CostMetricsResponse(**data)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.get_cost_metrics", exc=e)
 
 
 # ---------------------------------------------------------------------------
@@ -460,9 +472,13 @@ def get_audit_logs(
 ):
     """Admin-only: query audit trail."""
     try:
+        normalized_actor_username = _validate_optional_username_filter(
+            actor_username,
+            field_name="actor_username",
+        )
         logs = crud_knowledge.list_audit_logs(
             db,
-            actor_username=actor_username,
+            actor_username=normalized_actor_username,
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,
@@ -471,7 +487,7 @@ def get_audit_logs(
         )
         return logs
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.get_audit_logs", exc=e)
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +512,7 @@ def hard_delete_document(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise_internal_server_error(logger, action="knowledge.hard_delete_document", exc=e)
     _audit(db, _admin.username, "document.hard_delete",
            resource_type="document", resource_id=doc_id,
            detail_json={

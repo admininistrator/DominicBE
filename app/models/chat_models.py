@@ -9,6 +9,7 @@ class User(Base):
     username = Column(String(255), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=True)
     role = Column(String(50), nullable=False, server_default="user")  # "user" | "admin"
+    auth_token_version = Column(Integer, nullable=False, default=0, server_default="0")
     reset_token = Column(String(255), nullable=True)
     reset_token_expires_at = Column(DateTime, nullable=True)
     max_tokens_per_day = Column(Integer, default=10000)

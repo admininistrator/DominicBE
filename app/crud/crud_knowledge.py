@@ -3,7 +3,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.json_utils import ensure_json_mapping
@@ -302,6 +302,31 @@ def list_ingestion_jobs(db: Session, document_id: int):
         db.query(IngestionJob)
         .filter(IngestionJob.document_id == document_id)
         .order_by(IngestionJob.created_at.desc())
+        .all()
+    )
+
+
+def list_recoverable_ingestion_jobs(
+    db: Session,
+    *,
+    stale_before: datetime | None = None,
+    limit: int = 100,
+) -> list[IngestionJob]:
+    recoverable_states = [IngestionJob.status == "queued"]
+    if stale_before is not None:
+        recoverable_states.append(
+            and_(
+                IngestionJob.status == "processing",
+                IngestionJob.updated_at.is_not(None),
+                IngestionJob.updated_at <= stale_before,
+            )
+        )
+
+    return (
+        db.query(IngestionJob)
+        .filter(or_(*recoverable_states))
+        .order_by(IngestionJob.created_at.asc(), IngestionJob.id.asc())
+        .limit(max(0, limit))
         .all()
     )
 

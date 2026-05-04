@@ -1,5 +1,5 @@
 """CRUD operations for authentication & user management."""
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from secrets import token_urlsafe
 from typing import Optional
 
@@ -10,31 +10,19 @@ from app.core.security import (
     normalize_password,
     normalize_username,
     password_hash_needs_update,
+    validate_username_policy,
     verify_password,
 )
 from app.models.chat_models import User
 
 
-HARDCODED_ADMIN_USERNAME = "test_user"
+def _utcnow_naive() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _is_hardcoded_admin_username(username: str | None) -> bool:
-    return normalize_username(username or "") == HARDCODED_ADMIN_USERNAME
-
-
-def is_effective_admin_username(username: str | None) -> bool:
-    return _is_hardcoded_admin_username(username)
-
-
-def _apply_hardcoded_admin_role(db: Session, user: User | None) -> User | None:
-    if not user:
-        return None
-    effective_role = "admin" if _is_hardcoded_admin_username(user.username) else "user"
-    if user.role != effective_role:
-        user.role = effective_role
-        db.commit()
-        db.refresh(user)
-    return user
+def _next_auth_token_version(user: User) -> int:
+    current_version = int(getattr(user, "auth_token_version", 0) or 0)
+    return current_version + 1
 
 
 # ---------------------------------------------------------------------------
@@ -45,18 +33,15 @@ def get_user_by_username(db: Session, username: str) -> Optional[User]:
     normalized = normalize_username(username)
     if not normalized:
         return None
-    user = db.query(User).filter(User.username == normalized).first()
-    return _apply_hardcoded_admin_role(db, user)
+    return db.query(User).filter(User.username == normalized).first()
 
 
 def get_user_by_id(db: Session, user_id: int) -> Optional[User]:
-    user = db.query(User).filter(User.id == user_id).first()
-    return _apply_hardcoded_admin_role(db, user)
+    return db.query(User).filter(User.id == user_id).first()
 
 
 def list_users(db: Session, skip: int = 0, limit: int = 100):
-    users = db.query(User).order_by(User.id.asc()).offset(skip).limit(limit).all()
-    return [_apply_hardcoded_admin_role(db, user) for user in users]
+    return db.query(User).order_by(User.id.asc()).offset(skip).limit(limit).all()
 
 
 # ---------------------------------------------------------------------------
@@ -70,25 +55,25 @@ def create_user(
     role: str = "user",
     max_tokens_per_day: int = 10000,
 ) -> User:
-    normalized = normalize_username(username)
-    if not normalized:
-        raise ValueError("Username must not be empty.")
+    normalized = validate_username_policy(username, field_name="Username", min_length=3, max_length=255)
 
     if get_user_by_username(db, normalized):
         raise ValueError("Username already exists.")
 
-    effective_role = "admin" if _is_hardcoded_admin_username(normalized) else "user"
+    if role not in ("user", "admin"):
+        raise ValueError("Role must be 'user' or 'admin'.")
 
     user = User(
         username=normalized,
         password_hash=hash_password(password, enforce_policy=True),
-        role=effective_role,
+        role=role,
+        auth_token_version=0,
         max_tokens_per_day=max_tokens_per_day,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
-    return _apply_hardcoded_admin_role(db, user)
+    return user
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +81,9 @@ def create_user(
 # ---------------------------------------------------------------------------
 
 def verify_user_credentials(db: Session, username: str, password: str) -> Optional[User]:
-    normalized = normalize_username(username)
-    if not normalized:
+    try:
+        normalized = validate_username_policy(username, field_name="Username", min_length=1, max_length=255)
+    except ValueError:
         return None
 
     user = get_user_by_username(db, normalized)
@@ -116,7 +102,7 @@ def verify_user_credentials(db: Session, username: str, password: str) -> Option
             user.password_hash = hash_password(normalized_pw)
             db.commit()
             db.refresh(user)
-        return _apply_hardcoded_admin_role(db, user)
+        return user
 
     return None
 
@@ -134,6 +120,14 @@ def change_password(db: Session, user: User, old_password: str, new_password: st
         raise ValueError("Current password is incorrect.")
 
     user.password_hash = hash_password(new_password, enforce_policy=True)
+    user.auth_token_version = _next_auth_token_version(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def revoke_auth_tokens(db: Session, user: User) -> User:
+    user.auth_token_version = _next_auth_token_version(user)
     db.commit()
     db.refresh(user)
     return user
@@ -147,7 +141,7 @@ def create_reset_token(db: Session, user: User, expire_minutes: int = 30) -> str
     """Generate a one-time reset token for a user (admin action)."""
     token = token_urlsafe(32)
     user.reset_token = token
-    user.reset_token_expires_at = datetime.utcnow() + timedelta(minutes=expire_minutes)
+    user.reset_token_expires_at = _utcnow_naive() + timedelta(minutes=expire_minutes)
     db.commit()
     db.refresh(user)
     return token
@@ -162,13 +156,14 @@ def consume_reset_token(db: Session, username: str, token: str, new_password: st
     if not user.reset_token or user.reset_token != token:
         raise ValueError("Invalid reset token.")
 
-    if user.reset_token_expires_at and user.reset_token_expires_at < datetime.utcnow():
+    if user.reset_token_expires_at and user.reset_token_expires_at < _utcnow_naive():
         user.reset_token = None
         user.reset_token_expires_at = None
         db.commit()
         raise ValueError("Reset token has expired.")
 
     user.password_hash = hash_password(new_password, enforce_policy=True)
+    user.auth_token_version = _next_auth_token_version(user)
     user.reset_token = None
     user.reset_token_expires_at = None
     db.commit()
@@ -183,8 +178,10 @@ def consume_reset_token(db: Session, username: str, token: str, new_password: st
 def set_user_role(db: Session, user: User, role: str) -> User:
     if role not in ("user", "admin"):
         raise ValueError("Role must be 'user' or 'admin'.")
-    user.role = "admin" if _is_hardcoded_admin_username(user.username) else "user"
+    if user.role != role:
+        user.auth_token_version = _next_auth_token_version(user)
+    user.role = role
     db.commit()
     db.refresh(user)
-    return _apply_hardcoded_admin_role(db, user)
+    return user
 

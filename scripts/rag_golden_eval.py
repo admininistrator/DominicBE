@@ -14,9 +14,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.api.deps import get_db
+from app.core.config import settings
 from app.core.database import Base
 from app.main import app
 from app.services import chat_service
+
+
+API_PREFIX = "/api/v1"
+
+
+def api_path(path: str) -> str:
+    return f"{API_PREFIX}{path}"
 
 
 DATASET_PATH = PROJECT_ROOT / "scripts" / "data" / "rag_golden_set.json"
@@ -91,6 +99,8 @@ def main() -> None:
     original_get_client = chat_service._get_client
     app.dependency_overrides[get_db] = override_get_db
     chat_service._get_client = lambda: _FakeAnthropicClient()
+    original_rate_limit_enabled = settings.rate_limit_enabled
+    settings.rate_limit_enabled = False
 
     try:
         with TestClient(app) as client:
@@ -98,7 +108,7 @@ def main() -> None:
             for index, case in enumerate(dataset, start=1):
                 username = f"golden_user_{index}"
                 register_response = client.post(
-                    "/api/auth/register",
+                    api_path("/auth/register"),
                     json={
                         "username": username,
                         "password": "StrongPass1!",
@@ -110,7 +120,7 @@ def main() -> None:
                 headers = {"Authorization": f"Bearer {token}"}
 
                 ingest_response = client.post(
-                    "/api/knowledge/documents/ingest",
+                    api_path("/knowledge/documents/ingest"),
                     json={
                         "title": case["document_title"],
                         "source_type": "text",
@@ -122,7 +132,7 @@ def main() -> None:
                 document_id = ingest_response.json()["document_id"]
 
                 session_response = client.post(
-                    "/api/chat/sessions",
+                    api_path("/chat/sessions"),
                     json={"title": f"golden-{case['id']}"},
                     headers=headers,
                 )
@@ -137,7 +147,7 @@ def main() -> None:
                     payload["knowledge_document_id"] = document_id
 
                 chat_response = client.post(
-                    "/api/chat/",
+                    api_path("/chat/"),
                     json=payload,
                     headers=headers,
                 )
@@ -165,6 +175,7 @@ def main() -> None:
                 raise AssertionError("\n".join(failures))
 
     finally:
+        settings.rate_limit_enabled = original_rate_limit_enabled
         chat_service._get_client = original_get_client
         app.dependency_overrides.clear()
 

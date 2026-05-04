@@ -1,4 +1,5 @@
 """Knowledge ingestion service – chunking, indexing skeleton for RAG."""
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import logging
@@ -9,12 +10,13 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_knowledge
 from app.models.knowledge_models import KnowledgeDocument
 from app.services import object_storage, vector_store
 
-logger = logging.getLogger("uvicorn.error")
+logger = get_logger(__name__)
 LOCAL_EMBEDDING_DIMENSIONS = settings.embedding_dimensions
 
 
@@ -733,6 +735,67 @@ def run_indexing_pipeline(doc_id: int, job_id: int, db_factory) -> dict:
         max_attempts, doc_id, job_id, last_exc,
     )
     raise last_exc
+
+
+def recover_pending_ingestion_jobs(
+    db_factory,
+    *,
+    recovery_limit: int,
+    stale_after_seconds: int,
+) -> dict:
+    if recovery_limit <= 0:
+        return {
+            "selected_count": 0,
+            "queued_count": 0,
+            "stale_processing_count": 0,
+            "recovered_count": 0,
+            "failed_count": 0,
+            "jobs": [],
+        }
+
+    stale_before = (datetime.now(UTC) - timedelta(seconds=max(0, stale_after_seconds))).replace(tzinfo=None)
+    db = db_factory()
+    try:
+        jobs = crud_knowledge.list_recoverable_ingestion_jobs(
+            db,
+            stale_before=stale_before,
+            limit=recovery_limit,
+        )
+        recoverable_jobs = [
+            {
+                "job_id": job.id,
+                "document_id": job.document_id,
+                "previous_status": job.status,
+            }
+            for job in jobs
+        ]
+    finally:
+        db.close()
+
+    recovered_count = 0
+    failed_count = 0
+    for item in recoverable_jobs:
+        try:
+            run_indexing_pipeline(item["document_id"], item["job_id"], db_factory)
+            item["recovered"] = True
+            recovered_count += 1
+        except Exception as exc:
+            item["recovered"] = False
+            item["error"] = str(exc)
+            failed_count += 1
+
+    queued_count = sum(1 for item in recoverable_jobs if item["previous_status"] == "queued")
+    stale_processing_count = sum(
+        1 for item in recoverable_jobs if item["previous_status"] == "processing"
+    )
+    return {
+        "selected_count": len(recoverable_jobs),
+        "queued_count": queued_count,
+        "stale_processing_count": stale_processing_count,
+        "recovered_count": recovered_count,
+        "failed_count": failed_count,
+        "jobs": recoverable_jobs,
+    }
 
 
 def ingest_document(

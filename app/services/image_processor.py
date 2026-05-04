@@ -45,7 +45,9 @@ import io
 import logging
 from dataclasses import dataclass, field
 
-logger = logging.getLogger("uvicorn.error")
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 

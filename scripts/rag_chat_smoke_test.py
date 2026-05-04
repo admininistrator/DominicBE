@@ -11,9 +11,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.api.deps import get_db
+from app.core.config import settings
 from app.core.database import Base
 from app.main import app
 from app.services import chat_service
+
+
+API_PREFIX = "/api/v1"
+
+
+def api_path(path: str) -> str:
+    return f"{API_PREFIX}{path}"
 
 
 LONG_TEXT = (
@@ -61,11 +69,13 @@ def main() -> None:
     original_complete = chat_service.llm_provider.complete
     app.dependency_overrides[get_db] = override_get_db
     chat_service.llm_provider.complete = _fake_complete
+    original_rate_limit_enabled = settings.rate_limit_enabled
+    settings.rate_limit_enabled = False
 
     try:
         with TestClient(app) as client:
             register_response = client.post(
-                "/api/auth/register",
+                api_path("/auth/register"),
                 json={
                     "username": "rag_user",
                     "password": "StrongPass1!",
@@ -77,7 +87,7 @@ def main() -> None:
             headers = {"Authorization": f"Bearer {token}"}
 
             ingest_response = client.post(
-                "/api/knowledge/documents/ingest",
+                api_path("/knowledge/documents/ingest"),
                 json={
                     "title": "Product FAQ",
                     "source_type": "text",
@@ -89,7 +99,7 @@ def main() -> None:
             document_id = ingest_response.json()["document_id"]
 
             session_response = client.post(
-                "/api/chat/sessions",
+                api_path("/chat/sessions"),
                 json={"title": "Grounded chat"},
                 headers=headers,
             )
@@ -97,7 +107,7 @@ def main() -> None:
             session_id = session_response.json()["id"]
 
             chat_response = client.post(
-                "/api/chat/",
+                api_path("/chat/"),
                 json={
                     "session_id": session_id,
                     "message": "Chính sách hoàn tiền xử lý trong bao lâu?",
@@ -127,7 +137,7 @@ def main() -> None:
             assert "refund" in chat_payload["sources"][0]["snippet"].lower()
 
             history_response = client.get(
-                f"/api/chat/sessions/{session_id}/messages",
+                api_path(f"/chat/sessions/{session_id}/messages"),
                 headers=headers,
             )
             assert history_response.status_code == 200, history_response.text
@@ -145,7 +155,7 @@ def main() -> None:
             assert assistant_message["sources"][0]["title"] == "Product FAQ"
 
             weak_chat_response = client.post(
-                "/api/chat/",
+                api_path("/chat/"),
                 json={
                     "session_id": session_id,
                     "message": "Bảo hành thiết bị trong bao lâu?",
@@ -160,6 +170,7 @@ def main() -> None:
             assert "chưa có đủ bằng chứng" in weak_payload["reply"].lower()
 
     finally:
+        settings.rate_limit_enabled = original_rate_limit_enabled
         chat_service.llm_provider.complete = original_complete
         app.dependency_overrides.clear()
 

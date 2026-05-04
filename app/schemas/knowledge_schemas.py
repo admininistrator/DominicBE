@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from app.core.security import validate_username_policy
 
 
 class ORMBaseSchema(BaseModel):
@@ -112,6 +114,13 @@ class ThreeStorageBackfillRequest(BaseModel):
     upsert_vectors: bool = True
     write_source_manifest: bool = True
     fail_fast: bool = False
+
+    @field_validator("owner_username")
+    @classmethod
+    def _validate_owner_username(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return validate_username_policy(value, field_name="owner_username", min_length=1, max_length=255)
 
 
 class ThreeStorageBackfillItem(BaseModel):

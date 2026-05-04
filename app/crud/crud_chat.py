@@ -1,19 +1,24 @@
 import json
-
-from sqlalchemy.orm import Session
+from datetime import UTC, datetime, timedelta
 from secrets import compare_digest
+from uuid import uuid4
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
 from app.models.chat_models import Message, User, ChatSummary, ChatSession
 from app.core.security import (
     hash_password,
     normalize_password,
     normalize_username,
     password_hash_needs_update,
+    validate_username_policy,
     verify_password,
 )
-from uuid import uuid4
-from datetime import datetime
-from datetime import timedelta
-from sqlalchemy import func
+
+
+def _utcnow_naive() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _encode_message_payload(
@@ -143,22 +148,44 @@ def rename_chat_session(db: Session, username: str, session_id: int, title: str)
 def touch_chat_session(db: Session, session_id: int):
     row = db.query(ChatSession).filter(ChatSession.id == session_id).first()
     if row:
-        row.updated_at = datetime.utcnow()
+        row.updated_at = _utcnow_naive()
         db.commit()
         db.refresh(row)
     return row
 
 
-def get_session_messages(db: Session, username: str, session_id: int):
-    return (
+def get_session_messages(
+    db: Session,
+    username: str,
+    session_id: int,
+    *,
+    skip: int = 0,
+    limit: int | None = None,
+    before_id: int | None = None,
+):
+    query = (
         db.query(Message)
         .filter(
             Message.sender_username == username,
             Message.session_id == session_id,
         )
-        .order_by(Message.id.asc())
-        .all()
     )
+    if before_id is not None:
+        query = query.filter(Message.id < before_id)
+
+    query = query.order_by(Message.id.desc())
+    if skip:
+        query = query.offset(skip)
+
+    has_more = False
+    if limit is not None:
+        rows = query.limit(limit + 1).all()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+    else:
+        rows = query.all()
+
+    return list(reversed(rows)), has_more
 
 
 def get_recent_user_history(db: Session, username: str, session_id: int, limit: int):
@@ -227,9 +254,12 @@ def get_user_by_username(db: Session, username: str):
 
 
 def create_user(db: Session, username: str, password: str, max_tokens_per_day: int = 10000):
-    normalized_username = normalize_username(username)
-    if not normalized_username:
-        raise ValueError("Username must not be empty.")
+    normalized_username = validate_username_policy(
+        username,
+        field_name="Username",
+        min_length=3,
+        max_length=255,
+    )
 
     existing = get_user_by_username(db, normalized_username)
     if existing:
@@ -248,7 +278,7 @@ def create_user(db: Session, username: str, password: str, max_tokens_per_day: i
 
 
 def reset_user_tokens_if_needed(db: Session, user: User, reset_interval_hours: int = 2):
-    now = datetime.utcnow()
+    now = _utcnow_naive()
     last_reset = user.last_token_reset_at or user.created_at or now
     if now - last_reset >= timedelta(hours=reset_interval_hours):
         user.total_token_used = 0
@@ -261,7 +291,7 @@ def reset_user_tokens_if_needed(db: Session, user: User, reset_interval_hours: i
 
 
 def get_rolling_token_usage(db: Session, username: str, window_hours: int = 2):
-    cutoff = datetime.utcnow() - timedelta(hours=window_hours)
+    cutoff = _utcnow_naive() - timedelta(hours=window_hours)
     totals = (
         db.query(
             func.coalesce(func.sum(Message.input_tokens), 0).label("input_tokens"),
@@ -284,8 +314,14 @@ def get_rolling_token_usage(db: Session, username: str, window_hours: int = 2):
 
 
 def verify_user_credentials(db: Session, username: str, password: str):
-    normalized_username = normalize_username(username)
-    if not normalized_username:
+    try:
+        normalized_username = validate_username_policy(
+            username,
+            field_name="Username",
+            min_length=1,
+            max_length=255,
+        )
+    except ValueError:
         return None
 
     user = db.query(User).filter(User.username == normalized_username).first()

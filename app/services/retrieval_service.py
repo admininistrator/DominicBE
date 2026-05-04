@@ -11,13 +11,14 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_knowledge
 from app.services.knowledge_service import compute_text_embedding
 from app.services import vector_store
 
 
-logger = logging.getLogger("uvicorn.error")
+logger = get_logger(__name__)
 
 
 QUERY_EXPANSION_RULES: dict[str, list[str]] = {

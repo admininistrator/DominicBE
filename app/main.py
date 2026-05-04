@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 import logging
 import sys
+from threading import Thread
 from time import perf_counter
 from uuid import uuid4
 
@@ -16,16 +17,32 @@ from app.api.deps import get_current_user_optional
 from app.crud import crud_auth
 from app.api.endpoints import auth, chat, knowledge
 from app.core.config import settings
-from app.core.database import check_database_health, engine
+from app.core.database import SessionLocal, check_database_health, engine
+from app.core.logging import (
+    clear_log_context,
+    configure_logging,
+    get_log_context,
+    get_logger,
+    restore_log_context,
+    set_log_context,
+)
+from app.core.migrations import MigrationValidationError, validate_database_migrations
+from app.core.rate_limit import (
+    attach_rate_limit_headers,
+    build_rate_limiter,
+    build_default_rate_limit_rules,
+    build_rate_limited_response,
+    find_matching_rule,
+    get_client_ip,
+)
+from app.services.knowledge_service import recover_pending_ingestion_jobs
 from app.services.object_storage import check_object_storage_health
 from app.services.vector_store import check_vector_store_health
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    stream=sys.stdout,
-)
-logger = logging.getLogger("uvicorn.error")
+configure_logging(logging.INFO)
+logger = get_logger(__name__)
+API_LEGACY_PREFIX = "/api"
+API_V1_PREFIX = "/api/v1"
 
 HTTP_REQUESTS_TOTAL = Counter(
     "dominic_http_requests_total",
@@ -42,6 +59,12 @@ HTTP_REQUESTS_IN_PROGRESS = Gauge(
     "dominic_http_requests_in_progress",
     "Current in-flight HTTP requests.",
 )
+RATE_LIMIT_RULES = build_default_rate_limit_rules(settings)
+RATE_LIMIT_ENTRY_TTL_SECONDS = max(
+    [rule.window_seconds for rule in RATE_LIMIT_RULES if rule.limit > 0],
+    default=settings.rate_limit_cleanup_interval_seconds,
+)
+RATE_LIMITER = build_rate_limiter(settings, session_factory=SessionLocal)
 
 
 def _get_package_version(name: str) -> str:
@@ -59,6 +82,50 @@ def _mask_db_url(url: str) -> str:
         return url[:colon] + url[colon:second_colon] + ":***" + url[at:]
     except (ValueError, IndexError):
         return "(could not parse)"
+
+
+def _ensure_request_id(request: Request) -> str:
+    request_id = getattr(request.state, "request_id", None) or request.headers.get("X-Request-ID") or str(uuid4())
+    request.state.request_id = request_id
+    return request_id
+
+
+def _start_ingestion_recovery_worker() -> Thread | None:
+    if not settings.ingestion_recovery_enabled or settings.ingestion_recovery_max_jobs <= 0:
+        return None
+
+    def _recover_jobs():
+        try:
+            summary = recover_pending_ingestion_jobs(
+                SessionLocal,
+                recovery_limit=settings.ingestion_recovery_max_jobs,
+                stale_after_seconds=settings.ingestion_stuck_job_timeout_seconds,
+            )
+            if summary["selected_count"]:
+                logger.info(
+                    "ingestion recovery completed selected=%s queued=%s stale_processing=%s recovered=%s failed=%s",
+                    summary["selected_count"],
+                    summary["queued_count"],
+                    summary["stale_processing_count"],
+                    summary["recovered_count"],
+                    summary["failed_count"],
+                )
+        except Exception:
+            logger.exception("ingestion recovery failed at startup")
+
+    worker = Thread(target=_recover_jobs, name="ingestion-recovery", daemon=True)
+    worker.start()
+    return worker
+
+
+def _mount_api_router(*, router, segment: str, tags: list[str]):
+    app.include_router(router, prefix=f"{API_V1_PREFIX}/{segment}", tags=tags)
+    app.include_router(
+        router,
+        prefix=f"{API_LEGACY_PREFIX}/{segment}",
+        tags=tags,
+        include_in_schema=False,
+    )
 
 
 @asynccontextmanager
@@ -86,9 +153,29 @@ async def lifespan(app: FastAPI):
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
+            if settings.migration_validation_enabled:
+                migration_result = validate_database_migrations(
+                    connection,
+                    mode=settings.migration_validation_mode,
+                )
+                if migration_result.is_current:
+                    logger.info(
+                        "Database migration validation passed current_revision=%s",
+                        ",".join(migration_result.current_revisions) or "(none)",
+                    )
+                else:
+                    logger.warning(
+                        "Database migration validation warning %s",
+                        migration_result.describe(),
+                    )
         logger.info("Database connectivity check passed.")
+    except MigrationValidationError as exc:
+        logger.error("Database migration validation failed: %s", exc)
+        raise
     except Exception as exc:
         logger.warning("Database connectivity check failed: %s", exc)
+
+    _start_ingestion_recovery_worker()
 
     logger.info("=== %s ready ===", settings.app_name)
     yield
@@ -104,7 +191,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://.*\.azurestaticapps\.net$",
+    allow_origin_regex=settings.cors_allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -112,9 +199,54 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if not settings.rate_limit_enabled:
+        return await call_next(request)
+
+    rule = find_matching_rule(
+        RATE_LIMIT_RULES,
+        method=request.method,
+        path=request.url.path,
+    )
+    if rule is None:
+        return await call_next(request)
+
+    request_id = _ensure_request_id(request)
+    client_ip = get_client_ip(request, trust_proxy_headers=settings.rate_limit_trust_proxy_headers)
+    decision = RATE_LIMITER.check(rule=rule, key=client_ip)
+    if not decision.allowed:
+        previous_context = get_log_context()
+        set_log_context(
+            request_id=request_id,
+            client_ip=client_ip,
+            http_method=request.method,
+            http_path=request.url.path,
+            username=getattr(request.state, "auth_username", None),
+        )
+        logger.warning(
+            "rate limit exceeded scope=%s",
+            rule.name,
+        )
+        response = build_rate_limited_response(rule=rule, decision=decision)
+        response.headers["X-Request-ID"] = request_id
+        restore_log_context(previous_context)
+        return response
+
+    response = await call_next(request)
+    return attach_rate_limit_headers(response, decision)
+
+
+@app.middleware("http")
 async def observability_middleware(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID") or str(uuid4())
-    request.state.request_id = request_id
+    request_id = _ensure_request_id(request)
+    client_ip = get_client_ip(request, trust_proxy_headers=settings.rate_limit_trust_proxy_headers)
+    set_log_context(
+        request_id=request_id,
+        client_ip=client_ip,
+        http_method=request.method,
+        http_path=request.url.path,
+        username=getattr(request.state, "auth_username", None),
+    )
     started_at = perf_counter()
     status_code = 500
     response: Response | None = None
@@ -135,19 +267,30 @@ async def observability_middleware(request: Request, call_next):
         duration = perf_counter() - started_at
         HTTP_REQUESTS_TOTAL.labels(request.method, route_path, str(status_code)).inc()
         HTTP_REQUEST_LATENCY_SECONDS.labels(request.method, route_path).observe(duration)
+        set_log_context(
+            http_path=route_path,
+            username=getattr(request.state, "auth_username", None),
+        )
         logger.info(
-            "request completed request_id=%s method=%s path=%s status=%s duration_ms=%.2f",
-            request_id,
-            request.method,
-            route_path,
+            "request completed status=%s duration_ms=%.2f",
             status_code,
             duration * 1000,
         )
+        clear_log_context()
 
 
 @app.get("/")
 def root():
-    return {"service": settings.app_name, "status": "running"}
+    return {
+        "service": settings.app_name,
+        "status": "running",
+        "api_versions": {
+            "current": "v1",
+            "supported": ["v1"],
+            "default_base_path": API_V1_PREFIX,
+            "legacy_base_path": API_LEGACY_PREFIX,
+        },
+    }
 
 
 @app.get("/health")
@@ -197,7 +340,7 @@ def debug_env(current_user=Depends(get_current_user_optional)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Not authenticated.")
 
-    if not crud_auth.is_effective_admin_username(getattr(current_user, "username", None)):
+    if getattr(current_user, "role", None) != "admin":
         raise HTTPException(status_code=403, detail="Admin privileges required.")
 
     return {
@@ -220,6 +363,6 @@ def debug_env(current_user=Depends(get_current_user_optional)):
     }
 
 
-app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
-app.include_router(chat.router, prefix="/api/chat", tags=["Chat"])
-app.include_router(knowledge.router, prefix="/api/knowledge", tags=["Knowledge"])
+_mount_api_router(router=auth.router, segment="auth", tags=["Auth"])
+_mount_api_router(router=chat.router, segment="chat", tags=["Chat"])
+_mount_api_router(router=knowledge.router, segment="knowledge", tags=["Knowledge"])

@@ -31,6 +31,72 @@ class Settings(BaseSettings):
         alias="AUTH_ACCESS_TOKEN_EXPIRE_MINUTES",
         ge=5,
     )
+    auth_refresh_token_expire_minutes: int = Field(
+        default=60 * 24 * 30,
+        alias="AUTH_REFRESH_TOKEN_EXPIRE_MINUTES",
+        ge=5,
+    )
+    rate_limit_enabled: bool = Field(default=True, alias="RATE_LIMIT_ENABLED")
+    rate_limit_store_backend: Literal["memory", "database"] = Field(
+        default="database",
+        alias="RATE_LIMIT_STORE_BACKEND",
+    )
+    rate_limit_trust_proxy_headers: bool = Field(default=True, alias="RATE_LIMIT_TRUST_PROXY_HEADERS")
+    rate_limit_cleanup_interval_seconds: int = Field(
+        default=60,
+        alias="RATE_LIMIT_CLEANUP_INTERVAL_SECONDS",
+        ge=5,
+    )
+    rate_limit_auth_login_requests: int = Field(
+        default=5,
+        alias="RATE_LIMIT_AUTH_LOGIN_REQUESTS",
+        ge=0,
+    )
+    rate_limit_auth_login_window_seconds: int = Field(
+        default=60,
+        alias="RATE_LIMIT_AUTH_LOGIN_WINDOW_SECONDS",
+        ge=1,
+    )
+    rate_limit_auth_register_requests: int = Field(
+        default=3,
+        alias="RATE_LIMIT_AUTH_REGISTER_REQUESTS",
+        ge=0,
+    )
+    rate_limit_auth_register_window_seconds: int = Field(
+        default=300,
+        alias="RATE_LIMIT_AUTH_REGISTER_WINDOW_SECONDS",
+        ge=1,
+    )
+    rate_limit_auth_reset_password_requests: int = Field(
+        default=5,
+        alias="RATE_LIMIT_AUTH_RESET_PASSWORD_REQUESTS",
+        ge=0,
+    )
+    rate_limit_auth_reset_password_window_seconds: int = Field(
+        default=300,
+        alias="RATE_LIMIT_AUTH_RESET_PASSWORD_WINDOW_SECONDS",
+        ge=1,
+    )
+    rate_limit_chat_requests: int = Field(
+        default=20,
+        alias="RATE_LIMIT_CHAT_REQUESTS",
+        ge=0,
+    )
+    rate_limit_chat_window_seconds: int = Field(
+        default=60,
+        alias="RATE_LIMIT_CHAT_WINDOW_SECONDS",
+        ge=1,
+    )
+    rate_limit_chat_stream_requests: int = Field(
+        default=10,
+        alias="RATE_LIMIT_CHAT_STREAM_REQUESTS",
+        ge=0,
+    )
+    rate_limit_chat_stream_window_seconds: int = Field(
+        default=60,
+        alias="RATE_LIMIT_CHAT_STREAM_WINDOW_SECONDS",
+        ge=1,
+    )
     auth_password_min_length: int = Field(default=8, alias="AUTH_PASSWORD_MIN_LENGTH", ge=1)
     auth_password_max_length: int = Field(default=16, alias="AUTH_PASSWORD_MAX_LENGTH", ge=8)
 
@@ -42,22 +108,33 @@ class Settings(BaseSettings):
         default="http://localhost:5173,http://127.0.0.1:5173",
         alias="CORS_ORIGINS",
     )
+    cors_allow_origin_regex_raw: str | None = Field(
+        default=None,
+        alias="CORS_ALLOW_ORIGIN_REGEX",
+    )
 
     database_url: str | None = Field(default=None, alias="DATABASE_URL")
 
     db_host: str = Field(default="127.0.0.1", alias="DB_HOST")
-    db_port: int = Field(default=3306, alias="DB_PORT", ge=1, le=65535)
+    db_port: int = Field(default=5432, alias="DB_PORT", ge=1, le=65535)
     db_user: str = Field(default="dominic", alias="DB_USER")
     db_password: str = Field(default="", alias="DB_PASSWORD")
     db_name: str = Field(default="chatbot_db", alias="DB_NAME")
     db_ssl: bool = Field(default=False, alias="DB_SSL")
     db_ssl_ca: str | None = Field(default=None, alias="DB_SSL_CA")
     db_charset: str = Field(default="utf8mb4", alias="DB_CHARSET")
+    db_pool_size: int = Field(default=10, alias="DB_POOL_SIZE", ge=0)
+    db_max_overflow: int = Field(default=20, alias="DB_MAX_OVERFLOW", ge=0)
     db_pool_recycle: int = Field(default=300, alias="DB_POOL_RECYCLE", ge=1)
     db_pool_timeout: int = Field(default=10, alias="DB_POOL_TIMEOUT", ge=1)
     db_connect_timeout: int = Field(default=10, alias="DB_CONNECT_TIMEOUT", ge=1)
     db_read_timeout: int = Field(default=30, alias="DB_READ_TIMEOUT", ge=1)
     db_write_timeout: int = Field(default=30, alias="DB_WRITE_TIMEOUT", ge=1)
+    migration_validation_enabled: bool = Field(default=True, alias="MIGRATION_VALIDATION_ENABLED")
+    migration_validation_mode: Literal["warn", "strict"] = Field(
+        default="strict",
+        alias="MIGRATION_VALIDATION_MODE",
+    )
 
     # ── 9router-backed LiteLLM settings ──────────────────────────────────────
     llm_model: str = Field(default="", alias="LLM_MODEL")
@@ -142,6 +219,12 @@ class Settings(BaseSettings):
     context_window_size: int = Field(default=8, alias="CONTEXT_WINDOW_SIZE", ge=1)
     summary_trigger_messages: int = Field(default=10, alias="SUMMARY_TRIGGER_MESSAGES", ge=1)
     summary_max_tokens: int = Field(default=220, alias="SUMMARY_MAX_TOKENS", ge=32)
+    chat_message_max_length: int = Field(
+        default=12000,
+        alias="CHAT_MESSAGE_MAX_LENGTH",
+        ge=1,
+        le=200000,
+    )
     max_output_tokens: int = Field(default=5000, alias="MAX_OUTPUT_TOKENS", ge=1)
     rolling_window_hours: int = Field(default=2, alias="ROLLING_WINDOW_HOURS", ge=1)
     token_estimate_chars_per_token: int = Field(
@@ -256,6 +339,26 @@ class Settings(BaseSettings):
     )
     tavily_api_key: str = Field(default="", alias="TAVILY_API_KEY")
     tavily_base_url: str = Field(default="https://api.tavily.com", alias="TAVILY_BASE_URL")
+    rate_limit_knowledge_upload_requests: int = Field(
+        default=10,
+        alias="RATE_LIMIT_KNOWLEDGE_UPLOAD_REQUESTS",
+        ge=0,
+    )
+    rate_limit_knowledge_upload_window_seconds: int = Field(
+        default=300,
+        alias="RATE_LIMIT_KNOWLEDGE_UPLOAD_WINDOW_SECONDS",
+        ge=1,
+    )
+    rate_limit_knowledge_ingest_requests: int = Field(
+        default=10,
+        alias="RATE_LIMIT_KNOWLEDGE_INGEST_REQUESTS",
+        ge=0,
+    )
+    rate_limit_knowledge_ingest_window_seconds: int = Field(
+        default=300,
+        alias="RATE_LIMIT_KNOWLEDGE_INGEST_WINDOW_SECONDS",
+        ge=1,
+    )
     tavily_search_depth: Literal["basic", "advanced"] = Field(
         default="advanced",
         alias="TAVILY_SEARCH_DEPTH",
@@ -290,6 +393,14 @@ class Settings(BaseSettings):
     # Phase 6: retry policy for background indexing
     ingestion_max_retries: int = Field(default=3, alias="INGESTION_MAX_RETRIES", ge=0, le=10)
     ingestion_retry_delay_seconds: float = Field(default=2.0, alias="INGESTION_RETRY_DELAY_SECONDS", ge=0.0)
+    ingestion_recovery_enabled: bool = Field(default=True, alias="INGESTION_RECOVERY_ENABLED")
+    ingestion_recovery_max_jobs: int = Field(default=20, alias="INGESTION_RECOVERY_MAX_JOBS", ge=0, le=500)
+    ingestion_stuck_job_timeout_seconds: int = Field(
+        default=900,
+        alias="INGESTION_STUCK_JOB_TIMEOUT_SECONDS",
+        ge=30,
+        le=86400,
+    )
 
     # Phase 6: audit log
     audit_log_enabled: bool = Field(default=True, alias="AUDIT_LOG_ENABLED")
@@ -305,6 +416,8 @@ class Settings(BaseSettings):
         total_retrieval_weight = self.retrieval_hybrid_semantic_weight + self.retrieval_hybrid_lexical_weight
         if total_retrieval_weight <= 0:
             raise ValueError("Hybrid retrieval weights must sum to a positive value")
+        if self.migration_validation_mode not in {"warn", "strict"}:
+            raise ValueError("MIGRATION_VALIDATION_MODE must be either 'warn' or 'strict'")
         return self
 
     @property
@@ -315,6 +428,11 @@ class Settings(BaseSettings):
             if item.strip()
         ]
         return origins or ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+    @property
+    def cors_allow_origin_regex(self) -> str | None:
+        normalized = (self.cors_allow_origin_regex_raw or "").strip()
+        return normalized or None
 
     @property
     def supported_chat_models(self) -> list[str]:
@@ -331,9 +449,8 @@ class Settings(BaseSettings):
 
         encoded_password = quote_plus(self.db_password)
         return (
-            f"mysql+pymysql://{self.db_user}:{encoded_password}"
+            f"postgresql+psycopg://{self.db_user}:{encoded_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
-            f"?charset={self.db_charset}"
         )
 
     @property
