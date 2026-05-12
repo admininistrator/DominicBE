@@ -1209,7 +1209,11 @@ def _prepare_chat_turn(
         "model": model,
         "reasoning_effort": reasoning_effort,
     }
-    if images and settings.llm_vision_enabled:
+    if images:
+        if not settings.llm_vision_enabled:
+            raise ValueError(
+                "Image attachments are not supported: vision is disabled on this server."
+            )
         request_kwargs["images"] = images
         request_kwargs["image_media_types"] = image_media_types or []
 

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -20,6 +20,15 @@ class KnowledgeDocumentCreateRequest(BaseModel):
     session_id: int | None = Field(default=None, ge=1)
 
 
+# ---------------------------------------------------------------------------
+# Status vocabulary — locked by BE-003 source-verification
+# ---------------------------------------------------------------------------
+
+DocumentStatus = Literal["uploaded", "processing", "indexed", "failed"]
+JobStatus = Literal["queued", "processing", "completed", "failed"]
+IngestionResultStatus = Literal["pending", "indexed"]
+
+
 class KnowledgeDocumentResponse(ORMBaseSchema):
     id: int
     owner_username: str
@@ -27,7 +36,7 @@ class KnowledgeDocumentResponse(ORMBaseSchema):
     source_type: str
     source_uri: str | None = None
     mime_type: str | None = None
-    status: str
+    status: DocumentStatus
     checksum: str | None = None
     session_id: int | None = None
     metadata_json: dict[str, Any] | None = None
@@ -50,7 +59,7 @@ class KnowledgeChunkResponse(ORMBaseSchema):
 class IngestionJobResponse(ORMBaseSchema):
     id: int
     document_id: int
-    status: str
+    status: JobStatus
     error_message: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -59,7 +68,7 @@ class IngestionJobResponse(ORMBaseSchema):
 class IngestionResult(BaseModel):
     document_id: int
     job_id: int
-    status: str
+    status: IngestionResultStatus
     chunks_count: int = 0
     checksum: str | None = None
     attempts: int | None = None

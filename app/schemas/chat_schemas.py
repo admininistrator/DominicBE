@@ -109,8 +109,9 @@ class ChatRequest(_OptionalUsernameInputModel):
     @field_validator("images")
     @classmethod
     def _validate_image_count(cls, v: list[str]) -> list[str]:
-        if len(v) > 10:
-            raise ValueError("Maximum 10 images per message.")
+        max_count = settings.llm_chat_image_max_count
+        if len(v) > max_count:
+            raise ValueError(f"Maximum {max_count} images per message.")
         normalized_images: list[str] = []
         for image in v:
             normalized_image = (image or "").strip()

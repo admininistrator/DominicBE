@@ -612,7 +612,13 @@ def create_audit_log(
     detail_json: dict | None = None,
     result_code: int | None = None,
 ) -> AuditLog:
-    """Write an immutable audit log entry. Never raises – best-effort."""
+    """Write an immutable audit log entry and return it.
+
+    Raises on DB failure after rolling back the session – callers that want
+    best-effort (fire-and-forget) behaviour must catch exceptions themselves.
+    The ``_audit()`` helper in ``app/api/endpoints/knowledge.py`` provides
+    that best-effort wrapper for HTTP endpoint use.
+    """
     try:
         entry = AuditLog(
             actor_username=actor_username,

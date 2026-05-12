@@ -182,6 +182,13 @@ class Settings(BaseSettings):
         ge=0.1,
         le=20.0,
     )
+    llm_chat_image_max_count: int = Field(
+        default=5,
+        alias="LLM_CHAT_IMAGE_MAX_COUNT",
+        ge=1,
+        le=20,
+        description="Maximum number of images allowed per chat message.",
+    )
 
     # Image preprocessing (resize + OCR)
     llm_image_resize_enabled: bool = Field(default=True, alias="LLM_IMAGE_RESIZE_ENABLED")

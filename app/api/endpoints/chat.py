@@ -231,6 +231,7 @@ def send_message(
             usage=result["usage"],
             request_id=result.get("request_id"),
             sources=result.get("sources") or [],
+            assistant_meta=result.get("assistant_meta"),
             retrieval=result.get("retrieval"),
         )
     except PermissionError as e:
