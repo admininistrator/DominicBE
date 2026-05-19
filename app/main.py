@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
+import json
 import logging
 import sys
 from threading import Thread
@@ -38,6 +39,172 @@ from app.core.rate_limit import (
 from app.services.knowledge_service import recover_pending_ingestion_jobs
 from app.services.object_storage import check_object_storage_health
 from app.services.vector_store import check_vector_store_health
+
+
+def check_embedding_health() -> dict:
+    """Return embedding provider readiness without blocking local defaults.
+
+    - local provider: always OK (no external service required).
+    - ollama provider: performs a lightweight GET /api/tags probe.
+      Reports unavailable when Ollama is unreachable; never leaks document text.
+    """
+    provider = (settings.embedding_provider or "local").strip().lower()
+    model = settings.embedding_model or "local-hash-v1"
+    base_url = (settings.embedding_base_url or "http://localhost:11434").rstrip("/")
+
+    if provider == "local":
+        return {
+            "ok": True,
+            "provider": provider,
+            "model": model,
+            "detail": "local provider requires no external service",
+        }
+
+    if provider == "ollama":
+        tags_url = f"{base_url}/api/tags"
+        try:
+            import httpx
+
+            timeout = min(float(settings.embedding_timeout_seconds or 60.0), 10.0)
+            resp = httpx.get(tags_url, timeout=timeout)
+            if resp.is_success:
+                # Check whether the configured model is listed
+                data = resp.json()
+                models_raw = data.get("models") or []
+                available = [
+                    (entry.get("name") or entry.get("model") or "")
+                    for entry in models_raw
+                ]
+                model_found = any(model in name or name in model for name in available)
+                return {
+                    "ok": True,
+                    "provider": provider,
+                    "model": model,
+                    "base_url": base_url,
+                    "model_listed": model_found,
+                    "detail": "ollama reachable" + ("" if model_found else f"; model '{model}' not yet pulled"),
+                }
+            return {
+                "ok": False,
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "detail": f"ollama /api/tags returned HTTP {resp.status_code}",
+            }
+        except ImportError:
+            return {
+                "ok": False,
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "detail": "httpx not installed; cannot probe ollama",
+            }
+        except httpx.ConnectError as exc:
+            return {
+                "ok": False,
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "detail": f"ollama connection refused: {type(exc).__name__}",
+            }
+        except httpx.TimeoutException as exc:
+            return {
+                "ok": False,
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "detail": f"ollama timeout: {type(exc).__name__}",
+            }
+        except httpx.HTTPStatusError as exc:
+            return {
+                "ok": False,
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "detail": f"ollama HTTP error: {type(exc).__name__}",
+            }
+        except httpx.RequestError as exc:
+            return {
+                "ok": False,
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "detail": f"ollama request failed: {type(exc).__name__}",
+            }
+
+    if provider == "api":
+        # Lazy imports to avoid overhead for local/ollama paths
+        from app.services.embeddings.generic_api_provider import GenericAPIProvider
+
+        api_type = (settings.embedding_api_type or "").strip().lower()
+        api_key = settings.embedding_api_key or ""
+        timeout = min(float(settings.embedding_timeout_seconds or 60.0), 10.0)
+
+        # Parse custom headers from JSON string setting
+        custom_headers: dict = {}
+        raw_headers = (settings.embedding_api_headers or "").strip()
+        if raw_headers:
+            try:
+                custom_headers = json.loads(raw_headers)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        try:
+            provider_instance = GenericAPIProvider(
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                api_type=api_type,
+                timeout_seconds=timeout,
+                batch_size=1,
+                expected_dimensions=settings.embedding_dimensions or 0,
+                api_version=settings.embedding_api_version or "",
+                custom_headers=custom_headers,
+            )
+
+            started = perf_counter()
+            result = provider_instance.embed_texts(["health check probe"])
+            elapsed_ms = round((perf_counter() - started) * 1000, 2)
+
+            dims = len(result.vectors[0]) if result.vectors else 0
+
+            # NOTE: api_key intentionally excluded from response (even masked)
+            return {
+                "ok": True,
+                "provider": provider,
+                "model": model,
+                "api_type": api_type,
+                "dimensions": dims,
+                "latency_ms": elapsed_ms,
+            }
+        except Exception as exc:
+            # Sanitize error to strip any accidental API key leakage
+            detail = str(exc)
+            if api_key:
+                from app.services.embeddings.security import sanitize_error_message
+
+                detail = sanitize_error_message(detail, api_key)
+
+            category = getattr(exc, "category", "")
+            msg = (
+                f"api provider error: {category}"
+                if category
+                else f"api provider error: {type(exc).__name__}"
+            )
+            return {
+                "ok": False,
+                "provider": provider,
+                "model": model,
+                "api_type": api_type,
+                "detail": msg,
+            }
+
+    return {
+        "ok": False,
+        "provider": provider,
+        "model": model,
+        "detail": f"unknown EMBEDDING_PROVIDER={provider!r}",
+    }
 
 configure_logging(logging.INFO)
 logger = get_logger(__name__)
@@ -299,6 +466,7 @@ def health():
         "postgres": check_database_health(),
         "minio": check_object_storage_health(),
         "qdrant": check_vector_store_health(),
+        "embedding": check_embedding_health(),
     }
     payload = {
         "ok": all(check.get("ok") for check in checks.values()),
@@ -325,6 +493,11 @@ def health_minio():
 @app.get("/health/qdrant")
 def health_qdrant():
     return _health_response(check_vector_store_health())
+
+
+@app.get("/health/embedding")
+def health_embedding():
+    return _health_response(check_embedding_health())
 
 
 @app.get("/metrics", include_in_schema=False)

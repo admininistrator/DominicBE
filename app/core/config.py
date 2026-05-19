@@ -243,6 +243,20 @@ class Settings(BaseSettings):
     embedding_provider: str = Field(default="local", alias="EMBEDDING_PROVIDER")
     embedding_model: str = Field(default="local-hash-v1", alias="EMBEDDING_MODEL")
     embedding_dimensions: int = Field(default=64, alias="EMBEDDING_DIMENSIONS", ge=1)
+    embedding_base_url: str = Field(default="http://localhost:11434", alias="EMBEDDING_BASE_URL")
+    embedding_timeout_seconds: float = Field(default=60.0, alias="EMBEDDING_TIMEOUT_SECONDS", ge=1.0)
+    embedding_batch_size: int = Field(default=16, alias="EMBEDDING_BATCH_SIZE", ge=1, le=256)
+
+    # ── API embedding provider config (Phase 1: Multi-Provider API Embedding) ──
+    # Sensitive — never logged, never exposed in errors/health/diagnostics.
+    embedding_api_key: str = Field(default="", alias="EMBEDDING_API_KEY")
+    # API format type: 'openai', 'cohere', 'voyage', 'huggingface', or empty (defaults to openai).
+    embedding_api_type: str = Field(default="", alias="EMBEDDING_API_TYPE")
+    # Optional API version string (e.g. '2024-02-01' for Azure).
+    embedding_api_version: str = Field(default="", alias="EMBEDDING_API_VERSION")
+    # JSON string for custom HTTP headers (e.g. '{"X-Custom-Header": "value"}').
+    embedding_api_headers: str = Field(default="", alias="EMBEDDING_API_HEADERS")
+    ingestion_pipeline: str = Field(default="custom", alias="INGESTION_PIPELINE")
     vector_store_provider: str = Field(default="database", alias="VECTOR_STORE_PROVIDER")
     vector_store_url: str | None = Field(default=None, alias="VECTOR_STORE_URL")
     vector_store_api_key: str | None = Field(default=None, alias="VECTOR_STORE_API_KEY")

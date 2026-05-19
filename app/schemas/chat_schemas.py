@@ -222,6 +222,8 @@ class RetrievalMetadata(BaseModel):
     top_k: int
     returned: int
     retrieval_id: int | None = None
+    request_id: str | None = None
+    session_scope: str | None = None
     latency_ms: int | None = None
     document_id: int | None = None
     strategy: str | None = None

@@ -136,6 +136,28 @@ def main() -> None:
             assert chat_payload["sources"][0]["document_id"] == document_id
             assert "refund" in chat_payload["sources"][0]["snippet"].lower()
 
+            # P05-T02: Verify retrieval metadata completeness in chat response
+            retrieval = chat_payload["retrieval"]
+            assert retrieval["latency_ms"] >= 0
+            assert retrieval["top_k"] >= 1
+            assert retrieval["returned"] >= 1
+            assert retrieval["request_id"] is not None
+            # P06 (FINDING-R16): session_scope is required in retrieval metadata
+            assert "session_scope" in retrieval, "session_scope must be present in retrieval metadata"
+            assert retrieval["session_scope"] in ("session", "global", "all"), f"Unexpected session_scope: {retrieval['session_scope']}"
+            assert retrieval["original_query"] is not None
+            assert retrieval["rewritten_query"] is not None
+            assert retrieval["query_expansions"] is not None
+
+            # P05-T04: Verify source shape in chat response
+            source_0 = chat_payload["sources"][0]
+            assert "document_id" in source_0
+            assert "chunk_id" in source_0
+            assert "title" in source_0
+            assert source_0["source_type"] == "knowledge"
+            assert "source_uri" in source_0  # may be None for raw-text documents
+            assert source_0["rank"] == 1
+
             history_response = client.get(
                 api_path(f"/chat/sessions/{session_id}/messages"),
                 headers=headers,
@@ -153,6 +175,18 @@ def main() -> None:
             assert assistant_message["retrieval"]["packed_count"] >= 1
             assert len(assistant_message["sources"]) >= 1
             assert assistant_message["sources"][0]["title"] == "Product FAQ"
+
+            # P05-T04: Verify citations are persisted and loadable in history
+            assert len(assistant_message["sources"]) >= 1
+            # The persisted sources should have chunk_id and document_id
+            assert assistant_message["sources"][0].get("chunk_id") is not None
+            assert assistant_message["sources"][0].get("document_id") == document_id
+            # P05-T05: Retrieval metadata in history must include key fields
+            history_retrieval = assistant_message.get("retrieval") or {}
+            if history_retrieval.get("used"):
+                assert history_retrieval.get("returned", 0) >= 1
+                assert history_retrieval["strategy"] == "hybrid_rerank"
+                assert history_retrieval["answer_policy"] == "grounded"
 
             weak_chat_response = client.post(
                 api_path("/chat/"),

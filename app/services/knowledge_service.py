@@ -15,9 +15,15 @@ from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_knowledge
 from app.models.knowledge_models import KnowledgeDocument
 from app.services import object_storage, vector_store
+from app.services.embeddings.collection_naming import validate_collection_config
+from app.services.embeddings.factory import get_embedding_provider
 
 logger = get_logger(__name__)
 LOCAL_EMBEDDING_DIMENSIONS = settings.embedding_dimensions
+
+# Provider metadata version strings
+_CUSTOM_PARSER_VERSION = "custom-v1"
+_CUSTOM_CHUNKER_VERSION = "custom-sentence-v1"
 
 
 # ---------------------------------------------------------------------------
@@ -58,22 +64,26 @@ def resolve_embedding_model_name() -> str:
 
 
 def compute_text_embedding(text: str, *, dimensions: int = LOCAL_EMBEDDING_DIMENSIONS) -> list[float]:
-    normalized = normalize_text_for_ingestion(text).lower()
-    if not normalized:
+    """Compatibility shim – delegates to the provider factory (local provider by default).
+
+    Existing callers (retrieval_service fallback path, tests) continue to work
+    without modification.  New code should use get_embedding_provider() directly.
+
+    Empty or whitespace-only text returns a zero vector of the requested dimension,
+    matching the original compute_text_embedding() behavior.
+    """
+    if not (text or "").strip():
         return [0.0] * dimensions
 
-    vector = [0.0] * dimensions
-    for token in re.findall(r"\w+", normalized, flags=re.UNICODE):
-        token_hash = hashlib.sha256(token.encode("utf-8")).digest()
-        bucket = int.from_bytes(token_hash[:2], "big") % dimensions
-        sign = 1.0 if token_hash[2] % 2 == 0 else -1.0
-        weight = 1.0 + ((token_hash[3] % 5) * 0.1)
-        vector[bucket] += sign * weight
-
-    magnitude = sum(value * value for value in vector) ** 0.5
-    if magnitude == 0:
-        return [0.0] * dimensions
-    return [round(value / magnitude, 6) for value in vector]
+    provider = get_embedding_provider()
+    result = provider.embed_query(text)
+    vec = result.vector
+    # If the provider returns a different dimension than requested, fall back to
+    # the raw local-hash algorithm so the shim stays dimension-stable.
+    if len(vec) != dimensions:
+        from app.services.embeddings.local_hash_provider import _hash_embed
+        return _hash_embed(text, dimensions)
+    return vec
 
 
 def build_vector_id(document_id: int, chunk_index: int, checksum: str) -> str:
@@ -81,28 +91,62 @@ def build_vector_id(document_id: int, chunk_index: int, checksum: str) -> str:
 
 
 def prepare_chunks_for_indexing(document_id: int, checksum: str, chunks: list[dict]) -> list[dict]:
-    embedding_model = resolve_embedding_model_name()
-    prepared: list[dict] = []
+    """Embed chunks using the configured provider factory and attach provenance metadata.
 
-    for chunk in chunks:
-        content = chunk["content"]
-        embedding = compute_text_embedding(content)
-        metadata_json = {
+    P01-T06 / P01-T08: Uses provider factory so ingestion and retrieval share
+    the same embedding space.  Adds embedding_provider, embedding_model,
+    embedding_dimensions, embedding_version, parser_version, and chunker_version
+    to every chunk's metadata_json without requiring new database columns.
+    """
+    if not chunks:
+        return []
+
+    provider = get_embedding_provider()
+    provider_meta = provider.meta
+
+    texts = [chunk["content"] for chunk in chunks]
+    embed_result = provider.embed_texts(texts)
+
+    prepared: list[dict] = []
+    for chunk, vector in zip(chunks, embed_result.vectors):
+        # Use the actual per-batch meta (includes latency) when available
+        actual_meta = embed_result.meta
+
+        metadata_json: dict = {
             **(chunk.get("metadata_json") or {}),
+            # P01-T08: provider provenance fields
             "index_provider": settings.vector_store_provider,
-            "embedding_provider": settings.embedding_provider,
+            "embedding_provider": actual_meta.provider,
+            "embedding_model": actual_meta.model,
+            "embedding_dimensions": actual_meta.dimensions,
+            "embedding_version": actual_meta.version,
         }
+        # P03-T05: Preserve pipeline-supplied parser/chunker versions from
+        # IngestionChunk.to_dict().  Fall back to custom defaults for chunks
+        # that do not carry pipeline provenance (e.g. legacy or backfill paths).
+        metadata_json.setdefault("parser_version", _CUSTOM_PARSER_VERSION)
+        metadata_json.setdefault("chunker_version", _CUSTOM_CHUNKER_VERSION)
         if vector_store.should_store_embeddings_in_database():
-            metadata_json["embedding"] = embedding
+            metadata_json["embedding"] = vector
+
         prepared.append(
             {
                 **chunk,
-                "embedding": embedding,
-                "embedding_model": embedding_model,
+                "embedding": vector,
+                "embedding_model": actual_meta.model,
                 "vector_id": build_vector_id(document_id, chunk["chunk_index"], checksum),
                 "metadata_json": metadata_json,
             }
         )
+
+    logger.info(
+        "prepare_chunks_for_indexing: document_id=%d provider=%s model=%s dims=%d chunks=%d",
+        document_id,
+        provider_meta.provider,
+        embed_result.meta.model,
+        embed_result.meta.dimensions,
+        len(prepared),
+    )
 
     return prepared
 
@@ -517,9 +561,19 @@ def _is_numeric(value: str) -> bool:
 def _execute_indexing(db: Session, doc_id: int, job_id: int) -> dict:
     """Core chunk → embed → store logic. Updates job/document status.
 
+    P03-T05: Delegates chunk creation to the ingestion pipeline factory so
+    INGESTION_PIPELINE=custom (default) or INGESTION_PIPELINE=llamaindex can
+    be selected without changing endpoints or public service functions.
+
+    P03-T02: Validates collection naming convention before embedding to
+    warn about potential configuration mismatches. Does NOT block ingestion
+    on naming warnings — only dimension mismatch blocks.
+
     Raises on failure (caller is responsible for error-state updates).
     Returns result dict on success.
     """
+    from app.services.ingestion.factory import get_ingestion_pipeline
+
     doc = crud_knowledge.get_document(db, doc_id)
     if not doc:
         raise ValueError(f"Document {doc_id} not found.")
@@ -535,15 +589,39 @@ def _execute_indexing(db: Session, doc_id: int, job_id: int) -> dict:
     crud_knowledge.update_document_status(db, doc_id, "processing")
     crud_knowledge.update_ingestion_job_status(db, job_id, "processing")
 
-    chunks = chunk_text(normalized_text)
-    if not chunks:
+    # P03-T05: Use the pipeline factory instead of calling chunk_text() directly.
+    # Default pipeline (INGESTION_PIPELINE=custom) wraps chunk_text() and produces
+    # identical output.  LlamaIndex pipeline is selected when INGESTION_PIPELINE=llamaindex.
+    pipeline = get_ingestion_pipeline()
+    ingestion_chunks = pipeline.chunk_document(
+        normalized_text,
+        document_id=doc_id,
+        source_uri=doc.source_uri,
+        title=doc.title,
+    )
+    if not ingestion_chunks:
         raise ValueError("Document produced no chunks after splitting.")
 
+    # Convert IngestionChunk objects to the dict shape expected by
+    # prepare_chunks_for_indexing() and create_chunks_bulk().
+    chunks = [ic.to_dict() for ic in ingestion_chunks]
+
     logger.info(
-        "Indexing doc=%s job=%s: %d chunks (avg %d chars)",
-        doc_id, job_id, len(chunks),
+        "Indexing doc=%s job=%s pipeline=%s: %d chunks (avg %d chars)",
+        doc_id, job_id, pipeline.pipeline_name, len(chunks),
         sum(len(c["content"]) for c in chunks) // max(len(chunks), 1),
     )
+
+    # P03-T02: Validate collection naming convention before embedding.
+    # Logs warnings if collection doesn't match expected pattern.
+    # Does NOT block ingestion on naming warnings.
+    current_provider = (settings.embedding_provider or "local").strip().lower()
+    current_model = resolve_embedding_model_name()
+    collection_warnings = validate_collection_config(
+        current_provider, current_model, settings.vector_store_collection
+    )
+    for warning in collection_warnings:
+        logger.warning("Collection config: %s (doc_id=%s)", warning, doc_id)
 
     indexed_chunks = prepare_chunks_for_indexing(doc_id, checksum, chunks)
     vector_store.delete_document_chunks(doc.owner_username, doc.id)
@@ -552,8 +630,8 @@ def _execute_indexing(db: Session, doc_id: int, job_id: int) -> dict:
     vector_store.upsert_document_chunks(doc, chunk_rows, indexed_chunks)
 
     logger.info(
-        "Indexed doc=%s job=%s embedding_provider=%s model=%s vector_store=%s",
-        doc_id, job_id,
+        "Indexed doc=%s job=%s pipeline=%s embedding_provider=%s model=%s vector_store=%s",
+        doc_id, job_id, pipeline.pipeline_name,
         settings.embedding_provider, resolve_embedding_model_name(), settings.vector_store_provider,
     )
 
@@ -566,6 +644,7 @@ def _execute_indexing(db: Session, doc_id: int, job_id: int) -> dict:
         "status": "indexed",
         "chunks_count": len(chunk_rows),
         "checksum": checksum,
+        "pipeline": pipeline.pipeline_name,
     }
 
 
@@ -969,10 +1048,19 @@ def _prepare_existing_chunks_for_vector_backfill(chunk_rows: list) -> list[dict]
                 normalized_embedding = []
         if not normalized_embedding:
             normalized_embedding = compute_text_embedding(row.content)
+        # P06-T05 (FINDING-R14): propagate provider and pipeline metadata from existing row
+        backfill_meta: dict[str, object] = {}
+        if row.metadata_json:
+            row_meta = ensure_json_mapping(row.metadata_json)
+            for key in ("embedding_provider", "embedding_model", "embedding_dimensions",
+                        "embedding_version", "parser_version", "chunker_version"):
+                if key in row_meta:
+                    backfill_meta[key] = row_meta[key]
         prepared_chunks.append(
             {
                 "chunk_index": int(row.chunk_index),
                 "embedding": normalized_embedding,
+                "metadata_json": backfill_meta if backfill_meta else None,
             }
         )
     return prepared_chunks

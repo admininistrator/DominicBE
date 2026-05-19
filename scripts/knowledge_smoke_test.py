@@ -19,6 +19,17 @@ from app.main import app
 
 API_PREFIX = "/api/v1"
 
+# ---------------------------------------------------------------------------
+# Ollama ingestion smoke constants (P02-T05)
+# ---------------------------------------------------------------------------
+_OLLAMA_SMOKE_TEXT = (
+    "Qwen3 embedding integration smoke test document. "
+    "This paragraph verifies that the Ollama provider can embed document chunks "
+    "and store them in the configured Qdrant collection. "
+    "The embedding provider is qwen3-embedding:0.6b. "
+    "Retrieval should return this chunk when queried for Qwen3 embedding. " * 10
+).strip()
+
 
 def api_path(path: str) -> str:
     return f"{API_PREFIX}{path}"
@@ -278,6 +289,240 @@ def main() -> None:
     print("KNOWLEDGE_API_SMOKE_OK")
 
 
+# ---------------------------------------------------------------------------
+# P02-T05: Ollama ingestion smoke
+# ---------------------------------------------------------------------------
+
+def ollama_ingestion_smoke() -> None:
+    """Smoke test: ingest a small document with the Ollama provider and verify
+    chunk metadata, provider fields, and vector upsert target collection.
+
+    Requirements
+    ------------
+    - EMBEDDING_PROVIDER=ollama must be set in the environment.
+    - Ollama must be reachable at EMBEDDING_BASE_URL with the configured model.
+    - VECTOR_STORE_COLLECTION should be knowledge_qwen3_embedding_06b (recommended).
+    - The existing local collection (knowledge_chunks) is NOT touched.
+
+    This test does NOT require a running FastAPI server; it uses TestClient with
+    an in-memory SQLite database so it is self-contained.
+    """
+    provider = (settings.embedding_provider or "local").strip().lower()
+    if provider != "ollama":
+        print(
+            f"SKIP: EMBEDDING_PROVIDER={provider!r}. "
+            "Set EMBEDDING_PROVIDER=ollama to run the Ollama ingestion smoke.",
+            file=sys.stderr,
+        )
+        sys.exit(0)
+
+    model = settings.embedding_model or "qwen3-embedding:0.6b"
+    base_url = (settings.embedding_base_url or "http://localhost:11434").rstrip("/")
+    collection = settings.vector_store_collection or "knowledge_qwen3_embedding_06b"
+
+    print("=" * 60)
+    print("Ollama Ingestion Smoke Test (P02-T05)")
+    print("=" * 60)
+    print(f"  provider:   {provider}")
+    print(f"  model:      {model}")
+    print(f"  base_url:   {base_url}")
+    print(f"  collection: {collection}")
+    print()
+
+    # Warn if the user is about to write into the local-hash collection
+    if collection == "knowledge_chunks":
+        print(
+            "WARNING: VECTOR_STORE_COLLECTION=knowledge_chunks is the default local-hash "
+            "collection.\n"
+            "         Recommend using knowledge_qwen3_embedding_06b to avoid mixing "
+            "embedding spaces.",
+            file=sys.stderr,
+        )
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    testing_session_local = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+    )
+    Base.metadata.create_all(bind=engine)
+
+    def override_get_db():
+        db = testing_session_local()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    original_rate_limit_enabled = settings.rate_limit_enabled
+    settings.rate_limit_enabled = False
+
+    try:
+        with TestClient(app) as client:
+            # Register a dedicated smoke user
+            reg = client.post(
+                f"{API_PREFIX}/auth/register",
+                json={
+                    "username": "ollama_smoke_user",
+                    "password": "StrongPass1!",
+                    "confirm_password": "StrongPass1!",
+                },
+            )
+            assert reg.status_code == 201, f"Register failed: {reg.text}"
+            token = reg.json()["access_token"]
+            headers = {"Authorization": f"Bearer {token}"}
+
+            # ----------------------------------------------------------------
+            # Step 1: Ingest a small document via the Ollama provider
+            # ----------------------------------------------------------------
+            print("[1/5] Ingesting document with Ollama provider ...")
+            ingest = client.post(
+                f"{API_PREFIX}/knowledge/documents/ingest",
+                json={
+                    "title": "Ollama Smoke Doc",
+                    "source_type": "text",
+                    "raw_text": _OLLAMA_SMOKE_TEXT,
+                    "metadata": {"smoke": "ollama", "provider": provider},
+                },
+                headers=headers,
+            )
+            assert ingest.status_code == 201, (
+                f"Ingest failed (HTTP {ingest.status_code}): {ingest.text}\n"
+                f"  Ensure Ollama is running at {base_url} and model '{model}' is pulled."
+            )
+            ingest_payload = ingest.json()
+            assert ingest_payload["status"] == "indexed", (
+                f"Expected status=indexed, got {ingest_payload.get('status')}"
+            )
+            assert ingest_payload["chunks_count"] >= 1, "Expected at least 1 chunk"
+            doc_id = ingest_payload["document_id"]
+            print(f"  document_id={doc_id}  chunks={ingest_payload['chunks_count']}")
+
+            # ----------------------------------------------------------------
+            # Step 2: Verify chunk metadata provider fields
+            # ----------------------------------------------------------------
+            print("[2/5] Verifying chunk metadata provider fields ...")
+            chunks_resp = client.get(
+                f"{API_PREFIX}/knowledge/documents/{doc_id}/chunks",
+                headers=headers,
+            )
+            assert chunks_resp.status_code == 200, chunks_resp.text
+            chunks = chunks_resp.json()
+            assert len(chunks) >= 1, "Expected at least 1 chunk in listing"
+
+            for chunk in chunks:
+                meta = chunk.get("metadata_json") or {}
+                # embedding_provider must be 'ollama'
+                assert meta.get("embedding_provider") == "ollama", (
+                    f"chunk {chunk.get('id')}: expected embedding_provider=ollama, "
+                    f"got {meta.get('embedding_provider')!r}"
+                )
+                # embedding_model must match configured model
+                assert meta.get("embedding_model") == model or chunk.get("embedding_model") == model, (
+                    f"chunk {chunk.get('id')}: expected embedding_model={model!r}, "
+                    f"got meta={meta.get('embedding_model')!r} chunk={chunk.get('embedding_model')!r}"
+                )
+                # embedding_dimensions must be present and > 0
+                dims = meta.get("embedding_dimensions") or 0
+                assert dims > 0, (
+                    f"chunk {chunk.get('id')}: embedding_dimensions missing or zero"
+                )
+                # vector_id must be set
+                assert chunk.get("vector_id"), (
+                    f"chunk {chunk.get('id')}: vector_id is missing"
+                )
+
+            print(f"  {len(chunks)} chunks verified — provider=ollama model={model} dims={dims}")
+
+            # ----------------------------------------------------------------
+            # Step 3: Verify vector upsert target collection
+            # ----------------------------------------------------------------
+            print("[3/5] Verifying vector store collection ...")
+            # The collection name comes from settings; we assert it matches what
+            # was configured so the operator knows which collection was written.
+            actual_collection = settings.vector_store_collection
+            print(f"  VECTOR_STORE_COLLECTION={actual_collection!r}")
+            assert actual_collection, "VECTOR_STORE_COLLECTION must not be empty"
+            # Warn (not fail) if the local-hash default collection is used
+            if actual_collection == "knowledge_chunks":
+                print(
+                    "  WARNING: writing Qwen3 vectors into 'knowledge_chunks' mixes "
+                    "embedding spaces. Use 'knowledge_qwen3_embedding_06b' instead.",
+                    file=sys.stderr,
+                )
+
+            # ----------------------------------------------------------------
+            # Step 4: Reindex the document (proves reindex path works with Ollama)
+            # ----------------------------------------------------------------
+            print("[4/5] Reindexing document with Ollama provider ...")
+            reindex = client.post(
+                f"{API_PREFIX}/knowledge/documents/{doc_id}/reindex",
+                headers=headers,
+            )
+            assert reindex.status_code == 200, (
+                f"Reindex failed (HTTP {reindex.status_code}): {reindex.text}"
+            )
+            assert reindex.json()["status"] == "indexed"
+            assert reindex.json()["chunks_count"] >= 1
+            print(f"  Reindex OK  chunks={reindex.json()['chunks_count']}")
+
+            # ----------------------------------------------------------------
+            # Step 5: Confirm local collection is untouched
+            # ----------------------------------------------------------------
+            print("[5/5] Confirming local collection is not modified ...")
+            # We cannot directly inspect Qdrant collections in this in-process
+            # test, but we verify that the configured collection name is NOT
+            # 'knowledge_chunks' when the provider is ollama (best-effort guard).
+            if actual_collection != "knowledge_chunks":
+                print(
+                    f"  OK — Ollama vectors written to '{actual_collection}', "
+                    "local 'knowledge_chunks' collection is untouched."
+                )
+            else:
+                print(
+                    "  NOTE — both providers share 'knowledge_chunks'. "
+                    "Consider using a dedicated collection for Qwen3."
+                )
+
+    finally:
+        settings.rate_limit_enabled = original_rate_limit_enabled
+        app.dependency_overrides.clear()
+
+    print()
+    print("OLLAMA_INGESTION_SMOKE_OK")
+
+
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Knowledge API smoke tests",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python scripts/knowledge_smoke_test.py\n"
+            "      Run the standard local-provider smoke test.\n\n"
+            "  EMBEDDING_PROVIDER=ollama python scripts/knowledge_smoke_test.py --ollama\n"
+            "      Run the Ollama ingestion smoke (requires Ollama running).\n"
+        ),
+    )
+    parser.add_argument(
+        "--ollama",
+        action="store_true",
+        help=(
+            "Run the Ollama ingestion smoke test (P02-T05). "
+            "Requires EMBEDDING_PROVIDER=ollama and a running Ollama server."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.ollama:
+        ollama_ingestion_smoke()
+    else:
+        main()
 

@@ -437,6 +437,7 @@ def test_sync_chat_response_includes_assistant_meta(app_instance, monkeypatch):
     field that _finalize_chat_turn() already populated, causing a parity gap
     with the streaming final event.
     """
+    monkeypatch.setattr(main_module.settings, "rate_limit_enabled", False)
 
     def fake_handle_chat(*args, **kwargs):
         return {

@@ -1,44 +1,82 @@
 [
   {
-    "id": "grounded_scoped_refund",
-    "document_title": "Refund FAQ",
-    "document_text": "Refund policy requests are reviewed within 5 business days. Customers must submit evidence through the support portal.",
-    "message": "Chính sách hoàn tiền xử lý trong bao lâu?",
-    "use_scope": true,
-    "expected_answer_policy": "grounded",
-    "expected_sources_min": 1,
-    "expected_reply_contains": "5 ngày"
+    "id": "eval-001",
+    "query": "What is the refund policy for damaged products?",
+    "context": "If a product arrives damaged, customers may return it within 30 days of delivery for a full refund. The refund will be processed to the original payment method within 5-7 business days after the returned item is received and inspected. Please contact customer support to initiate the return process.",
+    "expected_document_id": null,
+    "tags": ["refund", "policy", "damaged"],
+    "difficulty": "easy"
   },
   {
-    "id": "insufficient_scoped_unrelated",
-    "document_title": "Refund FAQ",
-    "document_text": "Refund policy requests are reviewed within 5 business days. Customers must submit evidence through the support portal.",
-    "message": "Bảo hành thiết bị trong bao lâu?",
-    "use_scope": true,
-    "expected_answer_policy": "insufficient_evidence",
-    "expected_sources_min": 0,
-    "expected_reply_contains": "chưa có đủ bằng chứng"
+    "id": "eval-002",
+    "query": "How long does password reset take?",
+    "context": "To reset your password, click the 'Forgot Password' link on the login page. An email with reset instructions will be sent to your registered email address within 1 minute. The reset link expires after 24 hours. If you don't receive the email, check your spam folder or contact support for assistance.",
+    "expected_document_id": null,
+    "tags": ["password", "reset", "account"],
+    "difficulty": "easy"
   },
   {
-    "id": "cautious_unscoped_partial",
-    "document_title": "General FAQ",
-    "document_text": "Refund portal workflow is available for evidence uploads.",
-    "message": "Quy trình hoàn tiền như thế nào?",
-    "use_scope": false,
-    "expected_answer_policy": "cautious_general",
-    "expected_sources_min": 0,
-    "expected_reply_contains": "chưa thể khẳng định chắc chắn"
+    "id": "eval-003",
+    "query": "Can I change my subscription plan before the billing date?",
+    "context": "Subscription plan changes take effect immediately upon confirmation. If you upgrade your plan, the new features are available right away and you will be charged a prorated amount for the remainder of the current billing cycle. If you downgrade your plan, the new pricing will apply starting from the next billing cycle.",
+    "expected_document_id": null,
+    "tags": ["subscription", "plan", "billing", "upgrade", "downgrade"],
+    "difficulty": "medium"
   },
   {
-    "id": "insufficient_unscoped_none",
-    "document_title": "General FAQ",
-    "document_text": "Users can update profile settings and change passwords in the account page.",
-    "message": "Chính sách hoàn tiền xử lý trong bao lâu?",
-    "use_scope": false,
-    "expected_answer_policy": "insufficient_evidence",
-    "expected_sources_min": 0,
-    "expected_reply_contains": "chưa có đủ bằng chứng"
+    "id": "eval-004",
+    "query": "What documents are needed for identity verification?",
+    "context": "To verify your identity, please upload a clear photo of a government-issued ID such as a passport, driver's license, or national identity card. The name on the ID must match the name on your account. Verification typically takes 24-48 hours. You will receive a notification once your identity has been verified.",
+    "expected_document_id": null,
+    "tags": ["verification", "identity", "documents", "KYC"],
+    "difficulty": "easy"
+  },
+  {
+    "id": "eval-005",
+    "query": "How do I cancel my account and delete my data?",
+    "context": "Account cancellation can be initiated from the Settings page under Account Management. Once you confirm cancellation, your account will be deactivated immediately. Your personal data will be retained for 30 days in case you change your mind, after which it will be permanently deleted. To request immediate data deletion, please contact our privacy team at privacy@example.com.",
+    "expected_document_id": null,
+    "tags": ["account", "cancellation", "deletion", "privacy", "GDPR"],
+    "difficulty": "medium"
+  },
+  {
+    "id": "eval-006",
+    "query": "Do you ship internationally and what are the shipping costs?",
+    "context": "We ship to over 50 countries worldwide. International shipping costs vary by destination and are calculated at checkout based on package weight and delivery speed. Standard international shipping takes 7-14 business days and starts at $15 USD. Express shipping takes 3-5 business days and starts at $35 USD. Customs duties and taxes are the responsibility of the buyer.",
+    "expected_document_id": null,
+    "tags": ["shipping", "international", "costs", "delivery"],
+    "difficulty": "easy"
+  },
+  {
+    "id": "eval-007",
+    "query": "What happens if my package is lost during delivery?",
+    "context": "If your package is marked as delivered but you haven't received it, first check with neighbors and your local delivery office. If the package is confirmed lost, contact our support team within 7 days of the delivery date. We will initiate an investigation with the carrier. If the package cannot be located, we will either resend the items at no cost or issue a full refund.",
+    "expected_document_id": null,
+    "tags": ["shipping", "lost", "package", "refund"],
+    "difficulty": "medium"
+  },
+  {
+    "id": "eval-008",
+    "query": "How do I update my payment method on file?",
+    "context": "To update your payment method, go to Settings > Billing > Payment Methods. You can add a new credit or debit card, update the expiration date, or change your preferred payment method. For security reasons, we cannot display the full card number on file — only the last four digits are shown. Changes to your payment method will be used for future transactions immediately.",
+    "expected_document_id": null,
+    "tags": ["payment", "billing", "card", "update"],
+    "difficulty": "easy"
+  },
+  {
+    "id": "eval-009",
+    "query": "Is there a loyalty or rewards program for frequent customers?",
+    "context": "Yes, our loyalty program awards 1 point for every dollar spent. Members earn Silver status at 500 points, Gold at 2,000 points, and Platinum at 5,000 points in a calendar year. Higher tiers unlock exclusive benefits including free shipping, priority support, early access to sales, and bonus points on purchases. Points expire 12 months after they are earned.",
+    "expected_document_id": null,
+    "tags": ["loyalty", "rewards", "points", "program"],
+    "difficulty": "easy"
+  },
+  {
+    "id": "eval-010",
+    "query": "What warranty coverage applies to electronic products?",
+    "context": "All electronic products come with a standard 1-year manufacturer's warranty covering defects in materials and workmanship. The warranty does not cover damage from accidents, unauthorized modifications, normal wear and tear, or liquid exposure. Extended warranty plans are available for purchase within 30 days of the original product purchase and add up to 2 additional years of coverage.",
+    "expected_document_id": null,
+    "tags": ["warranty", "electronics", "coverage", "extended"],
+    "difficulty": "medium"
   }
 ]
-
-

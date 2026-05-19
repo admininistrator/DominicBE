@@ -29,4 +29,6 @@ boto3>=1.35.0
 qdrant-client>=1.13,<1.15
 prometheus-client>=0.20,<0.22
 pytest>=8.3,<9
+# Phase 3: LlamaIndex ingestion adapter (chunking only — no LLM, no vector-store integration)
+llama-index-core>=0.10,<0.13
 

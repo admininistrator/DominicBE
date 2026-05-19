@@ -14,8 +14,9 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_knowledge
-from app.services.knowledge_service import compute_text_embedding
 from app.services import vector_store
+from app.services.embeddings.factory import get_embedding_provider
+from app.services.knowledge_service import compute_text_embedding
 
 
 logger = get_logger(__name__)
@@ -84,6 +85,25 @@ def _extract_embedding(metadata_json: Any, fallback_text: str) -> list[float]:
         except (TypeError, ValueError):
             pass
     return compute_text_embedding(fallback_text)
+
+
+# P05-T01: mixed-space safeguard — detect incompatible provider provenance
+def _is_embedding_compatible(chunk_meta: Any, query_provider: str, query_model: str) -> bool:
+    """Return False if the chunk was embedded by a different provider / model.
+
+    When True, semantic cosine comparison is safe.  When False, the caller
+    should skip semantic scoring and rely on lexical fallback only to avoid
+    comparing vectors from incompatible embedding spaces.
+    """
+    meta = ensure_json_mapping(chunk_meta)
+    stored_provider = (meta.get("embedding_provider") or "").strip().lower()
+    stored_model = (meta.get("embedding_model") or "").strip().lower()
+    if not stored_provider:
+        # Legacy chunk with no provider metadata — assume compatible.
+        return True
+    if stored_provider == query_provider.lower() and stored_model == query_model.lower():
+        return True
+    return False
 
 
 def _build_snippet(content: str, *, max_chars: int = 220) -> str:
@@ -210,7 +230,12 @@ def search_knowledge(
     effective_top_k = top_k or settings.retrieval_top_k
     started_at = time.perf_counter()
     rewritten_query, query_expansions = _expand_query(normalized_query)
-    query_embedding = compute_text_embedding(rewritten_query)
+
+    # P01-T07: use provider factory so query and document embeddings share the same space
+    _embed_provider = get_embedding_provider()
+    _query_embed_result = _embed_provider.embed_query(rewritten_query)
+    query_embedding = _query_embed_result.vector
+    _embed_meta = _query_embed_result.meta
 
     session_scope = "all"
     if document_id is None and session_id is not None:
@@ -265,17 +290,29 @@ def search_knowledge(
             indexed_only=True,
         )
 
+    _mixed_space_skip_count = 0
     scored_results: list[dict] = []
+    # P05-T01: capture current provider identity for mixed-space check
+    _query_identity = (_embed_meta.provider, _embed_meta.model)
     for chunk, document in candidates:
+        # P06 (FINDING-R15): cache parsed chunk_meta to avoid double ensure_json_mapping
+        chunk_meta = ensure_json_mapping(chunk.metadata_json)
         if semantic_scores_by_chunk_id:
             semantic_score = semantic_scores_by_chunk_id.get(int(chunk.id), 0.0)
         else:
-            chunk_embedding = _extract_embedding(chunk.metadata_json, chunk.content)
-            semantic_score = round(max(0.0, _cosine_similarity(query_embedding, chunk_embedding)), 6)
+            # P05-T01: skip cross-space cosine comparison when provider metadata differs
+            if _is_embedding_compatible(chunk_meta, _query_identity[0], _query_identity[1]):
+                chunk_embedding = _extract_embedding(chunk.metadata_json, chunk.content)
+                semantic_score = round(max(0.0, _cosine_similarity(query_embedding, chunk_embedding)), 6)
+            else:
+                # Incompatible embedding space — rely on lexical scoring only
+                semantic_score = 0.0
+                _mixed_space_skip_count += 1
         lexical_score = _lexical_overlap_score(rewritten_query, chunk.content)
         score = _hybrid_score(semantic_score, lexical_score)
         if score < settings.retrieval_min_score and lexical_score < settings.retrieval_min_lexical_score:
             continue
+        # P05-T01: extract chunk embedding provider for provenance (chunk_meta already cached)
         scored_results.append(
             {
                 "document_id": document.id,
@@ -292,6 +329,7 @@ def search_knowledge(
                 "content": chunk.content,
                 "vector_id": chunk.vector_id,
                 "embedding_model": chunk.embedding_model,
+                "embedding_provider": chunk_meta.get("embedding_provider", _embed_meta.provider),
             }
         )
 
@@ -316,6 +354,7 @@ def search_knowledge(
     if not results and document_id is not None and fallback_candidates_source:
         fallback_candidates: list[dict] = []
         for chunk, document in fallback_candidates_source:
+            chunk_meta = ensure_json_mapping(chunk.metadata_json)
             fallback_candidates.append(
                 {
                     "document_id": document.id,
@@ -333,6 +372,7 @@ def search_knowledge(
                     "content": chunk.content,
                     "vector_id": chunk.vector_id,
                     "embedding_model": chunk.embedding_model,
+                    "embedding_provider": chunk_meta.get("embedding_provider", _embed_meta.provider),
                 }
             )
         fallback_candidates.sort(key=lambda item: (item["document_id"], item["chunk_index"]))
@@ -372,9 +412,18 @@ def search_knowledge(
             "fallback_used": fallback_used,
             "fallback_reason": fallback_reason,
             "evidence_strength": evidence_strength,
-            "embedding_provider": settings.embedding_provider,
+            # P01-T07: provider metadata from factory (additive, no schema change)
+            "embedding_provider": _embed_meta.provider,
+            "embedding_model": _embed_meta.model,
+            "embedding_dimensions": _embed_meta.dimensions,
+            "embedding_version": _embed_meta.version,
             "vector_store_provider": settings.vector_store_provider,
+            "vector_store_collection": settings.vector_store_collection,
             "session_scope": session_scope,
+            # P05-T01: api_type from provider metadata (extra dict from generic api provider)
+            "api_type": _embed_meta.extra.get("api_type", ""),
+            # P05-T01: mixed-space safeguard tracking
+            "mixed_space_skip_count": _mixed_space_skip_count,
         },
     )
 
@@ -383,6 +432,7 @@ def search_knowledge(
         "top_k": effective_top_k,
         "returned": len(results),
         "retrieval_id": retrieval_event.id,
+        "request_id": request_id,
         "latency_ms": latency_ms,
         "candidate_count": len(candidates),
         "document_id": document_id,

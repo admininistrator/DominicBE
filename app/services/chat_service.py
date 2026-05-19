@@ -994,6 +994,8 @@ def _build_retrieval_payload(retrieval_result: dict | None) -> dict | None:
         "top_k": int(retrieval_result.get("top_k") or 0),
         "returned": int(retrieval_result.get("returned") or 0),
         "retrieval_id": retrieval_result.get("retrieval_id"),
+        "request_id": retrieval_result.get("request_id"),
+        "session_scope": retrieval_result.get("session_scope"),
         "latency_ms": int(retrieval_result.get("latency_ms") or 0),
         "document_id": retrieval_result.get("document_id"),
         "strategy": retrieval_result.get("strategy"),
