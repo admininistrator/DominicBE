@@ -1,0 +1,179 @@
+{
+  "_config": {
+    "retrieval_hybrid_semantic_weight": 0.4,
+    "retrieval_hybrid_lexical_weight": 0.6,
+    "retrieval_low_confidence_score": 0.2,
+    "retrieval_max_rerank_candidates": 12,
+    "retrieval_rerank_title_weight": 0.15,
+    "retrieval_rerank_position_weight": 0.1
+  },
+  "cosine_similarity": {
+    "identical_vectors": 1.0,
+    "reversed_vectors": 0.6363636363636364,
+    "orthogonal_ish": 0.13483997249264842,
+    "empty_left": 0.0,
+    "empty_right": 0.0,
+    "zero_vector_left": 0.0,
+    "dimension_mismatch": 0.0
+  },
+  "lexical_overlap_score": {
+    "identical_tokens": 1.0,
+    "partial_overlap": 0.666667,
+    "no_overlap": 0.0,
+    "empty_query": 0.0,
+    "empty_content": 0.0,
+    "unicode_vietnamese": 0.519338
+  },
+  "hybrid_score": {
+    "full_semantic_full_lexical": 1.0,
+    "full_semantic_no_lexical": 0.4,
+    "no_semantic_full_lexical": 0.6,
+    "half_and_half": 0.5,
+    "both_zero": 0.0
+  },
+  "query_expansion": {
+    "no_match": [
+      "hello world",
+      []
+    ],
+    "vietnamese_match": [
+      "hoan tien policy refund refund policy money back",
+      [
+        "refund",
+        "refund policy",
+        "money back"
+      ]
+    ],
+    "multi_rule": [
+      "chinh sach va hoan tien refund refund policy money back policy",
+      [
+        "refund",
+        "refund policy",
+        "money back",
+        "policy"
+      ]
+    ]
+  },
+  "normalize_for_search": {
+    "basic": "hello world",
+    "accents": "xin chao the gioi",
+    "punctuation": "hello world test"
+  },
+  "tokenize": {
+    "basic": [
+      "hello",
+      "world"
+    ],
+    "vietnamese": [
+      "chao",
+      "gioi",
+      "the",
+      "xin"
+    ],
+    "empty": []
+  },
+  "build_snippet": {
+    "short_text": "Hello world",
+    "exact_220": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "long_500": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...",
+    "whitespace_collapse": "hello world test"
+  },
+  "estimate_token_count": {
+    "empty": 0,
+    "short": 2,
+    "explicit_42": 42,
+    "explicit_zero": 2
+  },
+  "classify_evidence_strength": {
+    "empty_results": "none",
+    "fallback_used": "fallback",
+    "high_score_grounded": "grounded",
+    "low_score_weak": "weak",
+    "score_zero": "weak"
+  },
+  "dedupe_scored_results": {
+    "no_duplicates": [
+      {
+        "document_id": 1,
+        "content": "hello world"
+      },
+      {
+        "document_id": 2,
+        "content": "foo bar"
+      }
+    ],
+    "with_duplicates": [
+      {
+        "document_id": 1,
+        "content": "hello world"
+      },
+      {
+        "document_id": 2,
+        "content": "foo bar"
+      }
+    ],
+    "empty_input": []
+  },
+  "rerank_results": {
+    "basic": [
+      {
+        "score": 0.5,
+        "title": "hello world",
+        "chunk_index": 0,
+        "document_id": 1,
+        "content": "some content",
+        "rerank_score": 0.739017,
+        "token_estimate": 3
+      },
+      {
+        "score": 0.3,
+        "title": "foo bar",
+        "chunk_index": 2,
+        "document_id": 1,
+        "content": "other content",
+        "rerank_score": 0.39,
+        "token_estimate": 3
+      }
+    ],
+    "title_overlap": [
+      {
+        "score": 0.1,
+        "title": "exact title match",
+        "chunk_index": 0,
+        "document_id": 1,
+        "content": "content a",
+        "rerank_score": 0.35,
+        "token_estimate": 2
+      },
+      {
+        "score": 0.1,
+        "title": "unrelated title",
+        "chunk_index": 1,
+        "document_id": 1,
+        "content": "content b",
+        "rerank_score": 0.247809,
+        "token_estimate": 2
+      }
+    ],
+    "position_decay": [
+      {
+        "score": 0.2,
+        "title": "",
+        "chunk_index": 0,
+        "document_id": 1,
+        "content": "content a",
+        "rerank_score": 0.3,
+        "token_estimate": 2
+      },
+      {
+        "score": 0.2,
+        "title": "",
+        "chunk_index": 10,
+        "document_id": 1,
+        "content": "content b",
+        "rerank_score": 0.25,
+        "token_estimate": 2
+      }
+    ]
+  }
+}

@@ -1,9 +1,10 @@
 """Embedding provider package.
 
 Exports the public surface used by knowledge_service and retrieval_service.
+All types are re-exported from ``rag_core.embeddings`` for backward compatibility.
 No side effects on import.
 """
-from app.services.embeddings.base import (
+from rag_core.embeddings import (  # noqa: F401
     EmbeddingDimensionMismatchError,
     EmbeddingMeta,
     EmbeddingProvider,
@@ -12,7 +13,7 @@ from app.services.embeddings.base import (
     EmbedResult,
     QueryEmbedResult,
 )
-from app.services.embeddings.factory import get_embedding_provider
+from app.services.embeddings.factory import get_embedding_provider  # noqa: F401
 
 __all__ = [
     "EmbeddingDimensionMismatchError",

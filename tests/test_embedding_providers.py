@@ -133,11 +133,18 @@ class TestLocalHashProvider(unittest.TestCase):
 
     def test_backward_compat_with_compute_text_embedding(self):
         """LocalHashProvider must produce the same output as the original compute_text_embedding."""
-        from app.services.embeddings.local_hash_provider import _hash_embed
+        from app.services.embeddings.local_hash_provider import LocalHashProvider, _hash_embed
         from app.services.knowledge_service import compute_text_embedding
 
         text = "backward compatibility check"
-        original = compute_text_embedding(text, dimensions=64)
+        local_provider = LocalHashProvider(model="local-hash-v1", dimensions=64)
+        # Patch both the factory used by knowledge_service and the module-level
+        # LOCAL_EMBEDDING_DIMENSIONS so compute_text_embedding uses local provider
+        # regardless of what the .env configures (which may point to an external API).
+        with patch("app.services.knowledge_service.get_embedding_provider",
+                   return_value=local_provider), \
+             patch("app.services.knowledge_service.LOCAL_EMBEDDING_DIMENSIONS", 64):
+            original = compute_text_embedding(text, dimensions=64)
         provider_vec = _hash_embed(text, 64)
         self.assertEqual(original, provider_vec)
 
@@ -443,26 +450,47 @@ class TestDefaultRetrievalPath(unittest.TestCase):
     """Ensure the default local provider path in retrieval_service is unchanged."""
 
     def test_compute_text_embedding_shim_returns_correct_dimension(self):
-        """compute_text_embedding shim must return 64-dim vector by default."""
+        """compute_text_embedding shim must return 64-dim vector when called with dimensions=64."""
+        from app.services.embeddings.local_hash_provider import LocalHashProvider
         from app.services.knowledge_service import compute_text_embedding
 
-        with patch("app.services.embeddings.factory.settings", _make_settings_override()):
-            vec = compute_text_embedding("test query")
+        local_provider = LocalHashProvider(model="local-hash-v1", dimensions=64)
+        # Patch knowledge_service.get_embedding_provider so compute_text_embedding
+        # uses the local provider regardless of .env EMBEDDING_PROVIDER=api setting.
+        # Pass dimensions=64 explicitly: the module-level LOCAL_EMBEDDING_DIMENSIONS
+        # default is baked at import time from settings (= 2048 in .env), so we must
+        # supply the dimension explicitly to keep the test environment-independent.
+        with patch("app.services.knowledge_service.get_embedding_provider",
+                   return_value=local_provider), \
+             patch("app.services.embeddings.factory.settings", _make_settings_override()):
+            vec = compute_text_embedding("test query", dimensions=64)
         self.assertEqual(len(vec), 64)
 
     def test_compute_text_embedding_shim_deterministic(self):
+        from app.services.embeddings.local_hash_provider import LocalHashProvider
         from app.services.knowledge_service import compute_text_embedding
 
-        with patch("app.services.embeddings.factory.settings", _make_settings_override()):
-            v1 = compute_text_embedding("same text")
-            v2 = compute_text_embedding("same text")
+        local_provider = LocalHashProvider(model="local-hash-v1", dimensions=64)
+        with patch("app.services.knowledge_service.get_embedding_provider",
+                   return_value=local_provider), \
+             patch("app.services.embeddings.factory.settings", _make_settings_override()):
+            v1 = compute_text_embedding("same text", dimensions=64)
+            v2 = compute_text_embedding("same text", dimensions=64)
         self.assertEqual(v1, v2)
 
     def test_compute_text_embedding_shim_empty_text(self):
+        from app.services.embeddings.local_hash_provider import LocalHashProvider
         from app.services.knowledge_service import compute_text_embedding
 
-        with patch("app.services.embeddings.factory.settings", _make_settings_override()):
-            vec = compute_text_embedding("")
+        local_provider = LocalHashProvider(model="local-hash-v1", dimensions=64)
+        # Pass dimensions=64 explicitly: LOCAL_EMBEDDING_DIMENSIONS is baked at module
+        # import time from settings.embedding_dimensions (= 2048 in .env). The
+        # empty-text fast-path returns [0.0] * dimensions, so we must pass it explicitly
+        # to keep the test environment-independent.
+        with patch("app.services.knowledge_service.get_embedding_provider",
+                   return_value=local_provider), \
+             patch("app.services.embeddings.factory.settings", _make_settings_override()):
+            vec = compute_text_embedding("", dimensions=64)
         self.assertEqual(len(vec), 64)
 
     def test_prepare_chunks_uses_provider_factory(self):

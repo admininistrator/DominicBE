@@ -1,4 +1,8 @@
-"""Knowledge ingestion service – chunking, indexing skeleton for RAG."""
+"""Knowledge ingestion service – chunking, indexing skeleton for RAG.
+
+This module delegates pure RAG operations to ``rag_core`` and retains only
+DB orchestration, object storage, and config wiring.
+"""
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -17,6 +21,10 @@ from app.models.knowledge_models import KnowledgeDocument
 from app.services import object_storage, vector_store
 from app.services.embeddings.collection_naming import validate_collection_config
 from app.services.embeddings.factory import get_embedding_provider
+
+# rag-core imports for delegated pure-RAG logic
+from rag_core.parsing import normalize_text_for_ingestion as _rag_normalize_text
+from rag_core.chunking import chunk_text as _rag_chunk_text
 
 logger = get_logger(__name__)
 LOCAL_EMBEDDING_DIMENSIONS = settings.embedding_dimensions
@@ -45,17 +53,11 @@ def _caption_image(image_bytes: bytes, media_type: str = "image/jpeg", context_h
 
 
 def normalize_text_for_ingestion(text: str) -> str:
-    """Normalize whitespace while preserving readable paragraph boundaries."""
-    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not raw:
-        return ""
+    """Normalize whitespace while preserving readable paragraph boundaries.
 
-    paragraphs = []
-    for block in re.split(r"\n\s*\n+", raw):
-        normalized = re.sub(r"[ \t]+", " ", block).strip()
-        if normalized:
-            paragraphs.append(normalized)
-    return "\n\n".join(paragraphs)
+    Delegates to ``rag_core.parsing.normalize_text_for_ingestion``.
+    """
+    return _rag_normalize_text(text)
 
 
 def resolve_embedding_model_name() -> str:
@@ -152,7 +154,7 @@ def prepare_chunks_for_indexing(document_id: int, checksum: str, chunks: list[di
 
 
 # ---------------------------------------------------------------------------
-# Text chunking (real implementation)
+# Text chunking (delegated to rag-core)
 # ---------------------------------------------------------------------------
 
 def chunk_text(
@@ -162,91 +164,12 @@ def chunk_text(
 ) -> list[dict]:
     """Split text into overlapping chunks.
 
+    Delegates to ``rag_core.chunking.chunk_text``.
     Returns list of {chunk_index, content, token_count (estimated)}.
-    Uses sentence-boundary-aware splitting when possible.
     """
     size = chunk_size or settings.chunk_size
     overlap = chunk_overlap or settings.chunk_overlap
-
-    normalized_text = normalize_text_for_ingestion(text)
-    if not normalized_text:
-        return []
-
-    # Split into sentences first for cleaner boundaries
-    sentences = _split_sentences(normalized_text)
-    chunks: list[dict] = []
-    current_chunk: list[str] = []
-    current_len = 0
-    idx = 0
-
-    expanded_sentences: list[str] = []
-    for sentence in sentences:
-        expanded_sentences.extend(_split_large_sentence(sentence, size=size, overlap=overlap))
-
-    for sentence in expanded_sentences:
-        s_len = len(sentence)
-        if current_len + s_len > size and current_chunk:
-            chunk_text_str = " ".join(current_chunk).strip()
-            if chunk_text_str:
-                chunks.append({
-                    "chunk_index": idx,
-                    "content": chunk_text_str,
-                    "token_count": max(1, len(chunk_text_str) // 4),
-                    "metadata_json": {"char_count": len(chunk_text_str)},
-                })
-                idx += 1
-
-            # Keep overlap: walk back from end
-            overlap_chunks: list[str] = []
-            overlap_len = 0
-            for s in reversed(current_chunk):
-                if overlap_len + len(s) > overlap:
-                    break
-                overlap_chunks.insert(0, s)
-                overlap_len += len(s)
-            current_chunk = overlap_chunks
-            current_len = overlap_len
-
-        current_chunk.append(sentence)
-        current_len += s_len
-
-    # Last chunk
-    if current_chunk:
-        chunk_text_str = " ".join(current_chunk).strip()
-        if chunk_text_str:
-            chunks.append({
-                "chunk_index": idx,
-                "content": chunk_text_str,
-                "token_count": max(1, len(chunk_text_str) // 4),
-                "metadata_json": {"char_count": len(chunk_text_str)},
-            })
-
-    return chunks
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Naive sentence splitter: split on '. ', '! ', '? ', newlines."""
-    # Split on sentence-ending punctuation followed by space or newline
-    parts = re.split(r'(?<=[.!?])\s+|\n+', text)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _split_large_sentence(sentence: str, size: int, overlap: int) -> list[str]:
-    if len(sentence) <= size:
-        return [sentence]
-
-    parts: list[str] = []
-    start = 0
-    step = max(1, size - overlap)
-    while start < len(sentence):
-        end = min(len(sentence), start + size)
-        piece = sentence[start:end].strip()
-        if piece:
-            parts.append(piece)
-        if end >= len(sentence):
-            break
-        start += step
-    return parts or [sentence]
+    return _rag_chunk_text(text, chunk_size=size, chunk_overlap=overlap)
 
 
 # ---------------------------------------------------------------------------

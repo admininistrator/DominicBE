@@ -5,7 +5,7 @@ Usage:
     from app.services.ingestion import IngestionPipelineError
     from app.services.ingestion.factory import get_ingestion_pipeline
 """
-from app.services.ingestion.base import (
+from app.services.ingestion.base import (  # noqa: F401
     IngestionChunk,
     IngestionPipeline,
     IngestionPipelineError,

@@ -2,7 +2,7 @@
 
 Coverage:
 - GenericAPIProvider happy path with mocked httpx (OpenAI format).
-- Adapter parsing for each format (OpenAI, Cohere, Voyage, HuggingFace, Ollama).
+- Adapter parsing for each format (OpenAI, NVIDIA, Cohere, Voyage, HuggingFace, Ollama).
 - Factory returns GenericAPIProvider for ``provider="api"``.
 - Factory still returns LocalHashProvider for ``provider="local"`` (backward compat).
 - Factory still returns OllamaProvider for ``provider="ollama"`` (backward compat).
@@ -12,6 +12,8 @@ Coverage:
 - Batch splitting preserves order.
 - Dimension validation.
 - No raw text in error messages.
+- Explicit NVIDIA api_type mapping (no fallback warning).
+- Unknown api_type raises ValueError instead of silent fallback.
 
 Run with:
     cd DominicBE
@@ -147,6 +149,56 @@ class TestGenericAPIProviderHappyPath(unittest.TestCase):
 
         self.assertEqual(result.vector, [0.8, 0.9, 1.0])
         self.assertEqual(result.meta.provider, "api")
+
+    def test_nvidia_indexing_embed_texts_sends_passage_input_type(self):
+        """NVIDIA document chunk embeddings include input_type=passage."""
+        provider = self._make_provider(
+            model="nvidia/llama-nemotron-embed-1b-v2",
+            base_url="https://integrate.api.nvidia.com",
+            api_type="nvidia",
+        )
+        fake_vec = [0.1, 0.2, 0.3]
+        mock_resp = _mock_httpx_response(_openai_response([fake_vec, fake_vec]))
+
+        with patch("httpx.post", return_value=mock_resp) as mock_post:
+            result = provider.embed_texts(["doc chunk one", "doc chunk two"])
+
+        self.assertEqual(len(result.vectors), 2)
+        request_body = mock_post.call_args.kwargs["json"]
+        self.assertEqual(request_body["input_type"], "passage")
+        self.assertEqual(request_body["model"], "nvidia/llama-nemotron-embed-1b-v2")
+        self.assertEqual(request_body["input"], ["doc chunk one", "doc chunk two"])
+
+    def test_nvidia_retrieval_embed_query_sends_query_input_type(self):
+        """NVIDIA query embeddings include input_type=query."""
+        provider = self._make_provider(
+            model="nvidia/llama-nemotron-embed-1b-v2",
+            base_url="https://integrate.api.nvidia.com",
+            api_type="nvidia",
+        )
+        fake_vec = [0.8, 0.9, 1.0]
+        mock_resp = _mock_httpx_response(_openai_response([fake_vec]))
+
+        with patch("httpx.post", return_value=mock_resp) as mock_post:
+            result = provider.embed_query("what is the policy?")
+
+        self.assertEqual(result.vector, [0.8, 0.9, 1.0])
+        request_body = mock_post.call_args.kwargs["json"]
+        self.assertEqual(request_body["input_type"], "query")
+        self.assertEqual(request_body["model"], "nvidia/llama-nemotron-embed-1b-v2")
+        self.assertEqual(request_body["input"], ["what is the policy?"])
+
+    def test_openai_request_does_not_include_nvidia_input_type(self):
+        """Non-NVIDIA OpenAI-compatible requests keep their previous shape."""
+        provider = self._make_provider(api_type="openai")
+        fake_vec = [0.1, 0.2, 0.3]
+        mock_resp = _mock_httpx_response(_openai_response([fake_vec]))
+
+        with patch("httpx.post", return_value=mock_resp) as mock_post:
+            provider.embed_texts(["document chunk"])
+
+        request_body = mock_post.call_args.kwargs["json"]
+        self.assertNotIn("input_type", request_body)
 
     def test_metadata_correctness(self):
         """Metadata fields are populated correctly."""
@@ -333,12 +385,72 @@ class TestAPIAdapters(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0], vectors[0])
 
-    # --- Unknown API type fallback ---
+    # --- NVIDIA adapter (OpenAI-compatible, explicitly mapped) ---
 
-    def test_unknown_api_type_fallback(self):
-        from app.services.embeddings.api_adapters import get_api_adapter, OpenAIAdapter
-        adapter = get_api_adapter("nonexistent-provider")
+    def test_nvidia_format_request(self):
+        """NVIDIA uses OpenAI-compatible adapter — same format as OpenAI."""
+        from app.services.embeddings.api_adapters import get_api_adapter
+        adapter = get_api_adapter("nvidia")
+        path, body = adapter.format_request(["hello", "world"], "nvidia/llama-nemotron-embed-1b-v2")
+        self.assertEqual(path, "/v1/embeddings")
+        self.assertEqual(body["input"], ["hello", "world"])
+        self.assertEqual(body["model"], "nvidia/llama-nemotron-embed-1b-v2")
+
+    def test_nvidia_format_request_with_dimensions(self):
+        """NVIDIA adapter supports dimensions parameter."""
+        from app.services.embeddings.api_adapters import get_api_adapter
+        adapter = get_api_adapter("nvidia")
+        _, body = adapter.format_request(["hello"], "nvidia/llama-nemotron-embed-1b-v2", dimensions=2048)
+        self.assertEqual(body["dimensions"], 2048)
+
+    def test_nvidia_format_request_with_input_type(self):
+        """NVIDIA adapter carries provider-specific input_type."""
+        from app.services.embeddings.api_adapters import get_api_adapter
+        adapter = get_api_adapter("nvidia")
+        _, body = adapter.format_request(
+            ["hello"],
+            "nvidia/llama-nemotron-embed-1b-v2",
+            input_type="passage",
+        )
+        self.assertEqual(body["input_type"], "passage")
+
+    def test_nvidia_parse_response(self):
+        """NVIDIA adapter parses OpenAI-format response correctly."""
+        from app.services.embeddings.api_adapters import get_api_adapter
+        adapter = get_api_adapter("nvidia")
+        vectors = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+        data = _openai_response(vectors)
+        result = adapter.parse_response(data, 2)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], [0.1, 0.2, 0.3])
+        self.assertEqual(result[1], [0.4, 0.5, 0.6])
+
+    def test_nvidia_adapter_is_openai_adapter(self):
+        """NVIDIA adapter is the same class as OpenAI adapter."""
+        from app.services.embeddings.api_adapters import (
+            get_api_adapter,
+            OpenAIAdapter,
+        )
+        adapter = get_api_adapter("nvidia")
+        openai_adapter = get_api_adapter("openai")
         self.assertIsInstance(adapter, OpenAIAdapter)
+        # Both should produce identical format
+        nv_path, nv_body = adapter.format_request(["test"], "some-model")
+        oa_path, oa_body = openai_adapter.format_request(["test"], "some-model")
+        self.assertEqual(nv_path, oa_path)
+        self.assertEqual(nv_body, oa_body)
+
+    # --- Unknown API type raises ValueError ---
+
+    def test_unknown_api_type_raises_value_error(self):
+        """Unknown api_type now raises ValueError instead of silent fallback."""
+        from app.services.embeddings.api_adapters import get_api_adapter
+        with self.assertRaises(ValueError) as ctx:
+            get_api_adapter("nonexistent-provider")
+        msg = str(ctx.exception)
+        self.assertIn("nonexistent-provider", msg)
+        self.assertIn("nvidia", msg)  # Should mention nvidia as a supported type
+        self.assertIn("openai", msg)  # Should mention openai as a supported type
 
 
 # ===========================================================================
@@ -420,6 +532,28 @@ class TestFactoryAPIProvider(unittest.TestCase):
         self.assertEqual(provider._api_key, "sk-custom-key")
         self.assertEqual(provider._api_type, "cohere")
 
+    def test_factory_returns_provider_with_nvidia_api_type(self):
+        """Factory returns GenericAPIProvider with api_type='nvidia'."""
+        from app.services.embeddings.factory import get_embedding_provider
+        from app.services.embeddings.generic_api_provider import GenericAPIProvider
+
+        with patch(
+            "app.services.embeddings.factory.settings",
+            _make_settings_override(
+                embedding_provider="api",
+                embedding_api_key="nv-test-key-12345",
+                embedding_api_type="nvidia",
+                embedding_base_url="https://integrate.api.nvidia.com",
+                embedding_model="nvidia/llama-nemotron-embed-1b-v2",
+                embedding_dimensions=2048,
+            ),
+        ):
+            provider = get_embedding_provider()
+        self.assertIsInstance(provider, GenericAPIProvider)
+        self.assertEqual(provider._api_type, "nvidia")
+        self.assertEqual(provider._model, "nvidia/llama-nemotron-embed-1b-v2")
+        self.assertEqual(provider._expected_dimensions, 2048)
+
 
 # ===========================================================================
 # Collection naming tests
@@ -438,6 +572,12 @@ class TestCollectionNaming(unittest.TestCase):
         from app.services.embeddings.collection_naming import suggest_collection_name
         result = suggest_collection_name("api", "text-embedding-3-small")
         self.assertEqual(result, "knowledge_api_text_embedding_3_small")
+
+    def test_nvidia_model_sanitization(self):
+        """NVIDIA model name with / and - chars is sanitized correctly."""
+        from app.services.embeddings.collection_naming import suggest_collection_name
+        result = suggest_collection_name("api", "nvidia/llama-nemotron-embed-1b-v2")
+        self.assertEqual(result, "knowledge_api_nvidia_llama_nemotron_embed_1b_v2")
 
     def test_ollama_model_sanitization(self):
         from app.services.embeddings.collection_naming import suggest_collection_name
@@ -518,6 +658,20 @@ class TestAPIKeySecurity(unittest.TestCase):
         from app.services.embeddings.security import validate_api_key
         with self.assertRaises(EmbeddingProviderError):
             validate_api_key("", provider="api", api_type="voyage")
+
+    def test_validate_raises_for_empty_key_nvidia(self):
+        """NVIDIA requires a non-empty API key, same as OpenAI."""
+        from app.services.embeddings.base import EmbeddingProviderError
+        from app.services.embeddings.security import validate_api_key
+        with self.assertRaises(EmbeddingProviderError) as ctx:
+            validate_api_key("", provider="api", api_type="nvidia")
+        self.assertEqual(ctx.exception.category, "configuration_error")
+        self.assertIn("EMBEDDING_API_KEY", str(ctx.exception))
+
+    def test_validate_accepts_key_for_nvidia(self):
+        """NVIDIA with a key should not raise."""
+        from app.services.embeddings.security import validate_api_key
+        validate_api_key("nv-key-12345", provider="api", api_type="nvidia")
 
     def test_validate_does_not_raise_for_empty_key_ollama(self):
         from app.services.embeddings.security import validate_api_key
@@ -1036,6 +1190,51 @@ class TestGenericAPIProviderConfig(unittest.TestCase):
         self.assertEqual(result.vector, [0.5, 0.6, 0.7])
         self.assertEqual(result.meta.provider, "api")
 
+    def test_build_url_warns_on_double_path_segment(self):
+        """_build_url emits a warning when base_url already ends with the
+        adapter endpoint's first path segment (e.g. /v1 + /v1/embeddings)."""
+        import logging
+        from app.services.embeddings.generic_api_provider import GenericAPIProvider
+
+        provider = GenericAPIProvider(
+            model="test-model",
+            base_url="https://integrate.api.nvidia.com/v1",  # /v1 suffix — wrong
+            api_key="sk-test-key",
+            api_type="openai",
+        )
+        with self.assertLogs(
+            "rag_core.embeddings.generic_api_provider", level=logging.WARNING
+        ) as log_ctx:
+            url = provider._build_url("/v1/embeddings")
+
+        # URL is still built (warning does not abort)
+        self.assertEqual(url, "https://integrate.api.nvidia.com/v1/v1/embeddings")
+        # Warning message contains the key diagnostic terms
+        combined = " ".join(log_ctx.output)
+        self.assertIn("double-path", combined)
+        self.assertIn("v1", combined)
+
+    def test_build_url_no_warning_for_clean_base_url(self):
+        """_build_url does NOT warn when base_url has no path-segment overlap."""
+        import logging
+        from app.services.embeddings.generic_api_provider import GenericAPIProvider
+
+        provider = GenericAPIProvider(
+            model="test-model",
+            base_url="https://integrate.api.nvidia.com",  # correct — no /v1
+            api_key="sk-test-key",
+            api_type="openai",
+        )
+        # assertLogs would raise AssertionError if no logs are emitted at WARNING+
+        # We verify no WARNING is emitted by checking the logger directly.
+        import logging as _logging
+        logger = _logging.getLogger("rag_core.embeddings.generic_api_provider")
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(logger, level=_logging.WARNING):
+                url = provider._build_url("/v1/embeddings")
+        # URL is correct
+        self.assertEqual(url, "https://integrate.api.nvidia.com/v1/embeddings")
+
     def _make_simple_provider(self):
         from app.services.embeddings.generic_api_provider import GenericAPIProvider
         return GenericAPIProvider(
@@ -1347,86 +1546,88 @@ class TestDimensionGuardAPIProvider(unittest.TestCase):
       and suggested collection name.
     """
 
-    @patch("app.services.vector_store._get_qdrant_client")
     @patch("app.services.vector_store.settings")
     def test_dimension_mismatch_raises_with_provider_info(
-        self, mock_settings, mock_get_client
+        self, mock_settings
     ):
         """Dimension guard raises ValueError with provider-aware message for API provider."""
-        from app.services.vector_store import _ensure_qdrant_collection
+        from rag_core.vector_store.qdrant_adapter import QdrantAdapter
 
-        # Mock settings for API provider
-        mock_settings.embedding_provider = "api"
-        mock_settings.embedding_model = "text-embedding-3-small"
-        mock_settings.vector_store_collection = "knowledge_chunks"
+        # Create adapter with matching config
+        adapter = QdrantAdapter(
+            collection="knowledge_chunks",
+            url="http://localhost:6333",
+            embedding_provider="api",
+            embedding_model="text-embedding-3-small",
+        )
 
-        # Mock Qdrant client returning a collection with dim=64
+        # Mock the internal QdrantClient
         mock_client = MagicMock()
         mock_collection_info = MagicMock()
         mock_collection_info.config.params.vectors.size = 64
         mock_client.get_collection.return_value = mock_collection_info
-        mock_get_client.return_value = mock_client
-
-        with self.assertRaises(ValueError) as ctx:
-            _ensure_qdrant_collection(vector_size=1536)
+        adapter._get_client.cache_clear()
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            with self.assertRaises(ValueError) as ctx:
+                adapter._ensure_collection(vector_size=1536)
 
         msg = str(ctx.exception)
-        # Should include provider name
         self.assertIn("api", msg)
-        # Should include model
         self.assertIn("text-embedding-3-small", msg)
-        # Should include dimensions
         self.assertIn("64", msg)
         self.assertIn("1536", msg)
-        # Should include suggested collection name
         self.assertIn("knowledge_api_text_embedding_3_small", msg)
 
-    @patch("app.services.vector_store._get_qdrant_client")
     @patch("app.services.vector_store.settings")
     def test_dimension_mismatch_for_local_provider(
-        self, mock_settings, mock_get_client
+        self, mock_settings
     ):
         """Dimension guard for local provider still works with provider info."""
-        from app.services.vector_store import _ensure_qdrant_collection
+        from rag_core.vector_store.qdrant_adapter import QdrantAdapter
 
-        mock_settings.embedding_provider = "local"
-        mock_settings.embedding_model = "local-hash-v1"
-        mock_settings.vector_store_collection = "knowledge_chunks"
+        adapter = QdrantAdapter(
+            collection="knowledge_chunks",
+            url="http://localhost:6333",
+            embedding_provider="local",
+            embedding_model="local-hash-v1",
+        )
 
         mock_client = MagicMock()
         mock_collection_info = MagicMock()
         mock_collection_info.config.params.vectors.size = 128
         mock_client.get_collection.return_value = mock_collection_info
-        mock_get_client.return_value = mock_client
-
-        with self.assertRaises(ValueError) as ctx:
-            _ensure_qdrant_collection(vector_size=64)
+        adapter._get_client.cache_clear()
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            with self.assertRaises(ValueError) as ctx:
+                adapter._ensure_collection(vector_size=64)
 
         msg = str(ctx.exception)
         self.assertIn("local", msg)
         self.assertIn("local-hash-v1", msg)
         self.assertIn("knowledge_local_local_hash_v1", msg)
 
-    @patch("app.services.vector_store._get_qdrant_client")
     @patch("app.services.vector_store.settings")
     def test_dimension_no_mismatch_does_not_raise(
-        self, mock_settings, mock_get_client
+        self, mock_settings
     ):
         """Dimension guard does not raise when dimensions match."""
-        from app.services.vector_store import _ensure_qdrant_collection
+        from rag_core.vector_store.qdrant_adapter import QdrantAdapter
 
-        mock_settings.embedding_provider = "api"
-        mock_settings.embedding_model = "text-embedding-3-small"
-        mock_settings.vector_store_collection = "knowledge_api_text_embedding_3_small"
+        adapter = QdrantAdapter(
+            collection="knowledge_api_text_embedding_3_small",
+            url="http://localhost:6333",
+            embedding_provider="api",
+            embedding_model="text-embedding-3-small",
+        )
 
         mock_client = MagicMock()
         mock_collection_info = MagicMock()
         mock_collection_info.config.params.vectors.size = 1536
         mock_client.get_collection.return_value = mock_collection_info
-        mock_get_client.return_value = mock_client
-
-        # Should not raise
-        _ensure_qdrant_collection(vector_size=1536)
+        adapter._get_client.cache_clear()
+        with patch.object(adapter, "_get_client", return_value=mock_client):
+            # Should not raise
+            adapter._ensure_collection(vector_size=1536)
 
 
 class TestCollectionValidationInIngestion(unittest.TestCase):

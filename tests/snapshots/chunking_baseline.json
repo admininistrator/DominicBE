@@ -1,0 +1,98 @@
+{
+  "empty": {
+    "input_length": 0,
+    "normalized": "",
+    "chunk_count": 0,
+    "chunks": []
+  },
+  "whitespace_only": {
+    "input_length": 10,
+    "normalized": "",
+    "chunk_count": 0,
+    "chunks": []
+  },
+  "single_sentence": {
+    "input_length": 28,
+    "normalized": "Hello world. This is a test.",
+    "chunk_count": 1,
+    "chunks": [
+      {
+        "chunk_index": 0,
+        "content": "Hello world. This is a test.",
+        "token_count": 7,
+        "metadata_json": {
+          "char_count": 28
+        }
+      }
+    ]
+  },
+  "multi_paragraph": {
+    "input_length": 100,
+    "normalized": "First paragraph about chunking.\n\nSecond paragraph about embedding.\n\nThird paragraph about retrieval.",
+    "chunk_count": 1,
+    "chunks": [
+      {
+        "chunk_index": 0,
+        "content": "First paragraph about chunking. Second paragraph about embedding. Third paragraph about retrieval.",
+        "token_count": 24,
+        "metadata_json": {
+          "char_count": 98
+        }
+      }
+    ]
+  },
+  "unicode": {
+    "input_length": 79,
+    "normalized": "Xin chào thế giới. Đây là văn bản tiếng Việt. Chúng tôi đang kiểm tra chunking.",
+    "chunk_count": 1,
+    "chunks": [
+      {
+        "chunk_index": 0,
+        "content": "Xin chào thế giới. Đây là văn bản tiếng Việt. Chúng tôi đang kiểm tra chunking.",
+        "token_count": 19,
+        "metadata_json": {
+          "char_count": 79
+        }
+      }
+    ]
+  },
+  "very_long_sentence": {
+    "input_length": 2500,
+    "normalized": "Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word",
+    "chunk_count": 4,
+    "chunks": [
+      {
+        "chunk_index": 0,
+        "content": "Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word",
+        "token_count": 199,
+        "metadata_json": {
+          "char_count": 799
+        }
+      },
+      {
+        "chunk_index": 1,
+        "content": "Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word",
+        "token_count": 199,
+        "metadata_json": {
+          "char_count": 799
+        }
+      },
+      {
+        "chunk_index": 2,
+        "content": "Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word",
+        "token_count": 199,
+        "metadata_json": {
+          "char_count": 799
+        }
+      },
+      {
+        "chunk_index": 3,
+        "content": "Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word Word",
+        "token_count": 99,
+        "metadata_json": {
+          "char_count": 399
+        }
+      }
+    ]
+  }
+}

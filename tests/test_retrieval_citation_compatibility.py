@@ -155,6 +155,206 @@ def _seed_chunks(session_factory, document_id: int, count: int = 2,
         db.close()
 
 
+class TestQueryEmbeddingCallCounts(unittest.TestCase):
+    """Regression tests for bounded query embedding during retrieval."""
+
+    def setUp(self):
+        self.factory, self.engine, self.db_path = _make_sqlite_factory()
+
+    def tearDown(self):
+        self.engine.dispose()
+        try:
+            os.remove(self.db_path)
+        except OSError:
+            pass
+
+    def _mock_provider(self, *, chunk_count: int = 0):
+        from app.services.embeddings.base import EmbedResult, EmbeddingMeta, QueryEmbedResult
+
+        meta = EmbeddingMeta(
+            provider="api",
+            model="nvidia/llama-nemotron-embed-1b-v2",
+            dimensions=3,
+            version="api-nvidia-v1",
+            extra={"api_type": "nvidia"},
+        )
+        provider = MagicMock()
+        provider.embed_query.return_value = QueryEmbedResult(vector=[0.2, 0.2, 0.2], meta=meta)
+        provider.embed_texts.return_value = EmbedResult(
+            vectors=[[0.2, 0.2, 0.2] for _ in range(chunk_count)],
+            meta=meta,
+        )
+        return provider
+
+    def test_db_fallback_embeds_query_once_and_batches_missing_chunk_embeddings(self):
+        """DB fallback must not call embed_query once per candidate chunk."""
+        from app.services.retrieval_service import search_knowledge
+
+        owner = "embed_once_user"
+        chunk_count = 4
+        doc_id = _seed_document(self.factory, owner=owner, title="Embedding Call Count")
+        _seed_chunks(
+            self.factory,
+            doc_id,
+            count=chunk_count,
+            provider="api",
+            model="nvidia/llama-nemotron-embed-1b-v2",
+            dimensions=3,
+            version="api-nvidia-v1",
+        )
+        provider = self._mock_provider(chunk_count=chunk_count)
+
+        db = self.factory()
+        try:
+            with patch("app.services.retrieval_service.get_embedding_provider",
+                       return_value=provider), \
+                 patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
+                       return_value=False), \
+                 patch("app.services.retrieval_service.settings",
+                       _make_settings_override(
+                           embedding_provider="api",
+                           embedding_model="nvidia/llama-nemotron-embed-1b-v2",
+                           embedding_dimensions=3,
+                           retrieval_min_score=0.0,
+                           retrieval_min_lexical_score=0.0,
+                       )):
+                result = search_knowledge(
+                    db=db,
+                    owner_username=owner,
+                    query="retrieval testing",
+                    top_k=chunk_count,
+                    session_id=123,
+                    request_id="req-embed-once",
+                )
+
+            self.assertEqual(result["returned"], chunk_count)
+            self.assertEqual(provider.embed_query.call_count, 1)
+            self.assertEqual(provider.embed_texts.call_count, 1)
+            embedded_texts = provider.embed_texts.call_args.args[0]
+            self.assertEqual(len(embedded_texts), chunk_count)
+        finally:
+            db.close()
+
+    def test_stored_chunk_embeddings_do_not_trigger_per_chunk_query_embeddings(self):
+        """Stored chunk vectors should be reused without extra provider calls."""
+        from app.services.retrieval_service import search_knowledge
+        from app.crud import crud_knowledge
+
+        owner = "stored_embedding_user"
+        doc_id = _seed_document(self.factory, owner=owner, title="Stored Embeddings")
+        _seed_chunks(
+            self.factory,
+            doc_id,
+            count=3,
+            provider="api",
+            model="nvidia/llama-nemotron-embed-1b-v2",
+            dimensions=3,
+            version="api-nvidia-v1",
+        )
+        seed_db = self.factory()
+        try:
+            rows = crud_knowledge.list_searchable_chunks(seed_db, owner, document_id=doc_id)
+            for chunk, _document in rows:
+                chunk.metadata_json = {
+                    **(chunk.metadata_json or {}),
+                    "embedding": [0.2, 0.2, 0.2],
+                }
+            seed_db.commit()
+        finally:
+            seed_db.close()
+
+        provider = self._mock_provider(chunk_count=0)
+        db = self.factory()
+        try:
+            with patch("app.services.retrieval_service.get_embedding_provider",
+                       return_value=provider), \
+                 patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
+                       return_value=False), \
+                 patch("app.services.retrieval_service.settings",
+                       _make_settings_override(
+                           embedding_provider="api",
+                           embedding_model="nvidia/llama-nemotron-embed-1b-v2",
+                           embedding_dimensions=3,
+                           retrieval_min_score=0.0,
+                           retrieval_min_lexical_score=0.0,
+                       )):
+                result = search_knowledge(
+                    db=db,
+                    owner_username=owner,
+                    query="stored embedding query",
+                    top_k=3,
+                    document_id=doc_id,
+                    request_id="req-stored-embedding",
+                )
+
+            self.assertEqual(result["returned"], 3)
+            self.assertEqual(provider.embed_query.call_count, 1)
+            provider.embed_texts.assert_not_called()
+        finally:
+            db.close()
+
+    def test_query_expansion_uses_one_rewritten_query_embedding(self):
+        """Current expansion rewrites one query, so embed_query remains bounded at one."""
+        from app.services.retrieval_service import search_knowledge
+        from app.crud import crud_knowledge
+
+        owner = "expanded_query_user"
+        doc_id = _seed_document(self.factory, owner=owner, title="Expansion")
+        _seed_chunks(
+            self.factory,
+            doc_id,
+            count=1,
+            provider="api",
+            model="nvidia/llama-nemotron-embed-1b-v2",
+            dimensions=3,
+            version="api-nvidia-v1",
+        )
+        seed_db = self.factory()
+        try:
+            rows = crud_knowledge.list_searchable_chunks(seed_db, owner, document_id=doc_id)
+            for chunk, _document in rows:
+                chunk.metadata_json = {
+                    **(chunk.metadata_json or {}),
+                    "embedding": [0.2, 0.2, 0.2],
+                }
+            seed_db.commit()
+        finally:
+            seed_db.close()
+
+        provider = self._mock_provider(chunk_count=0)
+        db = self.factory()
+        try:
+            with patch("app.services.retrieval_service.get_embedding_provider",
+                       return_value=provider), \
+                 patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
+                       return_value=False), \
+                 patch("app.services.retrieval_service.settings",
+                       _make_settings_override(
+                           embedding_provider="api",
+                           embedding_model="nvidia/llama-nemotron-embed-1b-v2",
+                           embedding_dimensions=3,
+                           retrieval_enable_query_expansion=True,
+                           retrieval_min_score=0.0,
+                           retrieval_min_lexical_score=0.0,
+                       )):
+                result = search_knowledge(
+                    db=db,
+                    owner_username=owner,
+                    query="chinh sach hoan tien",
+                    top_k=1,
+                    document_id=doc_id,
+                    request_id="req-expanded-query",
+                )
+
+            self.assertGreaterEqual(len(result["query_expansions"]), 1)
+            self.assertEqual(provider.embed_query.call_count, 1)
+            embedded_query = provider.embed_query.call_args.args[0]
+            self.assertIn("refund", embedded_query)
+            provider.embed_texts.assert_not_called()
+        finally:
+            db.close()
+
+
 # ===========================================================================
 # P05-T01: Owner and session filters
 # ===========================================================================
@@ -263,6 +463,8 @@ class TestOwnerAndSessionFilters(unittest.TestCase):
             provider = LocalHashProvider(model="local-hash-v1", dimensions=64)
 
             with patch("app.services.retrieval_service.get_embedding_provider",
+                       return_value=provider), \
+                 patch("app.services.knowledge_service.get_embedding_provider",
                        return_value=provider), \
                  patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
                        return_value=False), \
@@ -441,6 +643,8 @@ class TestRetrievalEventMetadata(unittest.TestCase):
 
             with patch("app.services.retrieval_service.get_embedding_provider",
                        return_value=provider), \
+                 patch("app.services.knowledge_service.get_embedding_provider",
+                       return_value=provider), \
                  patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
                        return_value=False), \
                  patch("app.services.retrieval_service.settings",
@@ -500,6 +704,8 @@ class TestRetrievalEventMetadata(unittest.TestCase):
 
             with patch("app.services.retrieval_service.get_embedding_provider",
                        return_value=provider), \
+                 patch("app.services.knowledge_service.get_embedding_provider",
+                       return_value=provider), \
                  patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
                        return_value=False), \
                  patch("app.services.retrieval_service.settings",
@@ -545,6 +751,8 @@ class TestRetrievalEventMetadata(unittest.TestCase):
 
             with patch("app.services.retrieval_service.get_embedding_provider",
                        return_value=provider), \
+                 patch("app.services.knowledge_service.get_embedding_provider",
+                       return_value=provider), \
                  patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
                        return_value=False), \
                  patch("app.services.retrieval_service.settings",
@@ -584,6 +792,8 @@ class TestRetrievalEventMetadata(unittest.TestCase):
             provider = LocalHashProvider(model="local-hash-v1", dimensions=64)
 
             with patch("app.services.retrieval_service.get_embedding_provider",
+                       return_value=provider), \
+                 patch("app.services.knowledge_service.get_embedding_provider",
                        return_value=provider), \
                  patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
                        return_value=False), \
@@ -642,6 +852,8 @@ class TestRetrievalEventMetadata(unittest.TestCase):
             mock_provider.embed_texts.return_value = embed_result
 
             with patch("app.services.retrieval_service.get_embedding_provider",
+                       return_value=mock_provider), \
+                 patch("app.services.knowledge_service.get_embedding_provider",
                        return_value=mock_provider), \
                  patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
                        return_value=False), \
@@ -790,6 +1002,8 @@ class TestSourceShape(unittest.TestCase):
                 provider = LocalHashProvider(model="local-hash-v1", dimensions=64)
 
                 with patch("app.services.retrieval_service.get_embedding_provider",
+                           return_value=provider), \
+                     patch("app.services.knowledge_service.get_embedding_provider",
                            return_value=provider), \
                      patch("app.services.retrieval_service.vector_store.is_external_vector_store_enabled",
                            return_value=False), \

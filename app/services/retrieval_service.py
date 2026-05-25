@@ -1,8 +1,12 @@
-"""Knowledge retrieval service for Phase 2 searchable indexing."""
+"""Knowledge retrieval service for Phase 2 searchable indexing.
+
+Delegates pure scoring/ranking/evidence/compat functions to ``rag_core.retrieval``.
+Retains ``search_knowledge()`` as the orchestrator (DB queries, event logging,
+fallback logic).
+"""
 from __future__ import annotations
 
 import logging
-import unicodedata
 import time
 from math import sqrt
 import re
@@ -16,199 +20,125 @@ from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_knowledge
 from app.services import vector_store
 from app.services.embeddings.factory import get_embedding_provider
-from app.services.knowledge_service import compute_text_embedding
 
+# rag-core imports for pure scoring/ranking/evidence functions
+from rag_core.retrieval.query_processor import (
+    QUERY_EXPANSION_RULES,  # noqa: F401
+    _expand_query as _rag_expand_query,
+    _normalize_for_search as _rag_normalize_for_search,
+    _strip_accents as _rag_strip_accents,
+    _tokenize as _rag_tokenize,
+)
+from rag_core.retrieval.scoring import (
+    _cosine_similarity as _rag_cosine_similarity,
+    _hybrid_score as _rag_hybrid_score,
+    _lexical_overlap_score as _rag_lexical_overlap_score,
+    _normalize_for_dedupe as _rag_normalize_for_dedupe,
+)
+from rag_core.retrieval.reranker import _rerank_results as _rag_rerank_results
+from rag_core.retrieval.deduplicator import _dedupe_scored_results as _rag_dedupe_scored_results
+from rag_core.retrieval.evidence import (
+    _build_snippet as _rag_build_snippet,
+    _classify_evidence_strength as _rag_classify_evidence_strength,
+    _estimate_token_count as _rag_estimate_token_count,
+    _is_embedding_compatible as _rag_is_embedding_compatible,
+)
 
 logger = get_logger(__name__)
 
 
-QUERY_EXPANSION_RULES: dict[str, list[str]] = {
-    "hoan tien": ["refund", "refund policy", "money back"],
-    "chinh sach": ["policy"],
-    "xu ly": ["review", "process", "processing"],
-    "bao lau": ["how long", "duration", "timeline", "days"],
-    "mat khau": ["password", "credentials"],
-    "dang nhap": ["login", "sign in", "authenticate"],
-    "tai lieu": ["document", "knowledge base"],
-}
-
+# ---------------------------------------------------------------------------
+# Pure functions — thin wrappers that read settings and delegate to rag-core
+# ---------------------------------------------------------------------------
 
 def _strip_accents(text: str) -> str:
-    normalized = unicodedata.normalize("NFKD", text or "")
-    return "".join(char for char in normalized if not unicodedata.combining(char))
+    return _rag_strip_accents(text)
 
 
 def _normalize_for_search(text: str) -> str:
-    lowered = _strip_accents(text).lower()
-    lowered = re.sub(r"[^\w\s]", " ", lowered, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", lowered).strip()
+    return _rag_normalize_for_search(text)
 
 
 def _tokenize(text: str) -> set[str]:
-    return {token for token in re.findall(r"\w+", _normalize_for_search(text), flags=re.UNICODE) if token}
+    return _rag_tokenize(text)
 
 
 def _expand_query(query: str) -> tuple[str, list[str]]:
-    normalized = _normalize_for_search(query)
-    expansions: list[str] = []
-    if settings.retrieval_enable_query_expansion:
-        for phrase, candidates in QUERY_EXPANSION_RULES.items():
-            if phrase in normalized:
-                for candidate in candidates:
-                    if candidate not in expansions:
-                        expansions.append(candidate)
-
-    if not expansions:
-        return " ".join((query or "").split()), []
-
-    rewritten_query = " ".join(part for part in [" ".join((query or "").split()), *expansions] if part).strip()
-    return rewritten_query, expansions
+    return _rag_expand_query(query, enable_query_expansion=settings.retrieval_enable_query_expansion)
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
-    if not left or not right or len(left) != len(right):
-        return 0.0
-
-    dot = sum(a * b for a, b in zip(left, right))
-    left_norm = sqrt(sum(a * a for a in left))
-    right_norm = sqrt(sum(b * b for b in right))
-    if left_norm == 0 or right_norm == 0:
-        return 0.0
-    return dot / (left_norm * right_norm)
+    return _rag_cosine_similarity(left, right)
 
 
-def _extract_embedding(metadata_json: Any, fallback_text: str) -> list[float]:
+def _lexical_overlap_score(query_text: str, content: str) -> float:
+    return _rag_lexical_overlap_score(query_text, content)
+
+
+def _hybrid_score(semantic_score: float, lexical_score: float) -> float:
+    return _rag_hybrid_score(
+        semantic_score,
+        lexical_score,
+        semantic_weight=settings.retrieval_hybrid_semantic_weight,
+        lexical_weight=settings.retrieval_hybrid_lexical_weight,
+    )
+
+
+def _normalize_for_dedupe(text: str) -> str:
+    return _rag_normalize_for_dedupe(text)
+
+
+def _rerank_results(query_text: str, results: list[dict]) -> list[dict]:
+    return _rag_rerank_results(
+        query_text,
+        results,
+        max_rerank_candidates=settings.retrieval_max_rerank_candidates,
+        rerank_title_weight=settings.retrieval_rerank_title_weight,
+        rerank_position_weight=settings.retrieval_rerank_position_weight,
+    )
+
+
+def _dedupe_scored_results(results: list[dict]) -> list[dict]:
+    return _rag_dedupe_scored_results(results)
+
+
+def _classify_evidence_strength(results: list[dict], *, fallback_used: bool) -> str:
+    return _rag_classify_evidence_strength(
+        results,
+        fallback_used=fallback_used,
+        low_confidence_score=settings.retrieval_low_confidence_score,
+    )
+
+
+def _build_snippet(content: str, *, max_chars: int = 220) -> str:
+    return _rag_build_snippet(content, max_chars=max_chars)
+
+
+def _estimate_token_count(text: str, explicit_count: int | None = None) -> int:
+    return _rag_estimate_token_count(text, explicit_count=explicit_count)
+
+
+def _is_embedding_compatible(chunk_meta: Any, query_provider: str, query_model: str) -> bool:
+    return _rag_is_embedding_compatible(chunk_meta, query_provider, query_model)
+
+
+# ---------------------------------------------------------------------------
+# Stored embedding extraction
+# ---------------------------------------------------------------------------
+
+def _extract_stored_embedding(metadata_json: Any) -> list[float] | None:
     embedding = ensure_json_mapping(metadata_json).get("embedding")
     if isinstance(embedding, list) and embedding:
         try:
             return [float(value) for value in embedding]
         except (TypeError, ValueError):
             pass
-    return compute_text_embedding(fallback_text)
+    return None
 
 
-# P05-T01: mixed-space safeguard — detect incompatible provider provenance
-def _is_embedding_compatible(chunk_meta: Any, query_provider: str, query_model: str) -> bool:
-    """Return False if the chunk was embedded by a different provider / model.
-
-    When True, semantic cosine comparison is safe.  When False, the caller
-    should skip semantic scoring and rely on lexical fallback only to avoid
-    comparing vectors from incompatible embedding spaces.
-    """
-    meta = ensure_json_mapping(chunk_meta)
-    stored_provider = (meta.get("embedding_provider") or "").strip().lower()
-    stored_model = (meta.get("embedding_model") or "").strip().lower()
-    if not stored_provider:
-        # Legacy chunk with no provider metadata — assume compatible.
-        return True
-    if stored_provider == query_provider.lower() and stored_model == query_model.lower():
-        return True
-    return False
-
-
-def _build_snippet(content: str, *, max_chars: int = 220) -> str:
-    normalized = " ".join((content or "").split())
-    if len(normalized) <= max_chars:
-        return normalized
-    return normalized[: max_chars - 3].rstrip() + "..."
-
-
-def _estimate_token_count(text: str, explicit_count: int | None = None) -> int:
-    if explicit_count and explicit_count > 0:
-        return int(explicit_count)
-    normalized = " ".join((text or "").split())
-    if not normalized:
-        return 0
-    return max(1, len(normalized) // 4)
-
-
-def _normalize_for_dedupe(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip().lower()
-
-
-def _lexical_overlap_score(query_text: str, content: str) -> float:
-    query_tokens = _tokenize(query_text)
-    content_tokens = _tokenize(content)
-    if not query_tokens or not content_tokens:
-        return 0.0
-
-    overlap = query_tokens & content_tokens
-    if not overlap:
-        return 0.0
-
-    coverage = len(overlap) / len(query_tokens)
-    density = len(overlap) / sqrt(len(query_tokens) * len(content_tokens))
-    return round(min(1.0, (coverage * 0.75) + (density * 0.25)), 6)
-
-
-def _hybrid_score(semantic_score: float, lexical_score: float) -> float:
-    total_weight = settings.retrieval_hybrid_semantic_weight + settings.retrieval_hybrid_lexical_weight
-    semantic_weight = settings.retrieval_hybrid_semantic_weight / total_weight
-    lexical_weight = settings.retrieval_hybrid_lexical_weight / total_weight
-    return round(
-        min(1.0, (semantic_score * semantic_weight) + (lexical_score * lexical_weight)),
-        6,
-    )
-
-
-def _classify_evidence_strength(results: list[dict], *, fallback_used: bool) -> str:
-    if not results:
-        return "none"
-    if fallback_used:
-        return "fallback"
-    top_score = float(results[0].get("score") or 0.0)
-    if top_score >= settings.retrieval_low_confidence_score:
-        return "grounded"
-    return "weak"
-
-
-def _rerank_results(query_text: str, results: list[dict]) -> list[dict]:
-    reranked: list[dict] = []
-    for item in results[: settings.retrieval_max_rerank_candidates]:
-        title_score = _lexical_overlap_score(query_text, item.get("title") or "")
-        chunk_index = int(item.get("chunk_index") or 0)
-        position_score = max(0.0, 1.0 - (chunk_index * 0.05))
-        rerank_score = round(
-            min(
-                1.0,
-                float(item.get("score") or 0.0)
-                + (title_score * settings.retrieval_rerank_title_weight)
-                + (position_score * settings.retrieval_rerank_position_weight),
-            ),
-            6,
-        )
-        reranked.append(
-            {
-                **item,
-                "rerank_score": rerank_score,
-                "token_estimate": _estimate_token_count(item.get("content") or "", item.get("token_count")),
-            }
-        )
-
-    reranked.sort(
-        key=lambda item: (
-            -float(item.get("rerank_score") or 0.0),
-            -float(item.get("score") or 0.0),
-            item.get("document_id") or 0,
-            item.get("chunk_index") or 0,
-        )
-    )
-    return reranked
-
-
-def _dedupe_scored_results(results: list[dict]) -> list[dict]:
-    seen: set[tuple[int, str]] = set()
-    deduped: list[dict] = []
-
-    for item in results:
-        key = (item["document_id"], _normalize_for_dedupe(item.get("content") or item.get("snippet") or ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
-
-    return deduped
-
+# ---------------------------------------------------------------------------
+# Main retrieval orchestrator
+# ---------------------------------------------------------------------------
 
 def search_knowledge(
     db: Session,
@@ -294,25 +224,50 @@ def search_knowledge(
     scored_results: list[dict] = []
     # P05-T01: capture current provider identity for mixed-space check
     _query_identity = (_embed_meta.provider, _embed_meta.model)
+    chunk_meta_by_id: dict[int, dict] = {}
+    chunk_embeddings_by_id: dict[int, list[float]] = {}
+    missing_embedding_inputs: list[tuple[int, str]] = []
+
+    if not semantic_scores_by_chunk_id:
+        for chunk, _document in candidates:
+            chunk_id = int(chunk.id)
+            chunk_meta = ensure_json_mapping(chunk.metadata_json)
+            chunk_meta_by_id[chunk_id] = chunk_meta
+            if not _is_embedding_compatible(chunk_meta, _query_identity[0], _query_identity[1]):
+                _mixed_space_skip_count += 1
+                continue
+
+            stored_embedding = _extract_stored_embedding(chunk_meta)
+            if stored_embedding is not None:
+                chunk_embeddings_by_id[chunk_id] = stored_embedding
+            else:
+                missing_embedding_inputs.append((chunk_id, chunk.content))
+
+        if missing_embedding_inputs:
+            embed_result = _embed_provider.embed_texts(
+                [content for _chunk_id, content in missing_embedding_inputs]
+            )
+            for (chunk_id, _content), vector in zip(missing_embedding_inputs, embed_result.vectors):
+                chunk_embeddings_by_id[chunk_id] = vector
+
     for chunk, document in candidates:
         # P06 (FINDING-R15): cache parsed chunk_meta to avoid double ensure_json_mapping
-        chunk_meta = ensure_json_mapping(chunk.metadata_json)
+        chunk_id = int(chunk.id)
+        chunk_meta = chunk_meta_by_id.get(chunk_id) or ensure_json_mapping(chunk.metadata_json)
         if semantic_scores_by_chunk_id:
-            semantic_score = semantic_scores_by_chunk_id.get(int(chunk.id), 0.0)
-        else:
-            # P05-T01: skip cross-space cosine comparison when provider metadata differs
-            if _is_embedding_compatible(chunk_meta, _query_identity[0], _query_identity[1]):
-                chunk_embedding = _extract_embedding(chunk.metadata_json, chunk.content)
+            semantic_score = semantic_scores_by_chunk_id.get(chunk_id, 0.0)
+        elif _is_embedding_compatible(chunk_meta, _query_identity[0], _query_identity[1]):
+            chunk_embedding = chunk_embeddings_by_id.get(chunk_id)
+            if chunk_embedding is not None:
                 semantic_score = round(max(0.0, _cosine_similarity(query_embedding, chunk_embedding)), 6)
             else:
-                # Incompatible embedding space — rely on lexical scoring only
                 semantic_score = 0.0
-                _mixed_space_skip_count += 1
+        else:
+            semantic_score = 0.0
         lexical_score = _lexical_overlap_score(rewritten_query, chunk.content)
         score = _hybrid_score(semantic_score, lexical_score)
         if score < settings.retrieval_min_score and lexical_score < settings.retrieval_min_lexical_score:
             continue
-        # P05-T01: extract chunk embedding provider for provenance (chunk_meta already cached)
         scored_results.append(
             {
                 "document_id": document.id,
@@ -447,4 +402,3 @@ def search_knowledge(
         "session_scope": session_scope,
         "results": results,
     }
-
