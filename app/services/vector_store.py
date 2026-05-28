@@ -10,6 +10,7 @@ from functools import lru_cache
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services.rag_core_client import get_rag_core_client, is_rag_core_api_mode
 from rag_core.vector_store.qdrant_adapter import QdrantAdapter
 
 logger = get_logger(__name__)
@@ -43,6 +44,26 @@ def should_store_embeddings_in_database() -> bool:
 
 def check_vector_store_health() -> dict:
     """Return health check information delegating to the QdrantAdapter."""
+    if is_rag_core_api_mode():
+        try:
+            health = get_rag_core_client().health()
+            dependencies = health.get("dependencies") if isinstance(health, dict) else None
+            qdrant = (dependencies or {}).get("qdrant") if isinstance(dependencies, dict) else None
+            if isinstance(qdrant, dict):
+                return {**qdrant, "via": "rag-core-api"}
+            return {
+                "ok": bool(health.get("ok")) if isinstance(health, dict) else False,
+                "provider": "qdrant",
+                "via": "rag-core-api",
+                "detail": "rag-core health did not include qdrant dependency",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "provider": "qdrant",
+                "via": "rag-core-api",
+                "detail": type(exc).__name__,
+            }
     if not is_external_vector_store_enabled():
         return _get_adapter().check_health()
     return _get_adapter().check_health()
@@ -51,6 +72,12 @@ def check_vector_store_health() -> dict:
 def delete_document_chunks(owner_username: str, document_id: int) -> None:
     if not is_external_vector_store_enabled():
         return
+    if is_rag_core_api_mode():
+        get_rag_core_client().vector_delete(
+            owner_username=owner_username,
+            document_id=document_id,
+        )
+        return
     _get_adapter().delete_document_chunks(owner_username, document_id)
 
 
@@ -58,7 +85,6 @@ def upsert_document_chunks(document, chunk_rows: list, prepared_chunks: list[dic
     if not is_external_vector_store_enabled() or not chunk_rows:
         return
 
-    adapter = _get_adapter()
     # Build provider metadata from the first prepared chunk
     embedding_provider = settings.embedding_provider
     embedding_model = settings.embedding_model
@@ -71,6 +97,30 @@ def upsert_document_chunks(document, chunk_rows: list, prepared_chunks: list[dic
         embedding_provider = first_meta.get("embedding_provider", embedding_provider)
         embedding_model = first_meta.get("embedding_model", embedding_model)
 
+    if is_rag_core_api_mode():
+        get_rag_core_client().vector_upsert(
+            document={
+                "owner_username": document.owner_username,
+                "document_id": int(document.id),
+                "title": document.title,
+                "source_type": document.source_type,
+                "source_uri": document.source_uri,
+                "session_id": int(document.session_id) if document.session_id is not None else None,
+            },
+            chunk_rows=[
+                {
+                    "id": int(row.id),
+                    "chunk_index": int(row.chunk_index),
+                }
+                for row in chunk_rows
+            ],
+            prepared_chunks=prepared_chunks,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+        )
+        return
+
+    adapter = _get_adapter()
     adapter.upsert_document_chunks(
         owner_username=document.owner_username,
         document_id=int(document.id),
@@ -96,6 +146,16 @@ def search_similar_chunks(
 ) -> list[dict]:
     if not is_external_vector_store_enabled():
         return []
+    if is_rag_core_api_mode():
+        response = get_rag_core_client().vector_search(
+            owner_username=owner_username,
+            query_vector=query_vector,
+            top_k=top_k,
+            document_id=document_id,
+            session_id=session_id,
+            session_scope=session_scope,
+        )
+        return response.get("vector_hits") or []
     return _get_adapter().search_similar_chunks(
         owner_username,
         query_vector,

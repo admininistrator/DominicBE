@@ -192,7 +192,7 @@ class TestQueryEmbeddingCallCounts(unittest.TestCase):
 
         owner = "embed_once_user"
         chunk_count = 4
-        doc_id = _seed_document(self.factory, owner=owner, title="Embedding Call Count")
+        doc_id = _seed_document(self.factory, owner=owner, title="Embedding Call Count", session_id=123)
         _seed_chunks(
             self.factory,
             doc_id,

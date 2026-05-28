@@ -95,6 +95,14 @@ class KnowledgeSearchResult(BaseModel):
     snippet: str
     vector_id: str | None = None
     embedding_model: str | None = None
+    page_number: int | None = None
+    page_range: str | None = None
+    section_key: str | None = None
+    section_title: str | None = None
+    section_level: int | None = None
+    section_order: int | None = None
+    char_start: int | None = None
+    char_end: int | None = None
 
 
 class KnowledgeSearchResponse(BaseModel):
@@ -102,6 +110,7 @@ class KnowledgeSearchResponse(BaseModel):
     top_k: int
     returned: int
     retrieval_id: int | None = None
+    request_id: str | None = None
     latency_ms: int | None = None
     candidate_count: int | None = None
     document_id: int | None = None
@@ -112,6 +121,21 @@ class KnowledgeSearchResponse(BaseModel):
     fallback_used: bool = False
     fallback_reason: str | None = None
     evidence_strength: str | None = None
+    session_scope: str | None = None
+    rag_mode: str | None = None
+    retrieval_scope: str | None = None
+    selected_document_id: int | None = None
+    session_id: int | None = None
+    section_key: str | None = None
+    section_confidence: float | None = None
+    vector_store_attempted: bool | None = None
+    vector_store_failed: bool | None = None
+    vector_store_error_type: str | None = None
+    dynamic_context_expanded: bool | None = None
+    requested_top_k: int | None = None
+    effective_top_k: int | None = None
+    adjacent_expansion_applied: bool | None = None
+    adjacent_expanded_count: int | None = None
     results: list[KnowledgeSearchResult]
 
 
@@ -253,5 +277,4 @@ class CostMetricsResponse(BaseModel):
     min_retrieval_latency_ms: int | None = None
     max_retrieval_latency_ms: int | None = None
     user_breakdown: list[UserTokenBreakdown]
-
 

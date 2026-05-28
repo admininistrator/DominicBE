@@ -18,16 +18,19 @@ RUN apt-get update \
         libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./requirements.txt
+COPY DominicBE/requirements.txt ./requirements.txt
 
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
-COPY alembic.ini ./alembic.ini
-COPY startup.sh ./startup.sh
-COPY alembic ./alembic
-COPY app ./app
-COPY docker/entrypoint.sh ./docker/entrypoint.sh
+COPY rag-core /tmp/rag-core
+RUN pip install /tmp/rag-core
+
+COPY DominicBE/alembic.ini ./alembic.ini
+COPY DominicBE/startup.sh ./startup.sh
+COPY DominicBE/alembic ./alembic
+COPY DominicBE/app ./app
+COPY DominicBE/docker/entrypoint.sh ./docker/entrypoint.sh
 
 RUN chmod +x ./startup.sh ./docker/entrypoint.sh
 

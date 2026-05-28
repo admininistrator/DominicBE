@@ -12,14 +12,14 @@ from app.core.logging import get_logger
 from app.core.json_utils import ensure_json_mapping
 from app.crud import crud_chat
 from app.crud import crud_knowledge
-from app.services.retrieval_service import search_knowledge
+from app.services.retrieval_service import build_retrieval_metadata_contract, search_knowledge
 from app.services import llm_provider
 from app.services.llm_provider import LLMError
+from app.services.rag_core_client import RagCoreClientError, get_rag_core_client, is_rag_core_api_mode
 from app.services.tavily_service import TavilySearchError, search_web
 
 # Local aliases for readability (resolved from settings at module load)
 CONTEXT_WINDOW_SIZE = settings.context_window_size
-MAX_OUTPUT_TOKENS = settings.max_output_tokens
 ROLLING_WINDOW_HOURS = settings.rolling_window_hours
 SUMMARY_MAX_TOKENS = settings.summary_max_tokens
 SUMMARY_TRIGGER_MESSAGES = settings.summary_trigger_messages
@@ -157,6 +157,13 @@ def _load_message_sources(payload: str | None) -> list[dict]:
                 "rank": item.get("rank"),
                 "url": item.get("url"),
                 "domain": item.get("domain"),
+                "page_number": item.get("page_number"),
+                "page_range": item.get("page_range"),
+                "section_key": item.get("section_key"),
+                "section_title": item.get("section_title"),
+                "section_level": item.get("section_level"),
+                "char_start": item.get("char_start"),
+                "char_end": item.get("char_end"),
             }
         )
     return normalized_sources
@@ -408,6 +415,15 @@ def _build_retrieval_by_request(db: Session, request_ids: list[str]) -> dict[str
             "web_results_count": int(metadata.get("web_results_count") or 0),
             "web_search_query": metadata.get("web_search_query"),
             "web_latency_ms": int(metadata.get("web_latency_ms") or 0),
+            "rag_mode": metadata.get("rag_mode"),
+            "retrieval_scope": metadata.get("retrieval_scope"),
+            "selected_document_id": metadata.get("selected_document_id"),
+            "session_id": metadata.get("session_id"),
+            "section_key": metadata.get("section_key"),
+            "section_confidence": metadata.get("section_confidence"),
+            "vector_store_attempted": bool(metadata.get("vector_store_attempted")),
+            "vector_store_failed": bool(metadata.get("vector_store_failed")),
+            "vector_store_error_type": metadata.get("vector_store_error_type"),
         }
     return grouped
 
@@ -418,6 +434,21 @@ def _estimate_input_tokens(messages: list[dict], system_prompt: str | None = Non
     if system_prompt:
         total_chars += len(system_prompt)
     return max(1, total_chars // TOKEN_ESTIMATE_CHARS_PER_TOKEN)
+
+
+def _calculate_max_output_tokens(
+    *,
+    estimated_input_tokens: int,
+    remaining_tokens: int,
+    context_window: int,
+    model_max_output_tokens: int,
+) -> int:
+    context_window_remaining = context_window - estimated_input_tokens
+    return min(
+        model_max_output_tokens,
+        remaining_tokens - estimated_input_tokens,
+        context_window_remaining,
+    )
 
 
 def _is_generated_session_title(title: str | None) -> bool:
@@ -645,6 +676,13 @@ def _build_sources(results: list[dict]) -> list[dict]:
             "rank": index,
             "url": None,
             "domain": None,
+            "page_number": row.get("page_number"),
+            "page_range": row.get("page_range"),
+            "section_key": row.get("section_key"),
+            "section_title": row.get("section_title"),
+            "section_level": row.get("section_level"),
+            "char_start": row.get("char_start"),
+            "char_end": row.get("char_end"),
         }
         for index, row in enumerate(results, start=1)
     ]
@@ -674,10 +712,18 @@ def _build_evidence_context(knowledge_results: list[dict], web_results: list[dic
     source_index = 1
 
     for row in knowledge_results:
+        labels: list[str] = []
+        if row.get("section_title"):
+            labels.append(f"section={row.get('section_title')}")
+        if row.get("page_range"):
+            labels.append(f"pages={row.get('page_range')}")
+        elif row.get("page_number") is not None:
+            labels.append(f"page={row.get('page_number')}")
+        label_suffix = " " + " ".join(labels) if labels else ""
         blocks.append(
             "\n".join(
                 [
-                    f"[Source {source_index}] type=knowledge title={row['title']} document_id={row['document_id']} chunk_id={row['chunk_id']} score={float(row.get('score') or 0):.3f}",
+                    f"[Source {source_index}] type=knowledge title={row['title']} document_id={row['document_id']} chunk_id={row['chunk_id']} score={float(row.get('score') or 0):.3f}{label_suffix}",
                     row.get("content") or row.get("snippet") or "",
                 ]
             )
@@ -700,6 +746,17 @@ def _build_evidence_context(knowledge_results: list[dict], web_results: list[dic
 
 
 def _pack_retrieval_results(results: list[dict]) -> tuple[list[dict], int]:
+    if is_rag_core_api_mode():
+        try:
+            payload = get_rag_core_client().pack_context(
+                results=results,
+                max_context_chunks=settings.retrieval_max_context_chunks,
+                max_context_tokens=settings.retrieval_max_context_tokens,
+            )
+            return payload.get("packed_results") or [], int(payload.get("packed_token_estimate") or 0)
+        except RagCoreClientError:
+            logger.warning("rag-core API context packing failed; using local packer")
+
     packed_results: list[dict] = []
     packed_token_estimate = 0
 
@@ -889,6 +946,10 @@ def _build_web_search_payload(web_search_result: dict | None, answer_policy: str
         "web_results_count": len(results),
         "web_search_query": (web_search_result or {}).get("query"),
         "web_latency_ms": int((web_search_result or {}).get("latency_ms") or 0),
+        **build_retrieval_metadata_contract(
+            rag_mode="direct_chat",
+            retrieval_scope="none",
+        ),
     }
 
 
@@ -1012,6 +1073,58 @@ def _build_retrieval_payload(retrieval_result: dict | None) -> dict | None:
         "web_results_count": int(retrieval_result.get("web_results_count") or 0),
         "web_search_query": retrieval_result.get("web_search_query"),
         "web_latency_ms": int(retrieval_result.get("web_latency_ms") or 0),
+        "rag_mode": retrieval_result.get("rag_mode"),
+        "retrieval_scope": retrieval_result.get("retrieval_scope"),
+        "selected_document_id": retrieval_result.get("selected_document_id"),
+        "session_id": retrieval_result.get("session_id"),
+        "section_key": retrieval_result.get("section_key"),
+        "section_confidence": retrieval_result.get("section_confidence"),
+        "vector_store_attempted": bool(retrieval_result.get("vector_store_attempted")),
+        "vector_store_failed": bool(retrieval_result.get("vector_store_failed")),
+        "vector_store_error_type": retrieval_result.get("vector_store_error_type"),
+    }
+
+
+def _build_chat_metadata_retrieval_result(
+    *,
+    rag_mode: str,
+    retrieval_scope: str,
+    session_id: int | None = None,
+    selected_document_id: int | None = None,
+    fallback_reason: str | None = None,
+) -> dict:
+    return {
+        "query": None,
+        "top_k": 0,
+        "returned": 0,
+        "retrieval_id": None,
+        "request_id": None,
+        "session_scope": retrieval_scope if retrieval_scope in {"session", "global"} else "none",
+        "latency_ms": 0,
+        "document_id": selected_document_id,
+        "strategy": rag_mode,
+        "original_query": None,
+        "rewritten_query": None,
+        "query_expansions": [],
+        "fallback_used": bool(fallback_reason),
+        "fallback_reason": fallback_reason,
+        "evidence_strength": "none",
+        "answer_policy": None,
+        "packed_count": 0,
+        "packed_token_estimate": 0,
+        "web_search_used": False,
+        "web_results_count": 0,
+        "web_search_query": None,
+        "web_latency_ms": 0,
+        "results": [],
+        "packed_results": [],
+        **build_retrieval_metadata_contract(
+            rag_mode=rag_mode,
+            retrieval_scope=retrieval_scope,
+            selected_document_id=selected_document_id,
+            session_id=session_id,
+            fallback_reason=fallback_reason,
+        ),
     }
 
 
@@ -1065,12 +1178,27 @@ def _prepare_chat_turn(
             raise ValueError("Knowledge document not found.")
         if knowledge_document.session_id is not None and knowledge_document.session_id != session_id:
             raise ValueError("Knowledge document does not belong to this chat session.")
+        selected_document_indexed = knowledge_document.status == "indexed"
+    else:
+        selected_document_indexed = False
+
+    model_selection = llm_provider.get_provider_registry().select_model(
+        model,
+        reasoning_effort=reasoning_effort,
+    )
 
     session_documents = crud_knowledge.list_documents(
         db,
         username,
         session_id=session_id,
         session_id_filter="session",
+    )
+    indexed_session_documents = crud_knowledge.list_documents(
+        db,
+        username,
+        session_id=session_id,
+        session_id_filter="session",
+        indexed_only=True,
     )
     session_document_attachments = [
         {
@@ -1082,8 +1210,10 @@ def _prepare_chat_turn(
     ]
     knowledge_base_active = _should_use_knowledge_base(
         knowledge_document_id=knowledge_document_id,
-        session_documents=session_documents,
+        session_documents=indexed_session_documents,
     )
+    if knowledge_document_id is not None:
+        knowledge_base_active = selected_document_indexed
 
     daily_limit = int(user.max_tokens_per_day or 10000)
     rolling = crud_chat.get_rolling_token_usage(db, username, window_hours=ROLLING_WINDOW_HOURS)
@@ -1126,6 +1256,27 @@ def _prepare_chat_turn(
         retrieval_result["packed_count"] = len(packed_results)
         retrieval_result["packed_token_estimate"] = packed_token_estimate
         retrieval_result["packed_results"] = packed_results
+    elif knowledge_document_id is not None:
+        retrieval_result = _build_chat_metadata_retrieval_result(
+            rag_mode="indexing_pending",
+            retrieval_scope="document",
+            session_id=session_id,
+            selected_document_id=knowledge_document_id,
+            fallback_reason="no_indexed_document",
+        )
+    elif session_documents:
+        retrieval_result = _build_chat_metadata_retrieval_result(
+            rag_mode="indexing_pending",
+            retrieval_scope="session",
+            session_id=session_id,
+            fallback_reason="no_indexed_session_documents",
+        )
+    else:
+        retrieval_result = _build_chat_metadata_retrieval_result(
+            rag_mode="direct_chat",
+            retrieval_scope="none",
+            session_id=None,
+        )
 
     web_search_result = {"used": False, "query": None, "latency_ms": 0, "results": []}
     if use_web_search:
@@ -1189,11 +1340,11 @@ def _prepare_chat_turn(
         )
         raise PermissionError(f"Rolling {ROLLING_WINDOW_HOURS}-hour token limit exceeded.")
 
-    context_window_remaining = settings.llm_context_window - estimated_input_tokens
-    max_output_tokens = min(
-        MAX_OUTPUT_TOKENS,
-        remaining_tokens - estimated_input_tokens,
-        context_window_remaining,
+    max_output_tokens = _calculate_max_output_tokens(
+        estimated_input_tokens=estimated_input_tokens,
+        remaining_tokens=remaining_tokens,
+        context_window=model_selection.context_window,
+        model_max_output_tokens=model_selection.max_output_tokens,
     )
     if max_output_tokens <= 0:
         crud_chat.update_message_tokens_and_status(

@@ -57,13 +57,35 @@ services:
       exit 0;
       "
 
+  rag-core:
+    build:
+      context: ../../rag-core
+      dockerfile: Dockerfile
+    container_name: dominic-rag-core
+    env_file:
+      - ${BACKEND_ENV_FILE:-../.env.ec2}
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_started
+    expose:
+      - "8010"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/ready').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   backend:
     build:
-      context: ..
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: DominicBE/Dockerfile
     container_name: dominic-backend
     env_file:
       - ${BACKEND_ENV_FILE:-../.env.ec2}
+    environment:
+      RAG_CORE_BASE_URL: http://rag-core:8010
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -76,6 +98,8 @@ services:
         condition: service_started
       minio-bootstrap:
         condition: service_completed_successfully
+      rag-core:
+        condition: service_healthy
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:

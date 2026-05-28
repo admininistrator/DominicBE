@@ -29,13 +29,30 @@ LONG_TEXT = (
     "Customers can submit refund evidence through the support portal. " * 40
 ).strip()
 
+SECTION_TEXT = """Bài thực hành số 4
+1. Nội dung bài một.
+2. Nội dung bài hai.
+3. Nội dung bài ba.
+""".strip()
+
 def _fake_complete(*, messages, system=None, max_tokens=1024, **kwargs):
     assert system
     assert "Evidence for this turn" in system
-    assert "Product FAQ" in system
-    assert "refund requests are reviewed within 5 business days" in system.lower()
     assert messages
     assert max_tokens >= 1
+    if "Bài thực hành số 4" in system:
+        assert "Nội dung bài một" in system
+        assert "Nội dung bài ba" in system
+        return {
+            "text": "Bài thực hành số 4 có 3 bài: bài một, bài hai và bài ba. [Source 1]",
+            "input_tokens": 120,
+            "output_tokens": 48,
+            "model": "test/fake-model",
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+        }
+    assert "Product FAQ" in system
+    assert "refund requests are reviewed within 5 business days" in system.lower()
     return {
         "text": "Theo Product FAQ, yêu cầu hoàn tiền được xem xét trong vòng 5 ngày làm việc. [Source 1]",
         "input_tokens": 120,
@@ -203,6 +220,46 @@ def main() -> None:
             assert weak_payload["sources"] == []
             assert "chưa có đủ bằng chứng" in weak_payload["reply"].lower()
 
+            section_ingest_response = client.post(
+                api_path("/knowledge/documents/ingest"),
+                json={
+                    "title": "Synthetic Practice Section",
+                    "source_type": "text",
+                    "raw_text": SECTION_TEXT,
+                    "metadata": {"category": "smoke", "language": "vi"},
+                },
+                headers=headers,
+            )
+            assert section_ingest_response.status_code == 201, section_ingest_response.text
+            section_document_id = section_ingest_response.json()["document_id"]
+
+            section_chat_response = client.post(
+                api_path("/chat/"),
+                json={
+                    "session_id": session_id,
+                    "message": "Bài thực hành số 4 có mấy bài, tóm tắt từng bài",
+                    "knowledge_document_id": section_document_id,
+                },
+                headers=headers,
+            )
+            assert section_chat_response.status_code == 200, section_chat_response.text
+            section_payload = section_chat_response.json()
+            section_retrieval = section_payload["retrieval"]
+            assert section_retrieval["used"] is True
+            assert section_retrieval["rag_mode"] == "section_rag"
+            assert section_retrieval["retrieval_scope"] == "document"
+            assert section_retrieval["selected_document_id"] == section_document_id
+            assert section_retrieval["section_key"] == "bai-thuc-hanh-so-4"
+            assert section_retrieval["vector_store_attempted"] is False
+            assert section_retrieval["returned"] >= 1
+            assert section_payload["sources"]
+            assert all(
+                source["document_id"] == section_document_id
+                and source.get("section_key") == "bai-thuc-hanh-so-4"
+                for source in section_payload["sources"]
+            )
+            assert "3 bài" in section_payload["reply"]
+
     finally:
         settings.rate_limit_enabled = original_rate_limit_enabled
         chat_service.llm_provider.complete = original_complete
@@ -213,4 +270,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

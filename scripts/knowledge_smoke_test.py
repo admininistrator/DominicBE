@@ -40,6 +40,15 @@ REFUND_TEXT = (
     "Product FAQ. Refund policy requests are reviewed within 5 business days. "
     "Customers can submit refund evidence through the support portal. " * 20
 ).strip()
+SECTION_SMOKE_TEXT = """Bài thực hành số 4
+1. Nội dung bài một.
+2. Nội dung bài hai.
+3. Nội dung bài ba.
+
+Practice Lesson 4
+1. Prepare the worksheet.
+2. Submit the reflection.
+""".strip()
 
 
 def main() -> None:
@@ -198,6 +207,61 @@ def main() -> None:
             assert expanded_search_payload["results"][0]["lexical_score"] > 0
             assert expanded_search_payload["results"][0]["rerank_score"] is not None
 
+            section_ingest_response = client.post(
+                api_path("/knowledge/documents/ingest"),
+                json={
+                    "title": "Synthetic Practice Section",
+                    "source_type": "text",
+                    "raw_text": SECTION_SMOKE_TEXT,
+                    "metadata": {"category": "smoke", "language": "vi"},
+                },
+                headers=headers,
+            )
+            assert section_ingest_response.status_code == 201, section_ingest_response.text
+            section_doc_id = section_ingest_response.json()["document_id"]
+
+            section_chunks_response = client.get(
+                api_path(f"/knowledge/documents/{section_doc_id}/chunks"),
+                headers=headers,
+            )
+            assert section_chunks_response.status_code == 200, section_chunks_response.text
+            section_chunks = section_chunks_response.json()
+            assert len(section_chunks) >= 1
+            assert any(
+                (chunk.get("metadata_json") or {}).get("section_key") == "bai-thuc-hanh-so-4"
+                for chunk in section_chunks
+            )
+            assert any(
+                (chunk.get("metadata_json") or {}).get("char_start") is not None
+                for chunk in section_chunks
+            )
+
+            section_search_response = client.post(
+                api_path("/knowledge/search"),
+                json={
+                    "query": "Bài thực hành số 4 có mấy bài, tóm tắt từng bài",
+                    "top_k": 5,
+                    "document_id": section_doc_id,
+                },
+                headers=headers,
+            )
+            assert section_search_response.status_code == 200, section_search_response.text
+            section_search_payload = section_search_response.json()
+            assert section_search_payload["rag_mode"] == "section_rag"
+            assert section_search_payload["retrieval_scope"] == "document"
+            assert section_search_payload["selected_document_id"] == section_doc_id
+            assert section_search_payload["section_key"] == "bai-thuc-hanh-so-4"
+            assert section_search_payload["vector_store_attempted"] is False
+            assert section_search_payload["returned"] >= 1
+            assert all(
+                row["document_id"] == section_doc_id
+                and row.get("section_key") == "bai-thuc-hanh-so-4"
+                for row in section_search_payload["results"]
+            )
+            section_context = "\n".join(row["snippet"] for row in section_search_payload["results"])
+            assert "Nội dung bài một" in section_context
+            assert "Nội dung bài ba" in section_context
+
             jobs_response = client.get(
                 api_path(f"/knowledge/documents/{text_doc_id}/jobs"),
                 headers=headers,
@@ -260,7 +324,7 @@ def main() -> None:
 
             documents_after_upload = client.get(api_path("/knowledge/documents"), headers=headers)
             assert documents_after_upload.status_code == 200, documents_after_upload.text
-            assert len(documents_after_upload.json()) == 3
+            assert len(documents_after_upload.json()) == 4
 
             reindex_response = client.post(
                 api_path(f"/knowledge/documents/{text_doc_id}/reindex"),
@@ -525,4 +589,3 @@ if __name__ == "__main__":
         ollama_ingestion_smoke()
     else:
         main()
-

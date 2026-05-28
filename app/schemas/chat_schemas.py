@@ -8,6 +8,7 @@ from datetime import datetime
 
 from app.core.config import settings
 from app.core.security import validate_username_policy
+from app.services import llm_provider
 
 CHAT_MESSAGE_MAX_LENGTH = settings.chat_message_max_length
 ALLOWED_CHAT_IMAGE_MEDIA_TYPES = frozenset({
@@ -149,11 +150,10 @@ class ChatRequest(_OptionalUsernameInputModel):
         if normalized.startswith("gh/"):
             normalized = normalized.split("gh/", 1)[1]
 
-        if normalized not in settings.supported_chat_models:
-            raise ValueError(
-                "Unsupported chat model. Supported models: " + ", ".join(settings.supported_chat_models)
-            )
-        return normalized
+        try:
+            return llm_provider.validate_catalog_model_request(normalized)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
 
     @field_validator("reasoning_effort")
     @classmethod
@@ -190,16 +190,10 @@ class ChatRequest(_OptionalUsernameInputModel):
         if not self.reasoning_effort:
             return self
 
-        allowed_efforts = _allowed_reasoning_efforts_for_model(self.model)
-        if self.model and self.reasoning_effort not in allowed_efforts:
-            raise ValueError(
-                "Unsupported reasoning effort '%s' for model '%s'. Supported values: %s"
-                % (
-                    self.reasoning_effort,
-                    self.model,
-                    ", ".join(sorted(allowed_efforts)) or "none",
-                )
-            )
+        try:
+            llm_provider.validate_catalog_model_request(self.model, self.reasoning_effort)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         return self
 
 
@@ -215,6 +209,14 @@ class CitationSource(BaseModel):
     rank: int | None = None
     url: str | None = None
     domain: str | None = None
+    page_number: int | None = None
+    page_range: str | None = None
+    section_key: str | None = None
+    section_title: str | None = None
+    section_level: int | None = None
+    section_order: int | None = None
+    char_start: int | None = None
+    char_end: int | None = None
 
 
 class RetrievalMetadata(BaseModel):
@@ -240,6 +242,15 @@ class RetrievalMetadata(BaseModel):
     web_results_count: int = 0
     web_search_query: str | None = None
     web_latency_ms: int | None = None
+    rag_mode: str | None = None
+    retrieval_scope: str | None = None
+    selected_document_id: int | None = None
+    session_id: int | None = None
+    section_key: str | None = None
+    section_confidence: float | None = None
+    vector_store_attempted: bool = False
+    vector_store_failed: bool = False
+    vector_store_error_type: str | None = None
 
 
 class TokenUsage(BaseModel):
@@ -314,4 +325,3 @@ class SessionMessageResponse(BaseModel):
     request_id: str | None = None
     sources: list[CitationSource] = Field(default_factory=list)
     retrieval: RetrievalMetadata | None = None
-

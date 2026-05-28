@@ -8,6 +8,7 @@ from app.api.error_handling import build_internal_server_error_payload, raise_in
 from app.core.logging import get_logger
 from app.core.security import validate_username_policy
 from app.models.chat_models import User
+from app.services import llm_provider
 from app.schemas.chat_schemas import (
     ChatRequest,
     ChatResponse,
@@ -107,6 +108,15 @@ def get_user_usage(
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
         raise_internal_server_error(logger, action="chat.get_user_usage", exc=e)
+
+
+@router.get("/models")
+def get_chat_models(current_user: User = Depends(get_current_user)):
+    del current_user
+    try:
+        return llm_provider.get_public_model_catalog()
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
 
 
 @router.post("/sessions", response_model=SessionResponse)

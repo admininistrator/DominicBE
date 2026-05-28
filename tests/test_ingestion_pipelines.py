@@ -294,6 +294,14 @@ class TestCustomPipeline(unittest.TestCase):
         result = p.chunk_document(_SAMPLE_TEXT, title="Test Document")
         self.assertGreater(len(result), 0)
 
+    def test_custom_pipeline_honors_chunk_size_and_overlap(self):
+        p = self.CustomPipeline(chunk_size=40, chunk_overlap=10)
+        text = "A" * 95
+        result = p.chunk_document(text)
+        self.assertEqual([chunk.content for chunk in result], ["A" * 40, "A" * 40, "A" * 35])
+        self.assertEqual(result[0].content[-10:], result[1].content[:10])
+        self.assertEqual(result[1].content[-10:], result[2].content[:10])
+
 
 # ===========================================================================
 # Pipeline factory tests
@@ -378,6 +386,14 @@ class TestIngestionPipelineFactory(unittest.TestCase):
             factory = self._get_factory()
             pipeline = factory(pipeline="custom")
         self.assertIsInstance(pipeline, CustomPipeline)
+
+    def test_custom_factory_passes_chunk_config(self):
+        mock_settings = _make_settings(ingestion_pipeline="custom", chunk_size=40, chunk_overlap=10)
+        with patch("app.core.config.settings", mock_settings):
+            factory = self._get_factory()
+            pipeline = factory()
+        result = pipeline.chunk_document("A" * 95)
+        self.assertEqual([chunk.content for chunk in result], ["A" * 40, "A" * 40, "A" * 35])
 
 
 # ===========================================================================

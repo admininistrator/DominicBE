@@ -1,3 +1,5 @@
+name: Dominic Local
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -55,6 +57,34 @@ services:
       /usr/bin/mc anonymous set none local/dominic-knowledge;
       exit 0;
       "
+
+  rag-core:
+    build:
+      context: ../../rag-core
+      dockerfile: Dockerfile
+    container_name: dominic-rag-core
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_started
+    environment:
+      RAG_CORE_API_KEY: local-rag-core-dev-key
+      RAG_CORE_HOST: 0.0.0.0
+      RAG_CORE_PORT: 8010
+      EMBEDDING_PROVIDER: local
+      EMBEDDING_MODEL: local-hash-v1
+      EMBEDDING_DIMENSIONS: 64
+      VECTOR_STORE_PROVIDER: qdrant
+      VECTOR_STORE_URL: http://qdrant:6333
+      VECTOR_STORE_COLLECTION: knowledge_chunks
+    ports:
+      - "127.0.0.1:8010:8010"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/ready').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
 volumes:
   postgres_data:

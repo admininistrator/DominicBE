@@ -23,6 +23,7 @@ Guide này dành cho trạng thái hiện tại của dự án: backend FastAPI 
 
 - backend image: `Dockerfile`
 - backend entrypoint: `docker/entrypoint.sh`
+- rag-core image: `../rag-core/Dockerfile`
 - frontend image: `../Dominic/chatbot-ui/Dockerfile`
 - production stack: `deploy/docker-compose.ec2.yml`
 - env mẫu cho EC2: `.env.ec2.example`
@@ -35,6 +36,7 @@ Một EC2 chạy:
 
 - `frontend` container: phục vụ static build của React bằng Nginx
 - `backend` container: FastAPI + Gunicorn/Uvicorn
+- `rag-core` container: internal FastAPI service cho RAG compute, Qdrant operations, retrieval ranking
 - `postgres` container: app DB
 - `minio` container: object storage cho file/tài liệu
 - `qdrant` container: vector store
@@ -49,9 +51,10 @@ Phân domain:
 Lưu ý quan trọng về LLM:
 
 - stack Docker này không đóng gói `9router`
-- backend hiện vẫn cần `GITHUB_COPILOT_API_KEY` và `NINEROUTER_BASE_URL`
+- backend hiện dùng OpenAI-compatible provider registry; mặc định cần `NINEROUTER_BASE_URL` và `NINEROUTER_API_KEY`
 - nếu `9router` đang chạy trên chính EC2 host, dùng `NINEROUTER_BASE_URL=http://host.docker.internal:20128/v1`
 - nếu `9router` nằm ở máy khác, điền URL public/private thật của gateway đó
+- model trong `LLM_PROVIDER_CATALOG_JSON` có thể khai báo `contextWindow` và `maxOutputTokens`; giá trị này override fallback `LLM_CONTEXT_WINDOW` và `MAX_OUTPUT_TOKENS`
 
 ## 3. Chuẩn bị tài nguyên AWS
 
@@ -61,7 +64,7 @@ Khuyến nghị:
 
 - AMI: `Ubuntu Server 24.04 LTS`
 - test nhỏ: `t3.medium`
-- khuyến nghị production ban đầu cho stack đủ 5 container: `t3.large`
+- khuyến nghị production ban đầu cho stack đủ 6 container: `t3.large`
 - disk: tối thiểu `40 GB`, nên dùng `60 GB` nếu knowledge base tăng nhanh
 
 ### 3.2 Security group
@@ -79,10 +82,11 @@ Không cần mở public:
 - `6334`
 - `9000`
 - `9001`
+- `8010`
 - `8000`
 - `8080`
 
-Các cổng này đã được bind nội bộ `127.0.0.1` trong compose.
+Các cổng này đã được bind nội bộ `127.0.0.1` trong compose, hoặc chỉ `expose` trong Docker network như `rag-core:8010`.
 
 ### 3.3 Elastic IP
 
@@ -156,8 +160,10 @@ Các biến bắt buộc phải đổi ngay:
 - `DATABASE_URL`
 - `OBJECT_STORAGE_ACCESS_KEY`
 - `OBJECT_STORAGE_SECRET_KEY`
-- `GITHUB_COPILOT_API_KEY`
 - `NINEROUTER_BASE_URL`
+- `NINEROUTER_API_KEY`
+- `LLM_DEFAULT_PROVIDER`
+- `LLM_DEFAULT_MODEL`
 - `CORS_ORIGINS`
 
 Lưu ý đồng bộ:
@@ -216,8 +222,8 @@ Nếu `/health` fail:
 
 Nếu chat không trả lời nhưng health vẫn xanh:
 
-- kiểm tra `GITHUB_COPILOT_API_KEY`
 - kiểm tra `NINEROUTER_BASE_URL`
+- kiểm tra `NINEROUTER_API_KEY`
 - xác nhận container backend nhìn thấy gateway LLM thật
 
 ## 9. Cấu hình Nginx trên host EC2

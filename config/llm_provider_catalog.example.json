@@ -1,0 +1,28 @@
+[
+  {
+    "id": "custom-openai",
+    "label": "Custom OpenAI Compatible",
+    "type": "openai-compatible",
+    "baseUrlEnv": "CUSTOM_OPENAI_BASE_URL",
+    "apiKeyEnv": "CUSTOM_OPENAI_API_KEY",
+    "enabled": true,
+    "models": [
+      {
+        "id": "custom-model",
+        "label": "Custom Model",
+        "displayProvider": "Custom",
+        "model": "custom-model-name",
+        "enabled": true,
+        "default": true,
+        "contextWindow": 128000,
+        "maxOutputTokens": 4096,
+        "capabilities": {
+          "reasoningEffort": {
+            "enabled": false,
+            "userConfigurable": false
+          }
+        }
+      }
+    ]
+  }
+]

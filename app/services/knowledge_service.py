@@ -21,6 +21,7 @@ from app.models.knowledge_models import KnowledgeDocument
 from app.services import object_storage, vector_store
 from app.services.embeddings.collection_naming import validate_collection_config
 from app.services.embeddings.factory import get_embedding_provider
+from app.services.rag_core_client import get_rag_core_client, is_rag_core_api_mode
 
 # rag-core imports for delegated pure-RAG logic
 from rag_core.parsing import normalize_text_for_ingestion as _rag_normalize_text
@@ -102,6 +103,24 @@ def prepare_chunks_for_indexing(document_id: int, checksum: str, chunks: list[di
     """
     if not chunks:
         return []
+
+    if is_rag_core_api_mode():
+        payload = get_rag_core_client().prepare_indexing(
+            document_id=document_id,
+            checksum=checksum,
+            chunks=chunks,
+            store_embeddings_in_metadata=vector_store.should_store_embeddings_in_database(),
+            index_provider=settings.vector_store_provider,
+        )
+        prepared = payload.get("prepared_chunks") or []
+        if not isinstance(prepared, list):
+            raise ValueError("rag-core prepare_indexing returned invalid prepared_chunks.")
+        logger.info(
+            "prepare_chunks_for_indexing delegated to rag-core API: document_id=%d chunks=%d",
+            document_id,
+            len(prepared),
+        )
+        return prepared
 
     provider = get_embedding_provider()
     provider_meta = provider.meta
@@ -236,7 +255,7 @@ def _extract_pdf(content: bytes) -> str:
             [b for b in blocks if b[6] == 0 and b[4].strip()],  # type==0 → text block
             key=lambda b: (round(b[1] / 10) * 10, b[0]),
         )
-        parts = [f"[Page {page_num}]"] + [b[4].strip() for b in blocks_sorted]
+        parts = [f"<<PAGE:{page_num}>>"] + [b[4].strip() for b in blocks_sorted]
 
         # Extract and caption embedded images when enabled
         if settings.llm_image_captioning_enabled:
@@ -1130,4 +1149,3 @@ def backfill_documents_storage(
         "total_vector_points": total_vector_points,
         "results": results,
     }
-

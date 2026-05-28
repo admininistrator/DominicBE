@@ -307,10 +307,9 @@ async def lifespan(app: FastAPI):
         settings.auth_access_token_expire_minutes,
     )
     logger.info("litellm package version = %s", _get_package_version("litellm"))
-    logger.info("GITHUB_COPILOT_API_KEY set = %s", bool(settings.github_copilot_api_key))
-    logger.info("MODEL_GITHUB_COPILOT = %s", settings.github_copilot_model_name)
-    logger.info("LLM_MODEL = %s", settings.llm_model or "(resolved from MODEL_GITHUB_COPILOT)")
-    logger.info("NINEROUTER_BASE_URL = %s", settings.ninerouter_base_url)
+    logger.info("NINEROUTER_API_KEY set = %s", bool(settings.ninerouter_api_key))
+    logger.info("LLM_DEFAULT_PROVIDER = %s", settings.llm_default_provider)
+    logger.info("LLM_DEFAULT_MODEL = %s", settings.llm_default_model)
     logger.info("LLM_CONTEXT_WINDOW = %s", settings.llm_context_window)
     if settings.auth_secret_key == "change-this-in-production":
         logger.warning(
@@ -526,11 +525,13 @@ def debug_env(current_user=Depends(get_current_user_optional)):
         "db_name": settings.db_name,
         "db_user": settings.db_user,
         "db_password_set": bool(settings.db_password),
-        "github_copilot_api_key_set": bool(settings.github_copilot_api_key),
-        "default_chat_model": settings.github_copilot_model_name,
-        "llm_model": settings.llm_model or "(resolved from MODEL_GITHUB_COPILOT)",
-        "supported_chat_models": settings.supported_chat_models,
-        "ninerouter_base_url": settings.ninerouter_base_url,
+        "ninerouter_api_key_set": bool(settings.ninerouter_api_key),
+        "llm_default_provider": settings.llm_default_provider,
+        "llm_default_model": settings.llm_default_model,
+        "llm_provider_catalog_configured": bool(
+            settings.llm_provider_catalog_json.strip()
+            or settings.llm_provider_catalog_file.strip()
+        ),
         "llm_context_window": settings.llm_context_window,
         "db_url_masked": _mask_db_url(settings.sqlalchemy_database_url),
     }

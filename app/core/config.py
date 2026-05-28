@@ -1,4 +1,5 @@
 from functools import lru_cache
+import os
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote_plus, urlparse
@@ -136,28 +137,33 @@ class Settings(BaseSettings):
         alias="MIGRATION_VALIDATION_MODE",
     )
 
-    # ── 9router-backed LiteLLM settings ──────────────────────────────────────
-    llm_model: str = Field(default="", alias="LLM_MODEL")
-    llm_vision_model: str = Field(default="", alias="LLM_VISION_MODEL")
+    # OpenAI-compatible LLM provider registry.
+    llm_default_provider: str = Field(default="ninerouter", alias="LLM_DEFAULT_PROVIDER")
+    llm_default_model: str = Field(default="gpt-5.4", alias="LLM_DEFAULT_MODEL")
+    llm_provider_catalog_json: str = Field(default="", alias="LLM_PROVIDER_CATALOG_JSON")
+    llm_provider_catalog_file: str = Field(default="", alias="LLM_PROVIDER_CATALOG_FILE")
     llm_context_window: int = Field(default=200000, alias="LLM_CONTEXT_WINDOW", ge=1)
-    llm_reasoning_effort: str = Field(default="", alias="LLM_REASONING_EFFORT")
-    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
-    openai_base_url: str | None = Field(default=None, alias="OPENAI_BASE_URL")
-    gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
-    github_copilot_api_key: str = Field(default="", alias="GITHUB_COPILOT_API_KEY")
-    github_copilot_model_name: str = Field(default="gpt-5.4", alias="MODEL_GITHUB_COPILOT")
-    supported_chat_models_raw: str = Field(
-        default="gpt-5.3-codex,gpt-5.4,gemini-3.1-pro-preview,claude-haiku-4.5,gpt-5.4-mini,claude-sonnet-4.6,claude-opus-4.6,deepseek-v4-pro,kc/nvidia/nemotron-3-super-120b-a12b:free,kc/moonshotai/kimi-k2.6,kc/inclusionai/ling-2.6-1t:free,kc/qwen/qwen3.6-plus,kc/minimax/minimax-m2.7",
-        alias="SUPPORTED_CHAT_MODELS",
-    )
     ninerouter_base_url: str = Field(
         default="http://127.0.0.1:20128/v1",
         alias="NINEROUTER_BASE_URL",
     )
-    deepseek_v4_pro_target: str = Field(
-        default="kc/deepseek/deepseek-chat",
-        alias="DEEPSEEK_V4_PRO_TARGET",
-    )
+    ninerouter_api_key: str = Field(default="", alias="NINEROUTER_API_KEY")
+    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1", alias="OPENROUTER_BASE_URL")
+    openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
+    commandcode_base_url: str = Field(default="", alias="COMMANDCODE_BASE_URL")
+    commandcode_api_key: str = Field(default="", alias="COMMANDCODE_API_KEY")
+    nvidia_base_url: str = Field(default="https://integrate.api.nvidia.com/v1", alias="NVIDIA_BASE_URL")
+    nvidia_api_key: str = Field(default="", alias="NVIDIA_API_KEY")
+    groq_base_url: str = Field(default="https://api.groq.com/openai/v1", alias="GROQ_BASE_URL")
+    groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
+    ollama_base_url: str = Field(default="http://localhost:11434/v1", alias="OLLAMA_BASE_URL")
+    ollama_api_key: str = Field(default="", alias="OLLAMA_API_KEY")
+    lmstudio_base_url: str = Field(default="http://localhost:1234/v1", alias="LMSTUDIO_BASE_URL")
+    lmstudio_api_key: str = Field(default="", alias="LMSTUDIO_API_KEY")
+    vllm_base_url: str = Field(default="http://localhost:8000/v1", alias="VLLM_BASE_URL")
+    vllm_api_key: str = Field(default="", alias="VLLM_API_KEY")
+    custom_openai_base_url: str = Field(default="", alias="CUSTOM_OPENAI_BASE_URL")
+    custom_openai_api_key: str = Field(default="", alias="CUSTOM_OPENAI_API_KEY")
 
     # Vision / image features
     llm_vision_enabled: bool = Field(default=True, alias="LLM_VISION_ENABLED")
@@ -211,7 +217,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Prompt caching hook retained for compatibility; current 9router flow is a no-op.
+    # Prompt caching hook retained for compatibility; current OpenAI-compatible flow is a no-op.
     llm_prompt_caching_enabled: bool = Field(default=True, alias="LLM_PROMPT_CACHING_ENABLED")
     llm_prompt_caching_min_chars: int = Field(
         default=3000,
@@ -423,6 +429,11 @@ class Settings(BaseSettings):
         le=86400,
     )
 
+    rag_core_mode: Literal["library", "api"] = Field(default="library", alias="RAG_CORE_MODE")
+    rag_core_base_url: str = Field(default="http://rag-core:8010", alias="RAG_CORE_BASE_URL")
+    rag_core_api_key: str = Field(default="", alias="RAG_CORE_API_KEY")
+    rag_core_timeout_seconds: float = Field(default=60.0, alias="RAG_CORE_TIMEOUT_SECONDS", ge=1.0)
+
     # Phase 6: audit log
     audit_log_enabled: bool = Field(default=True, alias="AUDIT_LOG_ENABLED")
 
@@ -455,13 +466,31 @@ class Settings(BaseSettings):
         normalized = (self.cors_allow_origin_regex_raw or "").strip()
         return normalized or None
 
-    @property
-    def supported_chat_models(self) -> list[str]:
-        return [
-            item.strip()
-            for item in self.supported_chat_models_raw.split(",")
-            if item.strip()
-        ]
+    def get_llm_runtime_env(self, env_name: str) -> str:
+        normalized = (env_name or "").strip().upper()
+        if not normalized:
+            return ""
+        known_values = {
+            "NINEROUTER_BASE_URL": self.ninerouter_base_url,
+            "NINEROUTER_API_KEY": self.ninerouter_api_key,
+            "OPENROUTER_BASE_URL": self.openrouter_base_url,
+            "OPENROUTER_API_KEY": self.openrouter_api_key,
+            "COMMANDCODE_BASE_URL": self.commandcode_base_url,
+            "COMMANDCODE_API_KEY": self.commandcode_api_key,
+            "NVIDIA_BASE_URL": self.nvidia_base_url,
+            "NVIDIA_API_KEY": self.nvidia_api_key,
+            "GROQ_BASE_URL": self.groq_base_url,
+            "GROQ_API_KEY": self.groq_api_key,
+            "OLLAMA_BASE_URL": self.ollama_base_url,
+            "OLLAMA_API_KEY": self.ollama_api_key,
+            "LMSTUDIO_BASE_URL": self.lmstudio_base_url,
+            "LMSTUDIO_API_KEY": self.lmstudio_api_key,
+            "VLLM_BASE_URL": self.vllm_base_url,
+            "VLLM_API_KEY": self.vllm_api_key,
+            "CUSTOM_OPENAI_BASE_URL": self.custom_openai_base_url,
+            "CUSTOM_OPENAI_API_KEY": self.custom_openai_api_key,
+        }
+        return str(known_values.get(normalized) or os.environ.get(normalized, "")).strip()
 
     @property
     def sqlalchemy_database_url(self) -> str:
@@ -486,4 +515,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-

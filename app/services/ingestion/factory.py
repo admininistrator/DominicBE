@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 
-from app.core.config import settings
 from app.services.ingestion.base import IngestionPipeline, IngestionPipelineError
 from rag_core.chunking.factory import get_ingestion_pipeline as _rag_core_get_ingestion_pipeline
 
@@ -38,6 +37,8 @@ def get_ingestion_pipeline(
         IngestionPipelineError: If the pipeline name is unknown or if the
             required dependency (e.g. llama-index-core) is not installed.
     """
+    from app.core.config import settings
+
     return _rag_core_get_ingestion_pipeline(
         pipeline=(pipeline or settings.ingestion_pipeline or "custom"),
         chunk_size=chunk_size or settings.chunk_size,

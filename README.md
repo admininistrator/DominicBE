@@ -85,6 +85,16 @@ Backend FastAPI cho Dominic. Ở thời điểm hiện tại repo này đã có 
 
 Repo hiện có sẵn stack local mẫu tại `deploy/docker-compose.local-rag.yml` và file env mẫu tại `.env.local-rag.example`.
 
+Stack local này cũng dựng `rag-core` như một service riêng tại `http://127.0.0.1:8010`. Nếu backend chạy trực tiếp trên Windows và muốn dùng API mode, đặt:
+
+```env
+RAG_CORE_MODE=api
+RAG_CORE_BASE_URL=http://127.0.0.1:8010
+RAG_CORE_API_KEY=local-rag-core-dev-key
+```
+
+Nếu muốn rollback nhanh về đường in-process cũ, đặt `RAG_CORE_MODE=library`.
+
 Quy ước môi trường cho backend:
 
 - Chỉ dùng một Python env duy nhất của repo: `c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe`
@@ -122,6 +132,7 @@ c:/Users/Admin/Documents/GitHub/DominicBE/.venv/Scripts/python.exe -m uvicorn ap
   - Qdrant API: `http://127.0.0.1:6333/dashboard`
   - MinIO API: `http://127.0.0.1:9000`
   - MinIO Console: `http://127.0.0.1:9001`
+  - rag-core API: `http://127.0.0.1:8010/health`
 8. Tài khoản mặc định của MinIO local mẫu:
   - access key: `minioadmin`
   - secret key: `minioadmin123`
@@ -204,6 +215,67 @@ Content-Type: application/json
 
 Response trả về số document được chọn, số thành công/thất bại, tổng vector points đã upsert, và kết quả chi tiết theo từng document.
 
+### RAG retrieval quality metadata, section retrieval, và re-index/backfill
+
+Các thay đổi RAG retrieval quality hiện tại là additive và không yêu cầu schema migration. Retrieval/chat metadata có thể bao gồm:
+
+- `rag_mode`: `direct_chat`, `document_rag`, `session_rag`, `section_rag`, hoặc `indexing_pending`
+- `retrieval_scope`: `none`, `document`, `session`, hoặc `global`
+- `selected_document_id`, `session_id`, `section_key`, `section_confidence`
+- `vector_store_attempted`, `vector_store_failed`, `vector_store_error_type`, `fallback_reason`
+
+Khi tài liệu mới được ingest hoặc tài liệu cũ được re-index bằng custom pipeline, chunk metadata có thể có thêm `section_key`, `section_title`, `section_level`, `section_order`, `page_number`, `page_range`, `char_start`, và `char_end`. Các trường này được dùng để trả lời câu hỏi dạng section-level, ví dụ `Bài thực hành số 4 có mấy bài, tóm tắt từng bài`, bằng `rag_mode=section_rag` và evidence được sắp theo đúng thứ tự chunk trong section.
+
+Lưu ý quan trọng cho dữ liệu cũ:
+
+- Các indexed document cũ không tự động có `section_key`, `page_number`, `page_range`, `char_start`, hoặc `char_end`.
+- Section/page/span metadata chỉ xuất hiện sau khi tài liệu được ingest mới hoặc re-index từ `raw_text` hiện có.
+- Nếu document không còn `raw_text`, không đoán metadata từ các chunk cũ; hãy re-upload hoặc khôi phục source text rồi ingest/re-index.
+- Session-bound chat không fallback sang global document khi session document chưa indexed; đây là safety fix có chủ ý. Metadata sẽ thể hiện `rag_mode=indexing_pending` và `fallback_reason=no_indexed_session_documents`.
+
+Dry-run kiểm tra document cũ cần re-index để có section/span/page metadata:
+
+```powershell
+C:\Users\Admin\Documents\DominicChatbot\DominicBE\.venv\Scripts\python.exe scripts\backfill_section_metadata.py --dry-run --limit 50
+```
+
+Chỉ kiểm tra một document:
+
+```powershell
+C:\Users\Admin\Documents\DominicChatbot\DominicBE\.venv\Scripts\python.exe scripts\backfill_section_metadata.py --dry-run --document-id 8
+```
+
+Apply re-index theo batch sau khi dry-run đã được review:
+
+```powershell
+C:\Users\Admin\Documents\DominicChatbot\DominicBE\.venv\Scripts\python.exe scripts\backfill_section_metadata.py --apply --limit 50
+```
+
+Flow này gọi cùng re-index pipeline với endpoint `POST /api/v1/knowledge/documents/{doc_id}/reindex`, nên chunk content/vector sẽ được tạo lại từ `raw_text` và metadata mới sẽ được tính lại một cách idempotent. Dùng `--owner <username>` hoặc `--document-id <id>` để giữ batch nhỏ và không mở rộng phạm vi ngoài owner/document được chọn.
+
+Smoke/golden coverage:
+
+- `scripts/knowledge_smoke_test.py` ingest tài liệu synthetic mới có heading `Bài thực hành số 4`, xác nhận chunk metadata có `section_key=bai-thuc-hanh-so-4`, và xác nhận `/api/v1/knowledge/search` trả `rag_mode=section_rag` cho câu hỏi count/summary.
+- `scripts/rag_chat_smoke_test.py` xác nhận grounded chat vẫn hoạt động và thêm kiểm tra chat section-level với cùng tài liệu synthetic.
+- `scripts/data/rag_golden_set.json` có thêm case Vietnamese `Bài thực hành số 4 có mấy bài, tóm tắt từng bài` và English `Practice Lesson 4`; các case này yêu cầu fresh ingestion hoặc re-index/backfill trước khi chạy trên dữ liệu lâu đời.
+
+Rollout khuyến nghị:
+
+1. Deploy code và chạy regression/smoke trên môi trường staging với document ingest mới.
+2. Chạy `backfill_section_metadata.py --dry-run` để ước lượng số document cần re-index và các document thiếu `raw_text`.
+3. Re-index theo batch nhỏ bằng `--apply --limit <n>` hoặc endpoint reindex từng document; theo dõi lỗi và Qdrant/vector-store metrics.
+4. Chạy lại smoke/golden cases section-level sau mỗi batch đại diện.
+5. Monitor retrieval metadata: tỷ lệ `section_rag`, `indexing_pending`, `vector_store_failed`, và `fallback_reason`.
+
+SQLite/PostgreSQL JSON lookup caveat: MVP section lookup vẫn giữ DB/session/access-control filter ở backend và lọc metadata portable. Nếu production traffic cho section retrieval cao, có thể cân nhắc index PostgreSQL expression cho `metadata_json.section_key` sau khi đã xác nhận query shape bằng `EXPLAIN`. Ví dụ PostgreSQL-only, không áp dụng cho SQLite và không chạy như migration không guarded:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_knowledge_chunks_metadata_section_key
+ON knowledge_chunks ((metadata_json->>'section_key'));
+```
+
+Không cần xóa metadata khi rollback; có thể disable section retrieval branch hoặc bỏ qua các key JSON additive. Nếu cần rollback dữ liệu, re-index lại bằng pipeline cũ hoặc hard-delete/re-upload theo quy trình vận hành hiện có.
+
 ---
 
 ## Dockerized AWS deployment hiện tại
@@ -218,7 +290,10 @@ Response trả về số document được chọn, số thành công/thất bạ
 ### Chưa bao gồm trong stack này
 
 - `9router` chưa được đóng gói trong compose production này
-- nếu muốn chat hoạt động, bạn vẫn phải cấu hình `GITHUB_COPILOT_API_KEY` và `NINEROUTER_BASE_URL` thật
+- nếu muốn chat hoạt động, bạn phải cấu hình provider registry mặc định:
+  `LLM_DEFAULT_PROVIDER=ninerouter`, `LLM_DEFAULT_MODEL`, `NINEROUTER_BASE_URL`, và `NINEROUTER_API_KEY`
+- thêm provider/model OpenAI-compatible mới bằng `LLM_PROVIDER_CATALOG_JSON` và các env base URL/API key tương ứng; frontend lấy model picker từ `/api/v1/chat/models`
+- mỗi model trong `LLM_PROVIDER_CATALOG_JSON` có thể khai báo `contextWindow` và `maxOutputTokens`; nếu bỏ trống, backend dùng fallback `LLM_CONTEXT_WINDOW` và `MAX_OUTPUT_TOKENS`
 
 ### Cần làm tiếp khi triển khai
 
@@ -241,7 +316,7 @@ Nếu bạn triển khai trạng thái code hiện tại, hãy ưu tiên dùng g
 This backend is a FastAPI app using:
 - FastAPI + Gunicorn/Uvicorn
 - MySQL
-- LiteLLM provider layer (Anthropic mặc định)
+- OpenAI-compatible LLM provider registry (`9router` là provider mặc định)
 
 This guide is written for deploying to **AWS EC2 in Singapore (`ap-southeast-1`)**.
 It assumes:
@@ -491,6 +566,7 @@ DB_POOL_TIMEOUT=10
 
 CORS_ORIGINS=https://your-frontend-domain.com,http://localhost:5173
 ROLLING_WINDOW_HOURS=2
+LLM_CONTEXT_WINDOW=200000
 MAX_OUTPUT_TOKENS=5000
 HOST=0.0.0.0
 PORT=8000
@@ -917,6 +993,7 @@ This validates the current Phase 2 MVP:
 - chunking + local embedding metadata + `vector_id`
 - searchable chunks through `/api/knowledge/search`
 - document job history and reindex flow
+- RAG retrieval quality metadata for newly ingested section documents, including `section_key`, `char_start`, `rag_mode=section_rag`, and `retrieval_scope=document` for the synthetic `Bài thực hành số 4` coverage
 
 ### 18.10 Direct Anthropic diagnostic on EC2
 

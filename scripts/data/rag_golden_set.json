@@ -78,5 +78,29 @@
     "expected_document_id": null,
     "tags": ["warranty", "electronics", "coverage", "extended"],
     "difficulty": "medium"
+  },
+  {
+    "id": "eval-011-section-vi",
+    "query": "Bài thực hành số 4 có mấy bài, tóm tắt từng bài",
+    "context": "Bài thực hành số 4\n1. Nội dung bài một.\n2. Nội dung bài hai.\n3. Nội dung bài ba.",
+    "expected_document_id": null,
+    "expected_rag_mode": "section_rag",
+    "expected_section_key": "bai-thuc-hanh-so-4",
+    "expected_item_count": 3,
+    "requires_fresh_ingestion_or_reindex": true,
+    "tags": ["section", "vietnamese", "count", "summary", "synthetic-practice"],
+    "difficulty": "medium"
+  },
+  {
+    "id": "eval-012-section-en",
+    "query": "In Practice Lesson 4, how many tasks are listed and summarize each task",
+    "context": "Practice Lesson 4\n1. Prepare the worksheet.\n2. Submit the reflection.",
+    "expected_document_id": null,
+    "expected_rag_mode": "section_rag",
+    "expected_section_key": "practice-lesson-4",
+    "expected_item_count": 2,
+    "requires_fresh_ingestion_or_reindex": true,
+    "tags": ["section", "english", "count", "summary", "synthetic-practice"],
+    "difficulty": "medium"
   }
 ]

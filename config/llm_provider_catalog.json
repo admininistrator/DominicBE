@@ -1,0 +1,86 @@
+[
+    {
+        "id": "custom-openai",
+        "label": "Custom OpenAI Compatible",
+        "type": "openai-compatible",
+        "baseUrlEnv": "CUSTOM_OPENAI_BASE_URL",
+        "apiKeyEnv": "CUSTOM_OPENAI_API_KEY",
+        "enabled": true,
+        "models": [
+            {
+                "id": "deepseek-v4-pro",
+                "label": "DeepSeek V4 Pro",
+                "displayProvider": "DeepSeek",
+                "model": "deepseek/deepseek-v4-pro",
+                "enabled": false,
+                "default": false,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 4096,
+                "capabilities": {
+                    "reasoningEffort": {
+                        "enabled": false,
+                        "userConfigurable": false
+                    }
+                }
+            },
+            {
+                "id": "deepseek-v4-flash",
+                "label": "DeepSeek V4 Flash",
+                "displayProvider": "DeepSeek",
+                "model": "deepseek/deepseek-v4-flash",
+                "enabled": false,
+                "default": false,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 4096,
+                "capabilities": {
+                    "reasoningEffort": {
+                        "enabled": false,
+                        "userConfigurable": false
+                    }
+                }
+            }
+        ]
+    },
+    {
+        "id": "ninerouter",
+        "label": "Ninerouter",
+        "type": "openai-compatible",
+        "baseUrlEnv": "NINEROUTER_BASE_URL",
+        "apiKeyEnv": "NINEROUTER_API_KEY",
+        "enabled": true,
+        "models": [
+            {
+                "id": "deepseek-v4-flash",
+                "label": "DeepSeek V4 Flash",
+                "displayProvider": "DeepSeek",
+                "model": "cmc/deepseek/deepseek-v4-flash",
+                "enabled": true,
+                "default": true,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 4096,
+                "capabilities": {
+                    "reasoningEffort": {
+                        "enabled": false,
+                        "userConfigurable": false
+                    }
+                }
+            },
+            {
+                "id": "deepseek-v4-pro",
+                "label": "DeepSeek V4 Pro",
+                "displayProvider": "DeepSeek",
+                "model": "cmc/deepseek/deepseek-v4-pro",
+                "enabled": true,
+                "default": false,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 4096,
+                "capabilities": {
+                    "reasoningEffort": {
+                        "enabled": false,
+                        "userConfigurable": false
+                    }
+                }
+            }
+        ]
+    }
+]

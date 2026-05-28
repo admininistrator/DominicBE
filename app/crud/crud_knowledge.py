@@ -82,6 +82,7 @@ def list_documents(
     limit: int = 50,
     session_id: Optional[int] = None,
     session_id_filter: str = "all",
+    indexed_only: bool = False,
 ):
     """List documents for a user.
 
@@ -94,6 +95,8 @@ def list_documents(
         db.query(KnowledgeDocument)
         .filter(KnowledgeDocument.owner_username == owner_username, KnowledgeDocument.deleted_at.is_(None))
     )
+    if indexed_only:
+        query = query.filter(KnowledgeDocument.status == "indexed")
     if session_id_filter == "session" and session_id is not None:
         query = query.filter(KnowledgeDocument.session_id == session_id)
     elif session_id_filter == "global":
@@ -249,6 +252,121 @@ def list_searchable_chunks(
     elif session_scope == "global":
         query = query.filter(KnowledgeDocument.session_id.is_(None))
     return query.order_by(KnowledgeDocument.id.asc(), KnowledgeChunk.chunk_index.asc()).all()
+
+
+def list_available_sections(
+    db: Session,
+    owner_username: str,
+    document_id: int | None = None,
+    *,
+    session_id: int | None = None,
+    session_scope: str = "all",
+    indexed_only: bool = True,
+) -> list[dict]:
+    """Return distinct section metadata under the current owner/scope filters."""
+    rows = list_searchable_chunks(
+        db,
+        owner_username,
+        document_id=document_id,
+        session_id=session_id,
+        session_scope=session_scope,
+        indexed_only=indexed_only,
+    )
+    sections_by_key: dict[str, dict] = {}
+    for chunk, document in rows:
+        meta = ensure_json_mapping(chunk.metadata_json)
+        section_key = meta.get("section_key")
+        if not section_key:
+            continue
+        existing = sections_by_key.get(str(section_key))
+        order = int(meta.get("section_order") or 0)
+        if existing is None or order < int(existing.get("section_order") or 0):
+            sections_by_key[str(section_key)] = {
+                "section_key": str(section_key),
+                "section_title": meta.get("section_title"),
+                "section_level": meta.get("section_level"),
+                "section_order": order,
+                "document_id": int(document.id),
+                "session_id": document.session_id,
+            }
+    return sorted(sections_by_key.values(), key=lambda item: (int(item.get("document_id") or 0), int(item.get("section_order") or 0), item.get("section_key") or ""))
+
+
+def find_chunks_by_section_key(
+    db: Session,
+    owner_username: str,
+    section_key: str,
+    document_id: int | None = None,
+    *,
+    session_id: int | None = None,
+    session_scope: str = "all",
+    indexed_only: bool = True,
+) -> list[tuple[KnowledgeChunk, KnowledgeDocument]]:
+    """Fetch ordered chunks for one section, preserving owner/session/document filters."""
+    if not section_key:
+        return []
+    rows = list_searchable_chunks(
+        db,
+        owner_username,
+        document_id=document_id,
+        session_id=session_id,
+        session_scope=session_scope,
+        indexed_only=indexed_only,
+    )
+    matched = []
+    for chunk, document in rows:
+        meta = ensure_json_mapping(chunk.metadata_json)
+        if meta.get("section_key") == section_key:
+            matched.append((chunk, document))
+    return sorted(
+        matched,
+        key=lambda row: (
+            int(row[1].id),
+            int(ensure_json_mapping(row[0].metadata_json).get("char_start") or row[0].chunk_index or 0),
+            int(row[0].chunk_index or 0),
+        ),
+    )
+
+
+def get_adjacent_chunks(
+    db: Session,
+    owner_username: str,
+    anchor_chunk_ids: list[int],
+    *,
+    window: int = 1,
+    document_id: int | None = None,
+    session_id: int | None = None,
+    session_scope: str = "all",
+    indexed_only: bool = True,
+) -> list[tuple[KnowledgeChunk, KnowledgeDocument]]:
+    """Fetch neighbor chunks around anchors while preserving retrieval filters."""
+    if not anchor_chunk_ids or window <= 0:
+        return []
+
+    rows = list_searchable_chunks(
+        db,
+        owner_username,
+        document_id=document_id,
+        session_id=session_id,
+        session_scope=session_scope,
+        indexed_only=indexed_only,
+    )
+    anchor_ids = {int(chunk_id) for chunk_id in anchor_chunk_ids}
+    anchor_positions = {
+        (int(chunk.document_id), int(chunk.chunk_index))
+        for chunk, _document in rows
+        if int(chunk.id) in anchor_ids
+    }
+    if not anchor_positions:
+        return []
+
+    matched = []
+    for chunk, document in rows:
+        doc_id = int(chunk.document_id)
+        chunk_index = int(chunk.chunk_index)
+        if any(anchor_doc_id == doc_id and abs(anchor_index - chunk_index) <= window for anchor_doc_id, anchor_index in anchor_positions):
+            matched.append((chunk, document))
+    return sorted(matched, key=lambda row: (int(row[1].id), int(row[0].chunk_index or 0), int(row[0].id)))
 
 
 def has_indexed_documents_for_session(

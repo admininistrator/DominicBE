@@ -1,8 +1,8 @@
-"""Unified LLM provider layer using LiteLLM over 9router.
+"""Unified LLM provider layer over OpenAI-compatible providers.
 
-Chat and vision requests are normalized onto the OpenAI-compatible 9router
-gateway so the rest of the application can switch among a small allowlist of
-user-facing model names without changing call sites.
+Chat and vision requests are normalized through the provider registry so the
+rest of the application selects public model ids without seeing credentials,
+base URLs, or routing provider internals.
 
 Image processing pipeline (applied automatically):
     1. Resize  – longest side ≤ LLM_IMAGE_MAX_DIMENSION (default 1 568 px)
@@ -13,7 +13,7 @@ Image processing pipeline (applied automatically):
                  the vision model → significant token savings.
 
 Prompt caching hooks are retained for backward compatibility, but the current
-9router flow does not add provider-specific cache directives.
+OpenAI-compatible flow does not add provider-specific cache directives.
 """
 from __future__ import annotations
 
@@ -37,6 +37,11 @@ from litellm.exceptions import (
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services.llm_registry import (
+    LLMRegistryError,
+    OpenAICompatibleProviderRegistry,
+    RuntimeModelSelection,
+)
 
 logger = get_logger(__name__)
 
@@ -45,141 +50,37 @@ litellm.suppress_debug_info = True
 litellm.set_verbose = False
 
 
+def get_provider_registry() -> OpenAICompatibleProviderRegistry:
+    return OpenAICompatibleProviderRegistry.from_settings(settings)
+
+
+def get_public_model_catalog() -> dict[str, Any]:
+    return get_provider_registry().public_catalog()
+
+
+def validate_catalog_model_request(model: str | None, reasoning_effort: str | None = None) -> str | None:
+    return get_provider_registry().validate_catalog_model_request(model, reasoning_effort)
+
+
 # ── Model resolution ──────────────────────────────────────────────────────────
 
-DEFAULT_9ROUTER_MODEL = "gpt-5.4"
-
-MODEL_TARGET_ALIASES = {
-    "deepseek-v4-pro": "deepseek_v4_pro_target",
-}
-
-KILOCODE_REASONING_MODELS = {
+DIRECT_REASONING_CHAT_MODELS = {
     "openai/kc/moonshotai/kimi-k2.6",
     "openai/kc/qwen/qwen3.6-plus",
 }
 
-KILOCODE_REASONING_EFFORT_MAP = {
-    "instant": "none",
-    "thinking": "minimal",
-}
-
 
 def list_supported_chat_models() -> list[str]:
-    configured = settings.supported_chat_models
-    return configured or [DEFAULT_9ROUTER_MODEL]
-
-
-def _normalize_9router_model_name(model_name: str | None) -> str:
-    normalized = (model_name or "").strip()
-    if not normalized:
-        return ""
-    if normalized.startswith("openai/"):
-        normalized = normalized.split("/", 1)[1]
-    if normalized.startswith("gh/"):
-        normalized = normalized.split("/", 1)[1]
-    return normalized
-
-
-def _validate_9router_model_name(model_name: str | None) -> str:
-    normalized = _normalize_9router_model_name(model_name)
-    if not normalized:
-        return ""
-
-    supported = list_supported_chat_models()
-    if normalized not in supported:
-        raise RuntimeError(
-            "Unsupported chat model '%s'. Supported models: %s"
-            % (normalized, ", ".join(supported))
-        )
-    return normalized
-
-
-def _resolve_configured_model_name(model_name: str | None, *, source: str) -> str:
-    normalized = _normalize_9router_model_name(model_name)
-    if not normalized:
-        return ""
-
-    supported = list_supported_chat_models()
-    if normalized not in supported:
-        logger.warning(
-            "Ignoring unsupported configured model from %s: %s. Falling back to %s.",
-            source,
-            normalized,
-            DEFAULT_9ROUTER_MODEL,
-        )
-        return ""
-    return normalized
-
-
-def _to_litellm_model(model_name: str) -> str:
-    normalized = _normalize_9router_model_name(model_name)
-    if not normalized:
-        return ""
-
-    target_setting_name = MODEL_TARGET_ALIASES.get(normalized)
-    if target_setting_name:
-        configured_target = getattr(settings, target_setting_name, "")
-        target = (configured_target or "").strip()
-        if target:
-            return f"openai/{target}"
-
-    if "/" in normalized:
-        return f"openai/{normalized}"
-
-    return f"openai/gh/{normalized}"
-
-
-def _normalize_reasoning_effort(value: str | None) -> str | None:
-    normalized = (value or "").strip().lower()
-    return normalized or None
-
-
-def _provider_reasoning_effort(model_str: str, value: str | None) -> str | None:
-    normalized = _normalize_reasoning_effort(value)
-    if not normalized:
-        return None
-    if model_str in KILOCODE_REASONING_MODELS:
-        return KILOCODE_REASONING_EFFORT_MAP.get(normalized)
-    return normalized
-
-
-def _supports_reasoning_effort(model_str: str) -> bool:
-    return model_str.startswith("openai/gh/gpt-") or model_str in {
-        "openai/gh/claude-sonnet-4.6",
-        "openai/gh/claude-opus-4.6",
-    } or model_str in KILOCODE_REASONING_MODELS
+    return [model["id"] for model in get_public_model_catalog().get("models", [])]
 
 def resolve_model(model: str | None = None) -> str:
-    """Return the full LiteLLM model string for the 9router-backed chat model."""
-    explicit = _validate_9router_model_name(model)
-    if explicit:
-        return _to_litellm_model(explicit)
-
-    configured = _resolve_configured_model_name(settings.llm_model, source="LLM_MODEL")
-    if configured:
-        return _to_litellm_model(configured)
-
-    configured = _resolve_configured_model_name(
-        settings.github_copilot_model_name,
-        source="MODEL_GITHUB_COPILOT",
-    )
-    if configured:
-        return _to_litellm_model(configured)
-
-    return _to_litellm_model(DEFAULT_9ROUTER_MODEL)
+    """Return the LiteLLM model string resolved from the provider registry."""
+    return get_provider_registry().resolve_catalog_litellm_model(model)
 
 
 def resolve_vision_model(model: str | None = None) -> str:
-    """Return vision-capable model string."""
-    explicit = _validate_9router_model_name(model)
-    if explicit:
-        return _to_litellm_model(explicit)
-
-    configured = _resolve_configured_model_name(settings.llm_vision_model, source="LLM_VISION_MODEL")
-    if configured:
-        return _to_litellm_model(configured)
-
-    return resolve_model()
+    """Return vision-capable model string resolved from the provider registry."""
+    return get_provider_registry().resolve_catalog_litellm_model(model)
 
 
 # ── API key / extra kwargs per provider ──────────────────────────────────────
@@ -189,44 +90,27 @@ def _provider_name(model_str: str) -> str:
     return model_str.split("/")[0].lower() if "/" in model_str else "openai"
 
 
-def _provider_kwargs(model_str: str) -> dict[str, Any]:
-    """Inject 9router API credentials into the LiteLLM call."""
-    if not model_str.startswith("openai/"):
-        raise RuntimeError(
-            "Only 9router-backed 'openai/*' chat models are supported in this project."
-        )
-
-    api_key = (settings.github_copilot_api_key or "").strip() or (settings.openai_api_key or "").strip()
-    if not api_key:
-        raise RuntimeError(
-            "GITHUB_COPILOT_API_KEY is not set. Configure it in .env or environment variables."
-        )
-
-    base_url = (settings.ninerouter_base_url or "").strip() or (settings.openai_base_url or "").strip()
-    if not base_url:
-        raise RuntimeError(
-            "NINEROUTER_BASE_URL is not set. Configure it in .env or environment variables."
-        )
-
+def _provider_kwargs(selection: RuntimeModelSelection) -> dict[str, Any]:
+    """Inject selected OpenAI-compatible provider credentials into LiteLLM."""
     return {
-        "api_key": api_key,
-        "api_base": base_url,
+        "api_key": selection.api_key,
+        "api_base": selection.base_url,
     }
 
 
-def _uses_direct_9router_http(model_str: str) -> bool:
+def _uses_direct_responses_http(model_str: str) -> bool:
     return model_str.startswith("openai/gh/gemini-")
 
 
-def _uses_direct_9router_chat_http(model_str: str) -> bool:
+def _uses_direct_chat_http(model_str: str) -> bool:
     return model_str == "openai/kc/minimax/minimax-m2.7"
 
 
-def _uses_direct_9router_reasoning_chat_http(model_str: str, reasoning_effort: str | None) -> bool:
-    return model_str in KILOCODE_REASONING_MODELS and bool(reasoning_effort)
+def _uses_direct_openai_compatible_reasoning_chat_http(model_str: str, reasoning_effort: str | None) -> bool:
+    return model_str in DIRECT_REASONING_CHAT_MODELS and bool(reasoning_effort)
 
 
-def _extract_json_from_9router_response(response: requests.Response) -> dict[str, Any]:
+def _extract_json_from_openai_compatible_response(response: requests.Response) -> dict[str, Any]:
     try:
         return response.json()
     except ValueError:
@@ -244,7 +128,7 @@ def _extract_json_from_9router_response(response: requests.Response) -> dict[str
         except ValueError:
             continue
 
-    raise ValueError("9router response did not contain a valid JSON payload")
+    raise ValueError("OpenAI-compatible response did not contain a valid JSON payload")
 
 
 def _extract_text_for_token_estimate(content: Any) -> str:
@@ -284,7 +168,7 @@ def _estimate_token_count_from_messages(messages: list[dict[str, Any]]) -> int:
     return max(1, total_chars // max(1, settings.token_estimate_chars_per_token))
 
 
-def _complete_via_9router_http(
+def _complete_via_responses_http(
     *,
     model_str: str,
     call_messages: list[dict[str, Any]],
@@ -296,7 +180,7 @@ def _complete_via_9router_http(
     base_url = (extra_kwargs.get("api_base") or "").rstrip("/")
     api_key = (extra_kwargs.get("api_key") or "").strip()
     if not base_url or not api_key:
-        raise RuntimeError("Missing 9router credentials for direct Gemini call")
+        raise RuntimeError("Missing OpenAI-compatible credentials for direct responses call")
 
     payload: dict[str, Any] = {
         "model": model_str.split("openai/", 1)[1],
@@ -327,7 +211,7 @@ def _complete_via_9router_http(
         detail = response.text.strip()[:200] or "Yêu cầu không hợp lệ"
         raise LLMError(400, f"Yêu cầu không hợp lệ: {detail}")
 
-    data = _extract_json_from_9router_response(response)
+    data = _extract_json_from_openai_compatible_response(response)
     choices = data.get("choices") or []
     message = choices[0].get("message") if choices else {}
     usage = data.get("usage") or {}
@@ -348,7 +232,7 @@ def _complete_via_9router_http(
     }
 
 
-def _complete_via_9router_chat_http(
+def _complete_via_chat_http(
     *,
     model_str: str,
     call_messages: list[dict[str, Any]],
@@ -360,7 +244,7 @@ def _complete_via_9router_chat_http(
     base_url = (extra_kwargs.get("api_base") or "").rstrip("/")
     api_key = (extra_kwargs.get("api_key") or "").strip()
     if not base_url or not api_key:
-        raise RuntimeError("Missing 9router credentials for direct chat call")
+        raise RuntimeError("Missing OpenAI-compatible credentials for direct chat call")
 
     payload: dict[str, Any] = {
         "model": model_str.split("openai/", 1)[1],
@@ -393,7 +277,7 @@ def _complete_via_9router_chat_http(
         detail = response.text.strip()[:200] or "Yêu cầu không hợp lệ"
         raise LLMError(400, f"Yêu cầu không hợp lệ: {detail}")
 
-    data = _extract_json_from_9router_response(response)
+    data = _extract_json_from_openai_compatible_response(response)
     choices = data.get("choices") or []
     message = choices[0].get("message") if choices else {}
     usage = data.get("usage") or {}
@@ -492,7 +376,7 @@ def _preprocess_image(image_data: str | bytes, media_type: str) -> tuple[str | b
         return image_data, media_type, None
 
 
-# ── Prompt caching hook (currently a no-op for 9router) ─────────────────────
+# Prompt caching hook (currently a no-op for OpenAI-compatible providers)
 
 def _apply_prompt_caching(
     call_messages: list[dict],
@@ -539,8 +423,9 @@ def complete(
         {"text": str, "input_tokens": int, "output_tokens": int, "model": str,
          "cache_read_tokens": int, "cache_write_tokens": int}
     """
-    model_str = resolve_model(model) if not images else resolve_vision_model(model)
-    extra_kwargs = _provider_kwargs(model_str)
+    selection = get_provider_registry().select_model(model, reasoning_effort=reasoning_effort)
+    model_str = selection.litellm_model
+    extra_kwargs = _provider_kwargs(selection)
 
     # ── Image preprocessing ───────────────────────────────────────────────
     processed_images: list[str | bytes] = []
@@ -597,26 +482,23 @@ def complete(
     if temperature is not None:
         call_kwargs["temperature"] = temperature
 
-    effective_reasoning_effort = _normalize_reasoning_effort(reasoning_effort) or _normalize_reasoning_effort(settings.llm_reasoning_effort)
-    provider_reasoning_effort = _provider_reasoning_effort(model_str, effective_reasoning_effort)
-    if provider_reasoning_effort and _supports_reasoning_effort(model_str):
-        call_kwargs["reasoning_effort"] = provider_reasoning_effort
-        if model_str in {"openai/gh/claude-sonnet-4.6", "openai/gh/claude-opus-4.6"} | KILOCODE_REASONING_MODELS:
+    provider_reasoning_effort = selection.reasoning_effort
+    effective_reasoning_effort = provider_reasoning_effort
+    if provider_reasoning_effort:
+        if selection.reasoning_param_style == "openrouter_reasoning":
+            call_kwargs["reasoning"] = {"effort": provider_reasoning_effort}
+            call_kwargs["allowed_openai_params"] = ["reasoning"]
+        else:
+            call_kwargs["reasoning_effort"] = provider_reasoning_effort
             call_kwargs["allowed_openai_params"] = ["reasoning_effort"]
-    elif effective_reasoning_effort:
-        logger.info(
-            "Ignoring reasoning_effort=%s for unsupported model=%s",
-            effective_reasoning_effort,
-            model_str,
-        )
 
     logger.debug(
         "LiteLLM call model=%s messages=%d vision_imgs=%d ocr_imgs=%d max_tokens=%d",
         model_str, len(call_messages), len(processed_images), len(ocr_texts), max_tokens,
     )
 
-    if _uses_direct_9router_http(model_str):
-        return _complete_via_9router_http(
+    if _uses_direct_responses_http(model_str):
+        return _complete_via_responses_http(
             model_str=model_str,
             call_messages=call_messages,
             max_tokens=max_tokens,
@@ -624,11 +506,11 @@ def complete(
             reasoning_effort=effective_reasoning_effort,
             extra_kwargs=extra_kwargs,
         )
-    if _uses_direct_9router_chat_http(model_str) or _uses_direct_9router_reasoning_chat_http(
+    if _uses_direct_chat_http(model_str) or _uses_direct_openai_compatible_reasoning_chat_http(
         model_str,
         provider_reasoning_effort,
     ):
-        return _complete_via_9router_chat_http(
+        return _complete_via_chat_http(
             model_str=model_str,
             call_messages=call_messages,
             max_tokens=max_tokens,
@@ -766,7 +648,7 @@ def _extract_usage_from_stream_payload(payload: dict[str, Any]) -> tuple[int | N
     return normalized_input, normalized_output
 
 
-def _iter_9router_sse_payloads(response: requests.Response) -> Iterator[dict[str, Any]]:
+def _iter_openai_compatible_sse_payloads(response: requests.Response) -> Iterator[dict[str, Any]]:
     for raw_line in response.iter_lines(decode_unicode=True):
         if raw_line is None:
             continue
@@ -784,7 +666,7 @@ def _iter_9router_sse_payloads(response: requests.Response) -> Iterator[dict[str
             yield payload
 
 
-def _stream_via_9router_http(
+def _stream_via_responses_http(
     *,
     model_str: str,
     call_messages: list[dict[str, Any]],
@@ -797,7 +679,7 @@ def _stream_via_9router_http(
     base_url = (extra_kwargs.get("api_base") or "").rstrip("/")
     api_key = (extra_kwargs.get("api_key") or "").strip()
     if not base_url or not api_key:
-        raise RuntimeError("Missing 9router credentials for direct Gemini call")
+        raise RuntimeError("Missing OpenAI-compatible credentials for direct responses call")
 
     payload: dict[str, Any] = {
         "model": model_str.split("openai/", 1)[1],
@@ -836,7 +718,7 @@ def _stream_via_9router_http(
     response_model = model_str
 
     try:
-        for payload_chunk in _iter_9router_sse_payloads(response):
+        for payload_chunk in _iter_openai_compatible_sse_payloads(response):
             response_model = payload_chunk.get("model") or (payload_chunk.get("response") or {}).get("model") or response_model
             payload_input_tokens, payload_output_tokens = _extract_usage_from_stream_payload(payload_chunk)
             if payload_input_tokens is not None:
@@ -874,7 +756,7 @@ def _stream_via_9router_http(
     }
 
 
-def _stream_via_9router_chat_http(
+def _stream_via_chat_http(
     *,
     model_str: str,
     call_messages: list[dict[str, Any]],
@@ -886,7 +768,7 @@ def _stream_via_9router_chat_http(
     base_url = (extra_kwargs.get("api_base") or "").rstrip("/")
     api_key = (extra_kwargs.get("api_key") or "").strip()
     if not base_url or not api_key:
-        raise RuntimeError("Missing 9router credentials for direct chat call")
+        raise RuntimeError("Missing OpenAI-compatible credentials for direct chat call")
 
     payload: dict[str, Any] = {
         "model": model_str.split("openai/", 1)[1],
@@ -926,7 +808,7 @@ def _stream_via_9router_chat_http(
     response_model = model_str
 
     try:
-        for payload_chunk in _iter_9router_sse_payloads(response):
+        for payload_chunk in _iter_openai_compatible_sse_payloads(response):
             response_model = payload_chunk.get("model") or response_model
             payload_input_tokens, payload_output_tokens = _extract_usage_from_stream_payload(payload_chunk)
             if payload_input_tokens is not None:
@@ -964,8 +846,9 @@ def stream_complete(
     temperature: float | None = None,
     reasoning_effort: str | None = None,
 ) -> Iterator[dict[str, Any]]:
-    model_str = resolve_model(model) if not images else resolve_vision_model(model)
-    extra_kwargs = _provider_kwargs(model_str)
+    selection = get_provider_registry().select_model(model, reasoning_effort=reasoning_effort)
+    model_str = selection.litellm_model
+    extra_kwargs = _provider_kwargs(selection)
 
     processed_images: list[str | bytes] = []
     processed_media_types: list[str] = []
@@ -1014,26 +897,23 @@ def stream_complete(
     if temperature is not None:
         call_kwargs["temperature"] = temperature
 
-    effective_reasoning_effort = _normalize_reasoning_effort(reasoning_effort) or _normalize_reasoning_effort(settings.llm_reasoning_effort)
-    provider_reasoning_effort = _provider_reasoning_effort(model_str, effective_reasoning_effort)
-    if provider_reasoning_effort and _supports_reasoning_effort(model_str):
-        call_kwargs["reasoning_effort"] = provider_reasoning_effort
-        if model_str in {"openai/gh/claude-sonnet-4.6", "openai/gh/claude-opus-4.6"} | KILOCODE_REASONING_MODELS:
+    provider_reasoning_effort = selection.reasoning_effort
+    effective_reasoning_effort = provider_reasoning_effort
+    if provider_reasoning_effort:
+        if selection.reasoning_param_style == "openrouter_reasoning":
+            call_kwargs["reasoning"] = {"effort": provider_reasoning_effort}
+            call_kwargs["allowed_openai_params"] = ["reasoning"]
+        else:
+            call_kwargs["reasoning_effort"] = provider_reasoning_effort
             call_kwargs["allowed_openai_params"] = ["reasoning_effort"]
-    elif effective_reasoning_effort:
-        logger.info(
-            "Ignoring reasoning_effort=%s for unsupported model=%s",
-            effective_reasoning_effort,
-            model_str,
-        )
 
     logger.debug(
         "LiteLLM stream call model=%s messages=%d vision_imgs=%d ocr_imgs=%d max_tokens=%d",
         model_str, len(call_messages), len(processed_images), len(ocr_texts), max_tokens,
     )
 
-    if _uses_direct_9router_http(model_str):
-        yield from _stream_via_9router_http(
+    if _uses_direct_responses_http(model_str):
+        yield from _stream_via_responses_http(
             model_str=model_str,
             call_messages=call_messages,
             max_tokens=max_tokens,
@@ -1043,11 +923,11 @@ def stream_complete(
         )
         return
 
-    if _uses_direct_9router_chat_http(model_str) or _uses_direct_9router_reasoning_chat_http(
+    if _uses_direct_chat_http(model_str) or _uses_direct_openai_compatible_reasoning_chat_http(
         model_str,
         provider_reasoning_effort,
     ):
-        yield from _stream_via_9router_chat_http(
+        yield from _stream_via_chat_http(
             model_str=model_str,
             call_messages=call_messages,
             max_tokens=max_tokens,
@@ -1219,7 +1099,7 @@ def caption_image(
         result = complete(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=settings.llm_image_caption_max_tokens,
-            model=resolve_vision_model(model),
+            model=model,
             images=[final_bytes],
             image_media_types=[final_mt],
         )
@@ -1230,4 +1110,3 @@ def caption_image(
     except Exception as e:
         logger.warning("Image captioning unexpected error (non-fatal): %s", e)
         return ""
-
