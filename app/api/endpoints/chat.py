@@ -1,6 +1,6 @@
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db
@@ -215,14 +215,16 @@ def get_my_messages_by_session(
         raise_internal_server_error(logger, action="chat.get_my_messages_by_session", exc=e)
 
 
-@router.post("/", response_model=ChatResponse)
+@router.post("/", response_model=ChatResponse, response_model_exclude_none=True)
 def send_message(
     request: ChatRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    fastapi_request: Request = None,
 ):
     try:
         username = _assert_same_user(request.username, current_user)
+        mcp_client_manager = getattr(fastapi_request.app.state, "mcp_client_manager", None) if fastapi_request else None
         result = handle_chat(
             db,
             username,
@@ -234,6 +236,7 @@ def send_message(
             reasoning_effort=request.reasoning_effort,
             images=request.images or None,
             image_media_types=request.image_media_types or None,
+            mcp_client_manager=mcp_client_manager,
         )
         return ChatResponse(
             success=True,
@@ -243,6 +246,8 @@ def send_message(
             sources=result.get("sources") or [],
             assistant_meta=result.get("assistant_meta"),
             retrieval=result.get("retrieval"),
+            artifacts=result.get("artifacts"),
+            tool_results=result.get("tool_results"),
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -258,25 +263,28 @@ def send_message(
 
 @router.post("/stream")
 def stream_message(
-    request: ChatRequest,
+    request_body: ChatRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    request: Request = None,
 ):
-    username = _assert_same_user(request.username, current_user)
+    username = _assert_same_user(request_body.username, current_user)
+    mcp_client_manager = getattr(request.app.state, "mcp_client_manager", None) if request else None
 
     def event_stream():
         try:
             for event in handle_chat_stream(
                 db,
                 username,
-                request.session_id,
-                request.message,
-                knowledge_document_id=request.knowledge_document_id,
-                use_web_search=request.use_web_search,
-                model=request.model,
-                reasoning_effort=request.reasoning_effort,
-                images=request.images or None,
-                image_media_types=request.image_media_types or None,
+                request_body.session_id,
+                request_body.message,
+                knowledge_document_id=request_body.knowledge_document_id,
+                use_web_search=request_body.use_web_search,
+                model=request_body.model,
+                reasoning_effort=request_body.reasoning_effort,
+                images=request_body.images or None,
+                image_media_types=request_body.image_media_types or None,
+                mcp_client_manager=mcp_client_manager,
             ):
                 yield _sse_event(event["event"], event["data"])
         except PermissionError as e:

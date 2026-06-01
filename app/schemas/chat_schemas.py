@@ -1,7 +1,7 @@
 import base64
 import binascii
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
@@ -270,6 +270,24 @@ class AssistantMessageMeta(BaseModel):
     display_text: str | None = None
 
 
+class ArtifactResponse(BaseModel):
+    id: str
+    type: str
+    title: str
+    content: str | None = None
+    url: str | None = None
+    preview_url: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolResultResponse(BaseModel):
+    tool_server_id: str
+    tool_name: str
+    status: str
+    duration_ms: int
+    artifact_ids: list[str] = Field(default_factory=list)
+
+
 class ChatResponse(BaseModel):
     success: bool
     reply: str
@@ -278,6 +296,8 @@ class ChatResponse(BaseModel):
     sources: list[CitationSource] = Field(default_factory=list)
     assistant_meta: AssistantMessageMeta | None = None
     retrieval: RetrievalMetadata | None = None
+    artifacts: list[ArtifactResponse] | None = None
+    tool_results: list[ToolResultResponse] | None = None
 
 
 class UsageResponse(BaseModel):

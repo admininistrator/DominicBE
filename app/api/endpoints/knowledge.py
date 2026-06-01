@@ -57,6 +57,27 @@ def _audit(db: Session, actor: str, action: str, **kwargs):
         pass
 
 
+def _dispatch_ingestion_job_to_celery(document_id: int, job_id: int) -> str:
+    """Queue an ingestion job through Celery without importing worker code eagerly."""
+    from app.worker.tasks.ingestion import ingest_document_async
+
+    async_result = ingest_document_async.delay(document_id, job_id)
+    return str(async_result.id)
+
+
+def _queue_ingestion_job_in_celery(db: Session, record: dict) -> dict:
+    celery_task_id = _dispatch_ingestion_job_to_celery(
+        int(record["document_id"]),
+        int(record["job_id"]),
+    )
+    crud_knowledge.set_ingestion_job_celery_task_id(
+        db,
+        int(record["job_id"]),
+        celery_task_id,
+    )
+    return {**record, "status": "queued", "celery_task_id": celery_task_id}
+
+
 @router.get("/admin/analytics", response_model=RetrievalAnalyticsResponse)
 def get_admin_analytics(
     username: str | None = None,
@@ -133,9 +154,9 @@ async def upload_document(
 ):
     """Upload a file (txt, md, pdf, docx) and run ingestion pipeline.
 
-    Pass ``async_index=true`` to return immediately with ``status=pending`` and
-    run chunking + embedding in a background task.  Poll ``GET /jobs/{job_id}``
-    to track progress.
+    Pass ``async_index=true`` to return immediately with ``status=pending``
+    (or ``status=queued`` when Celery is enabled) and run chunking + embedding
+    out-of-band. Poll ``GET /jobs/{job_id}`` to track progress.
 
     Pass ``session_id`` to associate the document with a specific chat session.
     """
@@ -167,15 +188,23 @@ async def upload_document(
                 source_bytes=content,
                 source_filename=file.filename,
             )
-            background_tasks.add_task(
-                run_indexing_pipeline,
-                record["document_id"],
-                record["job_id"],
-                SessionLocal,
-            )
+            if settings.celery_enabled:
+                record = _queue_ingestion_job_in_celery(db, record)
+            else:
+                background_tasks.add_task(
+                    run_indexing_pipeline,
+                    record["document_id"],
+                    record["job_id"],
+                    SessionLocal,
+                )
             _audit(db, current_user.username, "document.upload",
                    resource_type="document", resource_id=record["document_id"],
-                   detail_json={"filename": file.filename, "async": True, "session_id": session_id})
+                   detail_json={
+                       "filename": file.filename,
+                       "async": True,
+                       "session_id": session_id,
+                       "celery_task_id": record.get("celery_task_id"),
+                   })
             return IngestionResult(**record)
         else:
             result = ingest_uploaded_file(
@@ -210,8 +239,9 @@ def ingest_text(
 ):
     """Ingest a document from raw text.
 
-    Pass ``async_index=true`` to return immediately and run indexing in the
-    background.  Poll ``GET /jobs/{job_id}`` to track progress.
+    Pass ``async_index=true`` to return immediately and run indexing
+    out-of-band via Celery when enabled, or FastAPI BackgroundTasks otherwise.
+    Poll ``GET /jobs/{job_id}`` to track progress.
 
     Pass ``session_id`` in the request body to associate with a chat session.
     """
@@ -231,12 +261,15 @@ def ingest_text(
                 metadata=request.metadata,
                 session_id=request.session_id,
             )
-            background_tasks.add_task(
-                run_indexing_pipeline,
-                record["document_id"],
-                record["job_id"],
-                SessionLocal,
-            )
+            if settings.celery_enabled:
+                record = _queue_ingestion_job_in_celery(db, record)
+            else:
+                background_tasks.add_task(
+                    run_indexing_pipeline,
+                    record["document_id"],
+                    record["job_id"],
+                    SessionLocal,
+                )
             return IngestionResult(**record)
         else:
             result = ingest_document(
@@ -429,9 +462,10 @@ def get_job(
     job = crud_knowledge.get_ingestion_job(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    # Verify ownership via document
+    # Verify ownership via document; admins may inspect any ingestion job.
     doc = crud_knowledge.get_document(db, job.document_id)
-    if not doc or doc.owner_username != current_user.username:
+    is_admin = getattr(current_user, "role", None) == "admin"
+    if not doc or (doc.owner_username != current_user.username and not is_admin):
         raise HTTPException(status_code=404, detail="Job not found.")
     return job
 

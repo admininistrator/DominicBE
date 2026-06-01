@@ -16,7 +16,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 
 from app.api.deps import get_current_user_optional
 from app.crud import crud_auth
-from app.api.endpoints import auth, chat, knowledge
+from app.api.endpoints import admin, auth, chat, knowledge
 from app.core.config import settings
 from app.core.database import SessionLocal, check_database_health, engine
 from app.core.logging import (
@@ -37,6 +37,7 @@ from app.core.rate_limit import (
     get_client_ip,
 )
 from app.services.knowledge_service import recover_pending_ingestion_jobs
+from app.services.mcp import McpClientManager, McpToolRegistry
 from app.services.object_storage import check_object_storage_health
 from app.services.vector_store import check_vector_store_health
 
@@ -232,6 +233,8 @@ RATE_LIMIT_ENTRY_TTL_SECONDS = max(
     default=settings.rate_limit_cleanup_interval_seconds,
 )
 RATE_LIMITER = build_rate_limiter(settings, session_factory=SessionLocal)
+MCP_CLIENT_MANAGER = McpClientManager.from_settings(settings)
+MCP_TOOL_REGISTRY = McpToolRegistry(MCP_CLIENT_MANAGER)
 
 
 def _get_package_version(name: str) -> str:
@@ -343,8 +346,17 @@ async def lifespan(app: FastAPI):
 
     _start_ingestion_recovery_worker()
 
+    app.state.mcp_client_manager = MCP_CLIENT_MANAGER
+    app.state.mcp_tool_registry = MCP_TOOL_REGISTRY
+    logger.info(
+        "MCP remote foundation enabled=%s servers=%s",
+        MCP_CLIENT_MANAGER.enabled,
+        len(MCP_CLIENT_MANAGER.config.servers),
+    )
+
     logger.info("=== %s ready ===", settings.app_name)
     yield
+    await MCP_CLIENT_MANAGER.shutdown_all()
     logger.info("=== %s shutting down ===", settings.app_name)
 
 
@@ -353,6 +365,8 @@ app = FastAPI(
     debug=settings.debug,
     lifespan=lifespan,
 )
+app.state.mcp_client_manager = MCP_CLIENT_MANAGER
+app.state.mcp_tool_registry = MCP_TOOL_REGISTRY
 
 app.add_middleware(
     CORSMiddleware,
@@ -540,3 +554,4 @@ def debug_env(current_user=Depends(get_current_user_optional)):
 _mount_api_router(router=auth.router, segment="auth", tags=["Auth"])
 _mount_api_router(router=chat.router, segment="chat", tags=["Chat"])
 _mount_api_router(router=knowledge.router, segment="knowledge", tags=["Knowledge"])
+_mount_api_router(router=admin.router, segment="admin", tags=["Admin"])

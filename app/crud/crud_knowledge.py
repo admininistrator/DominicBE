@@ -415,6 +415,17 @@ def update_ingestion_job_status(
     return job
 
 
+def set_ingestion_job_celery_task_id(
+    db: Session, job_id: int, task_id: str | None
+) -> Optional[IngestionJob]:
+    job = get_ingestion_job(db, job_id)
+    if job:
+        job.celery_task_id = task_id
+        db.commit()
+        db.refresh(job)
+    return job
+
+
 def list_ingestion_jobs(db: Session, document_id: int):
     return (
         db.query(IngestionJob)

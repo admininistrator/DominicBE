@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote_plus, urlparse
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -68,6 +68,17 @@ class Settings(BaseSettings):
         alias="RATE_LIMIT_AUTH_REGISTER_WINDOW_SECONDS",
         ge=1,
     )
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug_mode(cls, value):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "prod", "production"}:
+                return False
+            if normalized in {"debug", "dev", "development"}:
+                return True
+        return value
     rate_limit_auth_reset_password_requests: int = Field(
         default=5,
         alias="RATE_LIMIT_AUTH_RESET_PASSWORD_REQUESTS",
@@ -396,6 +407,26 @@ class Settings(BaseSettings):
         ge=1.0,
         le=60.0,
     )
+
+    # Remote MCP (Model Context Protocol) foundation. Disabled by default so
+    # existing chat behavior remains unchanged unless explicitly enabled.
+    mcp_enabled: bool = Field(default=False, alias="MCP_ENABLED")
+    mcp_remote_enabled: bool = Field(default=True, alias="MCP_REMOTE_ENABLED")
+    mcp_config_file: str = Field(default="config/mcp_servers.json", alias="MCP_CONFIG_FILE")
+    mcp_timeout_seconds: float = Field(default=30.0, alias="MCP_TIMEOUT_SECONDS", ge=0.1)
+    mcp_max_retries: int = Field(default=2, alias="MCP_MAX_RETRIES", ge=0, le=10)
+    mcp_tool_invocation_enabled: bool = Field(
+        default=True,
+        alias="MCP_TOOL_INVOCATION_ENABLED",
+    )
+    mcp_artifact_storage_mode: Literal["inline", "local", "s3"] = Field(
+        default="inline",
+        alias="MCP_ARTIFACT_STORAGE_MODE",
+    )
+    mcp_total_budget_seconds: float = Field(default=60.0, alias="MCP_TOTAL_BUDGET_SECONDS", ge=0.1)
+    mcp_tool_cache_ttl_seconds: float = Field(default=300.0, alias="MCP_TOOL_CACHE_TTL_SECONDS", ge=0.0)
+    mcp_max_artifact_content_bytes: int = Field(default=512000, alias="MCP_MAX_ARTIFACT_CONTENT_BYTES", ge=1024)
+
     chunk_size: int = Field(default=800, alias="CHUNK_SIZE", ge=100)
     chunk_overlap: int = Field(default=100, alias="CHUNK_OVERLAP", ge=0)
     knowledge_max_upload_size_mb: int = Field(
@@ -415,6 +446,35 @@ class Settings(BaseSettings):
     object_storage_local_path: str = Field(
         default=str(PROJECT_ROOT / ".storage"),
         alias="OBJECT_STORAGE_LOCAL_PATH",
+    )
+
+    # Redis/Celery worker configuration. These settings are the single source
+    # of truth for Celery modules; worker code must not read env vars directly.
+    celery_enabled: bool = Field(default=False, alias="CELERY_ENABLED")
+    celery_broker_url: str = Field(
+        default="redis://127.0.0.1:6379/0",
+        alias="CELERY_BROKER_URL",
+    )
+    celery_result_backend: str = Field(
+        default="redis://127.0.0.1:6379/1",
+        alias="CELERY_RESULT_BACKEND",
+    )
+    celery_task_always_eager: bool = Field(default=False, alias="CELERY_TASK_ALWAYS_EAGER")
+    celery_task_soft_time_limit: int = Field(
+        default=300,
+        validation_alias=AliasChoices(
+            "CELERYD_TASK_SOFT_TIME_LIMIT",
+            "CELERY_TASK_SOFT_TIME_LIMIT_SECONDS",
+        ),
+        ge=1,
+    )
+    celery_task_time_limit: int = Field(
+        default=600,
+        validation_alias=AliasChoices(
+            "CELERYD_TASK_TIME_LIMIT",
+            "CELERY_TASK_TIME_LIMIT_SECONDS",
+        ),
+        ge=1,
     )
 
     # Phase 6: retry policy for background indexing
@@ -450,7 +510,21 @@ class Settings(BaseSettings):
             raise ValueError("Hybrid retrieval weights must sum to a positive value")
         if self.migration_validation_mode not in {"warn", "strict"}:
             raise ValueError("MIGRATION_VALIDATION_MODE must be either 'warn' or 'strict'")
+        if self.celery_task_time_limit < self.celery_task_soft_time_limit:
+            raise ValueError(
+                "CELERYD_TASK_TIME_LIMIT must be >= CELERYD_TASK_SOFT_TIME_LIMIT"
+            )
         return self
+
+    @property
+    def celery_task_soft_time_limit_seconds(self) -> int:
+        """Backward-compatibility alias for celery_task_soft_time_limit."""
+        return self.celery_task_soft_time_limit
+
+    @property
+    def celery_task_time_limit_seconds(self) -> int:
+        """Backward-compatibility alias for celery_task_time_limit."""
+        return self.celery_task_time_limit
 
     @property
     def cors_origins(self) -> list[str]:

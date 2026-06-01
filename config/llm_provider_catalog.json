@@ -11,8 +11,8 @@
                 "id": "deepseek-v4-pro",
                 "label": "DeepSeek V4 Pro",
                 "displayProvider": "DeepSeek",
-                "model": "deepseek/deepseek-v4-pro",
-                "enabled": false,
+                "model": "deepseek-v4-pro",
+                "enabled": true,
                 "default": false,
                 "contextWindow": 1000000,
                 "maxOutputTokens": 4096,
@@ -27,9 +27,9 @@
                 "id": "deepseek-v4-flash",
                 "label": "DeepSeek V4 Flash",
                 "displayProvider": "DeepSeek",
-                "model": "deepseek/deepseek-v4-flash",
-                "enabled": false,
-                "default": false,
+                "model": "deepseek-v4-flash",
+                "enabled": true,
+                "default": true,
                 "contextWindow": 1000000,
                 "maxOutputTokens": 4096,
                 "capabilities": {
@@ -47,7 +47,7 @@
         "type": "openai-compatible",
         "baseUrlEnv": "NINEROUTER_BASE_URL",
         "apiKeyEnv": "NINEROUTER_API_KEY",
-        "enabled": true,
+        "enabled": false,
         "models": [
             {
                 "id": "deepseek-v4-flash",
@@ -57,7 +57,7 @@
                 "enabled": true,
                 "default": true,
                 "contextWindow": 1000000,
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": 128000,
                 "capabilities": {
                     "reasoningEffort": {
                         "enabled": false,
@@ -73,7 +73,55 @@
                 "enabled": true,
                 "default": false,
                 "contextWindow": 1000000,
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": 128000,
+                "capabilities": {
+                    "reasoningEffort": {
+                        "enabled": false,
+                        "userConfigurable": false
+                    }
+                }
+            },
+            {
+                "id": "mimo-v2.5",
+                "label": "Mimo V2.5",
+                "displayProvider": "Xiaomi",
+                "model": "cmc/xiaomi/mimo-v2.5",
+                "enabled": true,
+                "default": false,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 128000,
+                "capabilities": {
+                    "reasoningEffort": {
+                        "enabled": false,
+                        "userConfigurable": false
+                    }
+                }
+            },
+            {
+                "id": "mimo-v2.5-pro",
+                "label": "Mimo V2.5 Pro",
+                "displayProvider": "Xiaomi",
+                "model": "cmc/xiaomi/mimo-v2.5-pro",
+                "enabled": true,
+                "default": false,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 128000,
+                "capabilities": {
+                    "reasoningEffort": {
+                        "enabled": false,
+                        "userConfigurable": false
+                    }
+                }
+            },
+            {
+                "id": "qwen-3.7-max",
+                "label": "Qwen 3.7 Max",
+                "displayProvider": "Alibaba",
+                "model": "cmc/Qwen/Qwen3.7-Max",
+                "enabled": true,
+                "default": false,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 128000,
                 "capabilities": {
                     "reasoningEffort": {
                         "enabled": false,

@@ -76,6 +76,167 @@ Backend FastAPI cho Dominic. Ở thời điểm hiện tại repo này đã có 
 
 ### Storage architecture đã sẵn sàng trong code
 
+## Remote MCP (Model Context Protocol) Integration
+
+### Overview
+
+The backend has integrated **Remote MCP** support, enabling the backend to act as an MCP client and invoke remote MCP tool servers. The first integration is **Excalidraw** (`https://mcp.excalidraw.com`), but the architecture supports N MCP remote servers via a generic registry.
+
+**Key design principles:**
+- Backend-only: the frontend never calls MCP remotes directly.
+- Registry-driven: adding a new MCP server requires only a config entry + optional adapter.
+- Backward compatible: MCP artifacts are delivered as optional `artifacts`/`tool_results` fields in the SSE `final` event. Old frontends simply ignore unknown fields.
+- Disabled by default: `MCP_ENABLED=false` produces zero behavioral change.
+
+### Configuration
+
+**Global MCP settings** (in `.env`):
+```
+MCP_ENABLED=false
+MCP_REMOTE_ENABLED=true
+MCP_TIMEOUT_SECONDS=30
+MCP_MAX_RETRIES=2
+MCP_TOOL_INVOCATION_ENABLED=true
+MCP_ARTIFACT_STORAGE_MODE=inline
+MCP_TOTAL_BUDGET_SECONDS=60
+MCP_TOOL_CACHE_TTL_SECONDS=300
+MCP_MAX_ARTIFACT_CONTENT_BYTES=512000
+```
+
+**Server registry** (in `config/mcp_servers.json`):
+```json
+{
+  "servers": [
+    {
+      "id": "excalidraw",
+      "label": "Excalidraw Whiteboard",
+      "url": "https://mcp.excalidraw.com",
+      "enabled": true,
+      "auth_strategy": null,
+      "auth_secret_env": null,
+      "timeout_seconds": 30,
+      "tool_allowlist": [],
+      "artifact_capabilities": ["excalidraw_json", "link", "svg", "png_url"],
+      "health_check_interval_seconds": 300,
+      "tags": ["drawing", "diagramming"]
+    }
+  ]
+}
+```
+
+**Per-server env overrides** (optional):
+```
+MCP_SERVER_EXCALIDRAW_ENABLED=true
+MCP_SERVER_EXCALIDRAW_URL=https://mcp.excalidraw.com
+MCP_SERVER_EXCALIDRAW_TIMEOUT=30
+MCP_SERVER_EXCALIDRAW_TOOL_ALLOWLIST=create-excalidraw,export-image
+MCP_SERVER_EXCALIDRAW_AUTH_STRATEGY=bearer
+MCP_SERVER_EXCALIDRAW_AUTH_SECRET_ENV=MCP_EXCALIDRAW_AUTH_TOKEN
+```
+
+### Architecture
+
+The MCP module lives under `app/services/mcp/`:
+
+```
+app/services/mcp/
+├── __init__.py            # Public API (get_mcp_client_manager, normalize_tool_result)
+├── config.py              # McpServerConfig, McpGlobalConfig, load_mcp_config()
+├── connector.py           # McpRemoteConnector — single server connection via StreamableHTTP
+├── client_manager.py      # McpClientManager — connection pool, invoke_tool()
+├── tool_registry.py       # McpToolRegistry — tool discovery, caching, allowlist
+├── artifact.py            # Artifact model, sanitization, McpToolResult
+├── adapters/
+│   ├── __init__.py        # ADAPTER_REGISTRY, get_result_adapter()
+│   ├── base.py            # BaseResultAdapter, GenericResultAdapter
+│   └── excalidraw.py      # ExcalidrawResultAdapter
+└── exceptions.py          # McpConnectionError, McpToolError, McpTimeoutError
+```
+
+### API Response Contract
+
+When MCP tools are invoked, the SSE `final` event includes optional fields:
+
+```json
+{
+  "success": true,
+  "reply": "Here is the diagram I created for you...",
+  "usage": { "input_tokens": N, "output_tokens": N },
+  "request_id": "uuid",
+  "sources": [...],
+  "assistant_meta": { ... },
+  "retrieval": { ... },
+  "artifacts": [
+    {
+      "id": "art_abc123",
+      "type": "excalidraw",
+      "title": "Architecture Diagram",
+      "url": "https://excalidraw.com/#json=...",
+      "preview_url": null,
+      "metadata": { "tool_server": "excalidraw", "tool_name": "create-excalidraw" }
+    }
+  ],
+  "tool_results": [
+    {
+      "tool_server_id": "excalidraw",
+      "tool_name": "create-excalidraw",
+      "status": "success",
+      "duration_ms": 1200,
+      "artifact_ids": ["art_abc123"]
+    }
+  ]
+}
+```
+
+- `artifacts` and `tool_results` are **optional** — omitted when no MCP tools were used.
+- Only artifacts with `safe=True` (sanitized) are included.
+- Old frontend clients safely ignore these unknown fields.
+
+### Frontend Artifact Rendering
+
+The frontend renders artifact cards in assistant messages via the `ArtifactRenderer` component tree:
+
+```
+ArtifactRenderer/
+├── ArtifactRenderer.jsx              # Type router
+├── ArtifactCard.jsx                  # Shared card wrapper
+├── ImageArtifactRenderer.jsx         # type: "image", "svg"
+├── ExcalidrawArtifactRenderer.jsx    # type: "excalidraw"
+├── LinkArtifactRenderer.jsx          # type: "link"
+└── GenericToolResultRenderer.jsx     # default fallback
+```
+
+**Security model (frontend):**
+- No `dangerouslySetInnerHTML` anywhere (0 matches).
+- SVG always rendered via `<img src=...>` (never inline HTML).
+- URL validation: Excalidraw URLs (https + domain), preview URLs (https/http/data:image), generic links (https-only).
+- JSON content downloaded as blob, never parsed as HTML.
+- All event handlers are React-managed — no inline handlers from MCP data.
+- JSON content size capped at 500KB on the backend.
+
+### Adding a New MCP Server
+
+1. **Add config entry** to `config/mcp_servers.json` (id, url, enabled, timeout, tool_allowlist).
+2. **Optionally add adapter** only if the tool's output needs custom normalization (most tools can use `GenericResultAdapter`).
+3. **No frontend rewrite** if output maps to existing artifact types (image, link, text, JSON).
+4. **No backend pipeline changes** — the MCP client manager handles new tools automatically.
+
+### Security Notes
+
+- **No secret forwarding**: User JWT or internal secrets are never sent to MCP remotes.
+- **Tool allowlist**: Only pre-approved tools can be invoked.
+- **Output sanitization**: All MCP tool outputs are sanitized before inclusion in the response.
+- **No raw HTML/SVG passthrough**: SVG content is sanitized (script/event handler stripping).
+- **Rate limiting**: MCP calls count toward existing rate limits.
+- **Audit logging**: Every MCP tool invocation is logged.
+- **No user-controlled MCP URLs**: Server URLs are admin-controlled via config file and env vars.
+
+### Known Limitations
+
+- **LLM tool-use loop (Option A) not implemented**: The `artifacts`/`tool_results` response fields are structurally ready, but tool data must be manually constructed or injected until Option A is implemented. Option B (system-prompt-driven approach) is currently active.
+- **3 pre-existing backend test collection failures**: FastAPI/Starlette `on_startup` version incompatibility — not caused by MCP work.
+- **Real connectivity test to `https://mcp.excalidraw.com` not automated**: All MCP tests run without network (fully mocked).
+
 - app DB có thể dùng `DATABASE_URL` tổng quát; nếu không set thì backend vẫn fallback về cấu hình MySQL cũ
 - object storage hỗ trợ `OBJECT_STORAGE_PROVIDER=local` mặc định và có thể chuyển sang `s3`/`minio` để lưu file gốc + normalized text snapshot
 - vector store hỗ trợ `VECTOR_STORE_PROVIDER=database` mặc định và có thể chuyển sang `qdrant` để retrieval top-k chạy qua vector DB thay vì quét chunks trong SQL
@@ -149,6 +310,112 @@ Muốn xóa toàn bộ data local để làm sạch từ đầu:
 ```powershell
 docker compose -f deploy/docker-compose.local-rag.yml down -v
 ```
+
+### Local Redis + Celery worker cho async ingestion
+
+Redis/Celery async ingestion is optional and guarded by `CELERY_ENABLED`. The frontend remains on the sync path unless a caller explicitly sends `async_index=true`.
+
+Start the local RAG stack with Redis and the Docker Celery worker:
+
+```powershell
+docker compose -f deploy/docker-compose.local-rag.yml -f deploy/docker-compose.local-redis.yml up -d --build
+```
+
+Validate the merged compose config without starting containers:
+
+```powershell
+docker compose --env-file .env.local-redis.example -f deploy/docker-compose.local-rag.yml -f deploy/docker-compose.local-redis.yml config
+```
+
+Backend env vars for host-side local async testing:
+
+```dotenv
+CELERY_ENABLED=true
+REDIS_PASSWORD=redis_dev_password
+CELERY_BROKER_URL=redis://:redis_dev_password@127.0.0.1:6379/0
+CELERY_RESULT_BACKEND=redis://:redis_dev_password@127.0.0.1:6379/1
+```
+
+Docker worker command used by compose:
+
+```powershell
+celery -A app.worker.celery_app worker --loglevel=info --concurrency=2 -Q celery,ingestion
+```
+
+If you run a worker directly on Windows instead of Docker, use the solo pool:
+
+```powershell
+.\.venv\Scripts\celery -A app.worker.celery_app worker --loglevel=info --pool=solo -Q celery,ingestion
+```
+
+Available smoke scripts:
+
+```powershell
+# API async-ingestion smoke (requires backend/auth token/running stack for live use)
+.\.venv\Scripts\python.exe scripts\celery_async_ingest_smoke_test.py --help
+
+# Redis broker smoke (requires Redis running and CELERY_BROKER_URL set or --url supplied)
+.\.venv\Scripts\python.exe scripts\smoke_redis.py --help
+
+# Celery worker liveness smoke (requires at least one running worker for live PASS)
+.\.venv\Scripts\python.exe scripts\smoke_celery_worker.py --help
+```
+
+For live local Redis/worker checks after the stack is up:
+
+```powershell
+$env:CELERY_BROKER_URL="redis://:redis_dev_password@127.0.0.1:6379/0"
+.\.venv\Scripts\python.exe scripts\smoke_redis.py
+.\.venv\Scripts\python.exe scripts\smoke_celery_worker.py
+```
+
+Stop the local Redis/Celery stack:
+
+```powershell
+docker compose -f deploy/docker-compose.local-rag.yml -f deploy/docker-compose.local-redis.yml down
+```
+
+Rollback switch: set `CELERY_ENABLED=false` and restart the backend. The default sync ingestion path remains available.
+
+### Local Nginx Docker proxy cho frontend streaming
+
+Local development can run through:
+
+```text
+Frontend Vite local -> Nginx Docker local -> FastAPI local
+```
+
+FE and BE stay outside Docker. Docker only runs the Nginx proxy so local development can exercise a production-like reverse proxy path while preserving SSE streaming.
+
+1. Start the backend outside Docker on `127.0.0.1:8000`:
+
+```powershell
+.\scripts\dev_backend.ps1
+```
+
+2. Start the local Nginx proxy:
+
+```powershell
+docker compose -f deploy/docker-compose.local-nginx.yml up -d
+```
+
+3. Check Nginx and FastAPI through the proxy:
+
+```powershell
+curl http://127.0.0.1:8080/nginx-healthz
+curl http://127.0.0.1:8080/health
+```
+
+4. Start the frontend outside Docker in `Dominic/chatbot-ui` with:
+
+```dotenv
+VITE_API_BASE_URL=http://127.0.0.1:8080
+VITE_API_TIMEOUT_MS=120000
+```
+
+To bypass Nginx and call the backend directly, use `VITE_API_BASE_URL=http://127.0.0.1:8000`.
+
+The local Nginx config is `deploy/nginx/local-api-proxy.conf`; the dedicated compose file is `deploy/docker-compose.local-nginx.yml`. It proxies `/api/` and `/health` to `http://host.docker.internal:8000` and disables proxy buffering/cache for SSE streaming.
 
 ### Migrate dữ liệu từ MySQL cũ sang Postgres mới
 
@@ -284,7 +551,9 @@ Không cần xóa metadata khi rollback; có thể disable section retrieval bra
 
 - backend đã có `Dockerfile` production và entrypoint tự chạy `alembic upgrade head`
 - frontend đã có `Dockerfile` multi-stage để build Vite và phục vụ bằng Nginx
-- repo backend có `deploy/docker-compose.ec2.yml` để dựng `frontend + backend + postgres + minio + qdrant`
+- repo backend có `deploy/docker-compose.ec2.yml` để dựng `frontend + backend + postgres + minio + qdrant + redis + celery-worker`
+- Redis trong EC2 compose chạy nội bộ Docker (`expose: ["6379"]`, không có host `ports:`), yêu cầu `REDIS_PASSWORD`, dùng AOF (`--appendonly yes`) và lưu vào `redis_data:/data`
+- celery-worker dùng cùng backend image, không expose port, và chạy `celery -A app.worker.celery_app worker --loglevel=info --concurrency=2 -Q celery,ingestion`
 - repo backend có Nginx config mẫu và systemd service mẫu cho EC2
 
 ### Chưa bao gồm trong stack này
@@ -298,12 +567,48 @@ Không cần xóa metadata khi rollback; có thể disable section retrieval bra
 ### Cần làm tiếp khi triển khai
 
 - clone `DominicBE` và `Dominic` thành hai thư mục sibling trên EC2
-- copy `.env.ec2.example` thành `.env.ec2` và điền secret/domain thật
+- copy `.env.ec2.example` thành `.env.ec2` và điền secret/domain thật, gồm `REDIS_PASSWORD=<strong 32+ char secret>` và `CELERY_ENABLED=true` sau khi sẵn sàng bật async worker
+- xác nhận AWS Security Group không có inbound TCP/6379; Phase F static docs không xác minh được AWS SG khi không có EC2/AWS access
+- chạy `BACKEND_ENV_FILE=../.env.ec2.example docker compose --env-file .env.ec2.example -f deploy/docker-compose.ec2.yml config` để kiểm tra compose trước khi deploy
 - chạy `docker compose --env-file .env.ec2 -f deploy/docker-compose.ec2.yml up -d --build`
+- sau deploy, smoke check `docker compose ps`, `curl http://127.0.0.1:8000/health`, `docker exec dominic-redis redis-cli -a "$REDIS_PASSWORD" ping`, worker logs, và xác nhận host không listen public `:6379`
+- rollback nhanh khi Redis/worker lỗi: đặt `CELERY_ENABLED=false` và restart backend; sync/default ingestion vẫn hoạt động
 - cấu hình Nginx host cho `dominicapp.dev` và `api.dominicapp.dev`
 - các lần update sau có thể dùng `./scripts/deploy_ec2.sh` trên EC2 thay cho việc gõ lại từng lệnh
 
 Guide chi tiết từng bước nằm ở `DEPLOY_AWS_EC2_DOCKER.md`.
+
+### Nginx/SSE streaming requirement
+
+The streaming chat endpoint `POST /api/v1/chat/stream` uses Server-Sent Events. Nginx buffers proxied responses by default, which can make a correctly streaming backend appear broken because token chunks are grouped and flushed only after buffering or completion.
+
+Every Nginx `location /` block that proxies Dominic traffic must preserve the existing `proxy_pass` upstream and include these SSE-safe directives:
+
+```nginx
+proxy_http_version 1.1;
+proxy_buffering off;
+proxy_cache off;
+proxy_read_timeout 300;
+proxy_set_header Connection "";
+```
+
+Use the templates in `deploy/nginx/dominic.conf.example` or `deploy/nginx/dominic-docker-ec2.conf.example`, then validate and reload Nginx:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Verify streaming through the public proxy with `curl -N` and a valid bearer token:
+
+```bash
+curl -N -X POST https://api.dominicapp.dev/api/v1/chat/stream \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Stream a concise response."}'
+```
+
+Expected output order is `event: start`, then incremental `event: delta` chunks, then `event: final`. If CloudFront or another CDN is in front of Nginx, create a pass-through/no-cache behavior for `/api/v1/chat/stream` or otherwise exclude that path from CDN caching and response buffering.
 
 ---
 
@@ -721,10 +1026,14 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
     }
 }
 ```
@@ -742,6 +1051,17 @@ Test publicly:
 ```bash
 curl http://YOUR_DOMAIN_OR_EC2_IP/health
 ```
+
+For streaming chat, Nginx must disable proxy buffering. Confirm the `location /` block includes `proxy_buffering off;`, `proxy_cache off;`, `proxy_read_timeout 300;`, and `proxy_set_header Connection "";`. Verify with `curl -N` after login/registering a user:
+
+```bash
+curl -N -X POST http://YOUR_DOMAIN_OR_EC2_IP/api/v1/chat/stream \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Stream a concise response."}'
+```
+
+If CloudFront or another CDN is used in front of this backend, exclude `/api/v1/chat/stream` from caching/buffering or configure SSE pass-through.
 
 ---
 

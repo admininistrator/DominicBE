@@ -1,0 +1,1 @@
+{"servers": [{"id": "excalidraw", "label": "Excalidraw Whiteboard", "url": "https://mcp.excalidraw.com", "enabled": true, "auth_strategy": null, "auth_secret_env": null, "timeout_seconds": 30, "tool_allowlist": [], "artifact_capabilities": ["excalidraw_json", "link"], "health_check_interval_seconds": 300, "tags": ["drawing"]}]}

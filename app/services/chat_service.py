@@ -1,6 +1,9 @@
 import logging
+import asyncio
+import concurrent.futures
 import json
 import re
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass
 from uuid import uuid4
@@ -17,6 +20,7 @@ from app.services import llm_provider
 from app.services.llm_provider import LLMError
 from app.services.rag_core_client import RagCoreClientError, get_rag_core_client, is_rag_core_api_mode
 from app.services.tavily_service import TavilySearchError, search_web
+from app.services.mcp.adapters import normalize_tool_result
 
 # Local aliases for readability (resolved from settings at module load)
 CONTEXT_WINDOW_SIZE = settings.context_window_size
@@ -33,6 +37,18 @@ AUTO_SESSION_TITLE_MODEL = "gpt-5.4-mini"
 AUTO_SESSION_TITLE_MAX_CHARS = 72
 AUTO_SESSION_TITLE_MAX_TOKENS = 24
 AUTO_SESSION_TITLE_MAX_WORDS = 8
+EXCALIDRAW_SERVER_ID = "excalidraw"
+EXCALIDRAW_EXPORT_TOOL = "export_to_excalidraw"
+EXCALIDRAW_CREATE_VIEW_TOOL = "create_view"
+EXCALIDRAW_INTENT_PATTERN = re.compile(
+    r"\b(excalidraw|diagram|flowchart|whiteboard|wireframe|mind\s*map|draw|drawing|chart|schema)\b"
+    r"|(?:\bs[ơo]\s*d[oồ]\b)"
+    r"|(?:sơ\s*đồ)"
+    r"|(?:\bv[eẽ]\b)"
+    r"|(?:\bve\b)",
+    re.IGNORECASE,
+)
+JSON_FENCE_PATTERN = re.compile(r"```(?:json|excalidraw)?\s*([\s\S]*?)```", re.IGNORECASE)
 
 
 class ProviderRequestError(Exception):
@@ -784,6 +800,7 @@ def _compose_system_prompt(
     knowledge_document_id: int | None = None,
     web_search_result: dict | None = None,
     knowledge_base_active: bool = True,
+    mcp_tool_prompt: str | None = None,
 ) -> str:
     retrieved_results = (retrieval_result or {}).get("packed_results") or (retrieval_result or {}).get("results") or []
     web_results = (web_search_result or {}).get("results") or []
@@ -856,6 +873,9 @@ def _compose_system_prompt(
         sections.append(
             "You may provide a cautious high-level answer, but explicitly say the current knowledge-base evidence is insufficient for a confident grounded claim."
         )
+
+    if mcp_tool_prompt:
+        sections.append(mcp_tool_prompt)
 
     return "\n\n".join(section for section in sections if section)
 
@@ -1085,6 +1105,33 @@ def _build_retrieval_payload(retrieval_result: dict | None) -> dict | None:
     }
 
 
+def _build_start_event_metadata(prepared: PreparedChatTurn) -> dict:
+    retrieval_result = prepared.retrieval_result or {}
+    safe_sources: list[dict] = []
+    for source in prepared.sources or []:
+        if not isinstance(source, dict):
+            continue
+        safe_sources.append(
+            {
+                "document_id": source.get("document_id"),
+                "chunk_id": source.get("chunk_id"),
+                "title": source.get("title"),
+                "source_type": source.get("source_type"),
+                "rank": source.get("rank"),
+            }
+        )
+
+    return {
+        "request_id": prepared.request_id,
+        "rag_mode": retrieval_result.get("rag_mode"),
+        "retrieval_scope": retrieval_result.get("retrieval_scope"),
+        "sources": safe_sources,
+        "has_web_search": bool((prepared.web_search_result or {}).get("used"))
+        or bool(retrieval_result.get("web_search_used")),
+    }
+
+
+
 def _build_chat_metadata_retrieval_result(
     *,
     rag_mode: str,
@@ -1164,6 +1211,7 @@ def _prepare_chat_turn(
     reasoning_effort: str | None = None,
     images: list[str] | None = None,
     image_media_types: list[str] | None = None,
+    mcp_client_manager=None,
 ) -> PreparedChatTurn:
     user = crud_chat.get_user_by_username(db, username)
     if not user:
@@ -1312,12 +1360,14 @@ def _prepare_chat_turn(
         start_rank=len(knowledge_sources) + 1,
     )
     sources = [*knowledge_sources, *web_sources]
+    mcp_tool_prompt = _build_mcp_tool_prompt(mcp_client_manager)
     system_prompt = _compose_system_prompt(
         summary_text,
         retrieval_result,
         knowledge_document_id=knowledge_document_id,
         web_search_result=web_search_result,
         knowledge_base_active=knowledge_base_active,
+        mcp_tool_prompt=mcp_tool_prompt,
     )
     request_messages = _build_request_messages(formatted_messages, user_message)
 
@@ -1389,6 +1439,599 @@ def _prepare_chat_turn(
     )
 
 
+def _build_mcp_tool_prompt(mcp_client_manager) -> str | None:
+    """Build a system prompt section describing available MCP tools.
+
+    Instructs the LLM to always include a text description of tool results
+    so text-only clients get a useful response. Returns None when MCP is
+    disabled or no tools are registered.
+    """
+    if not mcp_client_manager:
+        return None
+    try:
+        enabled = getattr(mcp_client_manager, "enabled", False)
+        if not enabled:
+            return None
+        config = getattr(mcp_client_manager, "config", None)
+        if not config:
+            return None
+        servers = getattr(config, "servers", []) or []
+        active_servers = [s for s in servers if getattr(s, "enabled", False)]
+        if not active_servers:
+            return None
+
+        lines = [
+            "You have access to external tools that can create diagrams, fetch data, or perform actions.",
+            "When using a tool, always include a text description of the result in your response.",
+            "For Excalidraw diagrams, use create_view with a JSON array of Excalidraw elements; export_to_excalidraw is only for app-side exports.",
+        ]
+        for server in active_servers:
+            sid = getattr(server, "id", "unknown")
+            label = getattr(server, "label", sid)
+            caps = getattr(server, "artifact_capabilities", [])
+            lines.append(f"- {label}: capabilities: {', '.join(caps) if caps else 'generic tool'}")
+        lines.append(
+            "If a tool execution fails, explain what went wrong in natural language. "
+            "Never leave your reply empty after a tool invocation."
+        )
+        return "\n\n".join(lines)
+    except Exception:
+        logger.debug("Failed to build MCP system prompt section", exc_info=True)
+        return None
+
+
+def _run_async_sync(coro_factory):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro_factory())
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(lambda: asyncio.run(coro_factory()))
+        return future.result()
+
+
+def _is_excalidraw_request(user_message: str, mcp_client_manager) -> bool:
+    if not mcp_client_manager or not EXCALIDRAW_INTENT_PATTERN.search(user_message or ""):
+        return False
+    try:
+        if not getattr(mcp_client_manager, "enabled", False):
+            return False
+        config = getattr(mcp_client_manager, "config", None)
+        if config is not None and hasattr(config, "get_server"):
+            return config.get_server(EXCALIDRAW_SERVER_ID) is not None
+        return True
+    except Exception:
+        logger.debug("Failed to evaluate Excalidraw MCP intent", exc_info=True)
+        return False
+
+
+def _json_candidates_from_text(text: str) -> list[object]:
+    candidates: list[object] = []
+    for match in JSON_FENCE_PATTERN.finditer(text or ""):
+        fenced = match.group(1).strip()
+        if not fenced:
+            continue
+        try:
+            candidates.append(json.loads(fenced))
+        except json.JSONDecodeError:
+            pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text or ""):
+        if char not in "[{":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        candidates.append(parsed)
+    return candidates
+
+
+def _scene_from_candidate(candidate: object) -> tuple[dict, list[dict]] | None:
+    if isinstance(candidate, list) and all(isinstance(item, dict) for item in candidate):
+        elements = candidate
+        scene = {
+            "type": "excalidraw",
+            "version": 2,
+            "source": "Dominic MCP",
+            "elements": elements,
+            "appState": {"viewBackgroundColor": "#ffffff"},
+            "files": {},
+        }
+        return scene, elements
+
+    if not isinstance(candidate, dict):
+        return None
+    raw_elements = candidate.get("elements")
+    if not isinstance(raw_elements, list) or not all(isinstance(item, dict) for item in raw_elements):
+        return None
+
+    scene = dict(candidate)
+    scene.setdefault("type", "excalidraw")
+    scene.setdefault("version", 2)
+    scene.setdefault("source", "Dominic MCP")
+    scene.setdefault("appState", {"viewBackgroundColor": "#ffffff"})
+    scene.setdefault("files", {})
+    return scene, raw_elements
+
+
+def _extract_excalidraw_scene(text: str) -> tuple[dict, list[dict]] | None:
+    for candidate in _json_candidates_from_text(text):
+        scene = _scene_from_candidate(candidate)
+        if scene is not None:
+            return scene
+    return None
+
+
+def _excalidraw_text_element(
+    *,
+    text: str,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    font_size: int = 20,
+) -> dict:
+    element_id = uuid4().hex[:20]
+    return {
+        "id": element_id,
+        "type": "text",
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 1,
+        "opacity": 100,
+        "groupIds": [],
+        "frameId": None,
+        "roundness": None,
+        "seed": 100000 + len(text),
+        "version": 1,
+        "versionNonce": 200000 + len(text),
+        "isDeleted": False,
+        "boundElements": None,
+        "updated": 1,
+        "link": None,
+        "locked": False,
+        "text": text,
+        "fontSize": font_size,
+        "fontFamily": 1,
+        "textAlign": "center",
+        "verticalAlign": "middle",
+        "containerId": None,
+        "originalText": text,
+        "lineHeight": 1.25,
+    }
+
+
+def _excalidraw_rectangle_element(*, x: int, y: int, width: int, height: int) -> dict:
+    return {
+        "id": uuid4().hex[:20],
+        "type": "rectangle",
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "angle": 0,
+        "strokeColor": "#1e1e1e",
+        "backgroundColor": "#e7f5ff",
+        "fillStyle": "solid",
+        "strokeWidth": 2,
+        "strokeStyle": "solid",
+        "roughness": 1,
+        "opacity": 100,
+        "groupIds": [],
+        "frameId": None,
+        "roundness": {"type": 3},
+        "seed": 300000 + width + height,
+        "version": 1,
+        "versionNonce": 400000 + width + height,
+        "isDeleted": False,
+        "boundElements": None,
+        "updated": 1,
+        "link": None,
+        "locked": False,
+    }
+
+
+def _excalidraw_ellipse_element(
+    *,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    background_color: str = "#ffffff",
+) -> dict:
+    element = _excalidraw_rectangle_element(x=x, y=y, width=width, height=height)
+    element["type"] = "ellipse"
+    element["backgroundColor"] = background_color
+    element["roundness"] = None
+    return element
+
+
+def _excalidraw_line_element(
+    *,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    dashed: bool = False,
+    arrow: bool = False,
+) -> dict:
+    dx = x2 - x1
+    dy = y2 - y1
+    return {
+        "id": uuid4().hex[:20],
+        "type": "arrow" if arrow else "line",
+        "x": x1,
+        "y": y1,
+        "width": dx,
+        "height": dy,
+        "angle": 0,
+        "strokeColor": "#495057",
+        "backgroundColor": "transparent",
+        "fillStyle": "solid",
+        "strokeWidth": 1,
+        "strokeStyle": "dashed" if dashed else "solid",
+        "roughness": 1,
+        "opacity": 100,
+        "groupIds": [],
+        "frameId": None,
+        "roundness": None,
+        "seed": 500000 + abs(dx) + abs(dy),
+        "version": 1,
+        "versionNonce": 600000 + abs(dx) + abs(dy),
+        "isDeleted": False,
+        "boundElements": None,
+        "updated": 1,
+        "link": None,
+        "locked": False,
+        "points": [[0, 0], [dx, dy]],
+        "lastCommittedPoint": None,
+        "startBinding": None,
+        "endBinding": None,
+        "startArrowhead": None,
+        "endArrowhead": "arrow" if arrow else None,
+    }
+
+
+def _looks_like_sales_use_case_request(user_message: str, ai_content: str) -> bool:
+    raw_text = f"{user_message or ''}\n{ai_content or ''}"
+    text = unicodedata.normalize("NFKD", raw_text).encode("ascii", "ignore").decode("ascii").lower()
+    has_use_case = "use case" in text or "ca su dung" in text
+    has_sales = "ban hang" in text or "sales" in text or "san pham" in text
+    return has_use_case and has_sales
+
+
+def _build_sales_use_case_excalidraw_scene() -> tuple[dict, list[dict]]:
+    elements: list[dict] = []
+
+    def add_text(text: str, x: int, y: int, width: int, height: int, font_size: int = 16):
+        elements.append(_excalidraw_text_element(text=text, x=x, y=y, width=width, height=height, font_size=font_size))
+
+    def add_actor(label: str, x: int, y: int):
+        elements.append(_excalidraw_rectangle_element(x=x, y=y, width=150, height=54))
+        add_text(label, x + 10, y + 13, 130, 24, 15)
+
+    def add_use_case(label: str, x: int, y: int):
+        elements.append(_excalidraw_ellipse_element(x=x, y=y, width=220, height=58, background_color="#fff9db"))
+        add_text(label, x + 20, y + 15, 180, 28, 15)
+
+    def add_line(x1: int, y1: int, x2: int, y2: int, dashed: bool = False, arrow: bool = False):
+        elements.append(_excalidraw_line_element(x1=x1, y1=y1, x2=x2, y2=y2, dashed=dashed, arrow=arrow))
+
+    elements.append(_excalidraw_rectangle_element(x=230, y=40, width=810, height=650))
+    elements[-1]["backgroundColor"] = "transparent"
+    add_text("H\u1ec7 th\u1ed1ng b\u00e1n h\u00e0ng", 515, 58, 240, 30, 20)
+
+    use_cases = {
+        "login": ("\u0110\u0103ng nh\u1eadp", 520, 105),
+        "view": ("Xem s\u1ea3n ph\u1ea9m", 310, 190),
+        "search": ("T\u00ecm ki\u1ebfm s\u1ea3n ph\u1ea9m", 650, 190),
+        "cart": ("Th\u00eam v\u00e0o gi\u1ecf h\u00e0ng", 310, 285),
+        "checkout": ("Thanh to\u00e1n", 650, 285),
+        "history": ("Xem l\u1ecbch s\u1eed \u0111\u01a1n h\u00e0ng", 310, 380),
+        "product": ("Qu\u1ea3n l\u00fd s\u1ea3n ph\u1ea9m", 650, 380),
+        "order": ("Qu\u1ea3n l\u00fd \u0111\u01a1n h\u00e0ng", 310, 475),
+        "user": ("Qu\u1ea3n l\u00fd ng\u01b0\u1eddi d\u00f9ng", 650, 475),
+        "success": ("Thanh to\u00e1n th\u00e0nh c\u00f4ng", 650, 570),
+        "failed": ("Thanh to\u00e1n th\u1ea5t b\u1ea1i", 310, 570),
+    }
+
+    add_actor("Kh\u00e1ch h\u00e0ng", 35, 250)
+    add_actor("Nh\u00e2n vi\u00ean", 35, 455)
+    add_actor("Qu\u1ea3n tr\u1ecb vi\u00ean", 1110, 360)
+
+    add_line(185, 277, 310, 219)
+    add_line(185, 277, 650, 219)
+    add_line(185, 277, 310, 314)
+    add_line(185, 277, 650, 314)
+    add_line(185, 277, 310, 409)
+    add_line(185, 482, 310, 504)
+    add_line(185, 482, 310, 219)
+    add_line(185, 482, 650, 219)
+    add_line(1110, 387, 870, 409)
+    add_line(1110, 387, 530, 504)
+    add_line(1110, 387, 870, 504)
+    add_line(420, 314, 575, 134, dashed=True, arrow=True)
+    add_line(760, 314, 630, 134, dashed=True, arrow=True)
+    add_line(760, 314, 760, 570, dashed=True, arrow=True)
+    add_line(760, 314, 420, 570, dashed=True, arrow=True)
+
+    for label, x, y in use_cases.values():
+        add_use_case(label, x, y)
+
+    add_text("<<include>>", 455, 205, 95, 24, 12)
+    add_text("<<include>>", 665, 195, 95, 24, 12)
+    add_text("<<extend>>", 770, 430, 95, 24, 12)
+    add_text("<<extend>>", 500, 430, 95, 24, 12)
+
+    scene = {
+        "type": "excalidraw",
+        "version": 2,
+        "source": "Dominic MCP",
+        "elements": elements,
+        "appState": {"viewBackgroundColor": "#ffffff"},
+        "files": {},
+    }
+    return scene, elements
+
+
+def _build_fallback_excalidraw_scene(user_message: str, ai_content: str) -> tuple[dict, list[dict]]:
+    if _looks_like_sales_use_case_request(user_message, ai_content):
+        return _build_sales_use_case_excalidraw_scene()
+
+    title = (user_message or "Excalidraw diagram").strip()
+    summary = re.sub(r"\s+", " ", (ai_content or "").strip())
+    if len(summary) > 240:
+        summary = summary[:237].rstrip() + "..."
+    if not summary:
+        summary = "Generated from the chat request."
+
+    elements = [
+        _excalidraw_rectangle_element(x=0, y=0, width=520, height=110),
+        _excalidraw_text_element(text=title[:120], x=20, y=28, width=480, height=54, font_size=24),
+        _excalidraw_rectangle_element(x=0, y=170, width=520, height=150),
+        _excalidraw_text_element(text=summary, x=24, y=200, width=472, height=90, font_size=18),
+    ]
+    scene = {
+        "type": "excalidraw",
+        "version": 2,
+        "source": "Dominic MCP",
+        "elements": elements,
+        "appState": {"viewBackgroundColor": "#ffffff"},
+        "files": {},
+    }
+    return scene, elements
+
+
+def _tool_allowed(mcp_client_manager, tool_name: str) -> bool:
+    checker = getattr(mcp_client_manager, "is_tool_allowed", None)
+    if callable(checker):
+        try:
+            return bool(checker(EXCALIDRAW_SERVER_ID, tool_name))
+        except Exception:
+            logger.debug("Failed to check MCP tool allowlist", exc_info=True)
+            return False
+    return True
+
+
+def _invoke_mcp_tool_sync(mcp_client_manager, tool_name: str, arguments: dict, prepared: PreparedChatTurn):
+    async def call_tool():
+        return await mcp_client_manager.invoke_tool(
+            EXCALIDRAW_SERVER_ID,
+            tool_name,
+            arguments,
+            user=prepared.username,
+            session=str(prepared.session_id),
+            turn_id=prepared.request_id,
+        )
+
+    return _run_async_sync(call_tool)
+
+
+def _normalize_mcp_artifacts(mcp_client_manager, tool_result) -> list:
+    if getattr(tool_result, "status", None) != "success":
+        return []
+    max_content_bytes = getattr(getattr(mcp_client_manager, "global_config", None), "max_artifact_content_bytes", None)
+    artifacts = normalize_tool_result(
+        EXCALIDRAW_SERVER_ID,
+        getattr(tool_result, "tool_name", EXCALIDRAW_EXPORT_TOOL),
+        getattr(tool_result, "raw_content", None),
+        max_content_bytes=max_content_bytes,
+    )
+    try:
+        tool_result.artifact_ids = [artifact.id for artifact in artifacts]
+    except Exception:
+        logger.debug("Failed to attach MCP artifact ids to tool result", exc_info=True)
+    return artifacts
+
+
+def _checkpoint_id_from_tool_result(tool_result) -> str | None:
+    raw = getattr(tool_result, "raw_content", None)
+    if not isinstance(raw, dict):
+        raw_dump = getattr(raw, "model_dump", None)
+        if callable(raw_dump):
+            try:
+                raw = raw_dump()
+            except Exception:
+                raw = None
+    if not isinstance(raw, dict):
+        return None
+    structured = raw.get("structuredContent")
+    if isinstance(structured, dict):
+        checkpoint_id = structured.get("checkpointId")
+        if isinstance(checkpoint_id, str) and checkpoint_id.strip():
+            return checkpoint_id.strip()
+    return None
+
+
+def _annotate_create_view_artifacts(artifacts: list, tool_result, element_count: int) -> list:
+    checkpoint_id = _checkpoint_id_from_tool_result(tool_result)
+    for artifact in artifacts:
+        try:
+            metadata = dict(getattr(artifact, "metadata", {}) or {})
+            metadata.update({
+                "tool_server": EXCALIDRAW_SERVER_ID,
+                "tool_name": getattr(tool_result, "tool_name", EXCALIDRAW_CREATE_VIEW_TOOL),
+                "mcp_app_tool": "create_view",
+                "render_mode": "inline_create_view",
+                "element_count": element_count,
+            })
+            if checkpoint_id:
+                metadata["checkpoint_id"] = checkpoint_id
+            artifact.metadata = metadata
+            artifact.title = "Excalidraw create_view"
+        except Exception:
+            logger.debug("Failed to annotate Excalidraw create_view artifact", exc_info=True)
+    return artifacts
+
+
+def _fallback_scene_artifacts(mcp_client_manager, tool_name: str, scene: dict) -> list:
+    max_content_bytes = getattr(getattr(mcp_client_manager, "global_config", None), "max_artifact_content_bytes", None)
+    return normalize_tool_result(
+        EXCALIDRAW_SERVER_ID,
+        tool_name,
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(scene, ensure_ascii=False, separators=(",", ":")),
+                }
+            ]
+        },
+        max_content_bytes=max_content_bytes,
+    )
+
+
+def _maybe_create_excalidraw_artifacts(
+    mcp_client_manager,
+    prepared: PreparedChatTurn,
+    ai_content: str,
+) -> tuple[list, list]:
+    if not _is_excalidraw_request(prepared.user_message, mcp_client_manager):
+        return [], []
+
+    scene_and_elements = _extract_excalidraw_scene(ai_content)
+    if not scene_and_elements or not scene_and_elements[1]:
+        scene_and_elements = _build_fallback_excalidraw_scene(prepared.user_message, ai_content)
+    scene, elements = scene_and_elements
+    tool_results: list = []
+
+    if _tool_allowed(mcp_client_manager, EXCALIDRAW_CREATE_VIEW_TOOL):
+        result = _invoke_mcp_tool_sync(
+            mcp_client_manager,
+            EXCALIDRAW_CREATE_VIEW_TOOL,
+            {"elements": json.dumps(elements, ensure_ascii=False, separators=(",", ":"))},
+            prepared,
+        )
+        tool_results.append(result)
+        artifacts = _normalize_mcp_artifacts(mcp_client_manager, result)
+        if artifacts:
+            _annotate_create_view_artifacts(artifacts, result, len(elements))
+            return artifacts, tool_results
+        artifacts = _fallback_scene_artifacts(mcp_client_manager, EXCALIDRAW_CREATE_VIEW_TOOL, scene)
+        _annotate_create_view_artifacts(artifacts, result, len(elements))
+        try:
+            result.artifact_ids = [artifact.id for artifact in artifacts]
+        except Exception:
+            logger.debug("Failed to attach fallback MCP artifact ids", exc_info=True)
+        if artifacts:
+            return artifacts, tool_results
+
+    if _tool_allowed(mcp_client_manager, EXCALIDRAW_EXPORT_TOOL):
+        result = _invoke_mcp_tool_sync(
+            mcp_client_manager,
+            EXCALIDRAW_EXPORT_TOOL,
+            {"json": json.dumps(scene, ensure_ascii=False, separators=(",", ":"))},
+            prepared,
+        )
+        tool_results.append(result)
+        artifacts = _normalize_mcp_artifacts(mcp_client_manager, result)
+        if artifacts:
+            return artifacts, tool_results
+        if getattr(result, "status", None) == "success":
+            artifacts = _fallback_scene_artifacts(mcp_client_manager, EXCALIDRAW_EXPORT_TOOL, scene)
+            try:
+                result.artifact_ids = [artifact.id for artifact in artifacts]
+            except Exception:
+                logger.debug("Failed to attach fallback MCP artifact ids", exc_info=True)
+            if artifacts:
+                return artifacts, tool_results
+
+    if tool_results:
+        fallback_tool_name = getattr(tool_results[-1], "tool_name", EXCALIDRAW_EXPORT_TOOL)
+        artifacts = _fallback_scene_artifacts(mcp_client_manager, fallback_tool_name, scene)
+        try:
+            tool_results[-1].artifact_ids = [artifact.id for artifact in artifacts]
+        except Exception:
+            logger.debug("Failed to attach final fallback MCP artifact ids", exc_info=True)
+        if artifacts:
+            return artifacts, tool_results
+
+    return [], tool_results
+
+
+def _reply_for_excalidraw_artifact(ai_content: str, artifacts: list) -> str:
+    if not artifacts:
+        return ai_content
+    return "I created the Excalidraw diagram. Open the artifact below to view or edit it."
+
+
+def _artifacts_to_response(artifacts: list | None) -> list[dict] | None:
+    """Convert internal Artifact models to public-safe response dicts.
+
+    Returns None when empty so the field is omitted from JSON.
+    Only includes artifacts that passed sanitization (safe=True).
+    """
+    if not artifacts:
+        return None
+    result: list[dict] = []
+    for art in artifacts:
+        if not hasattr(art, "safe") or not getattr(art, "safe", False):
+            continue
+        item = {
+            "id": getattr(art, "id", ""),
+            "type": getattr(art, "type", "generic_tool_result"),
+            "title": getattr(art, "title", ""),
+            "url": getattr(art, "url", None),
+            "preview_url": getattr(art, "preview_url", None),
+            "metadata": getattr(art, "metadata", {}),
+        }
+        content = getattr(art, "content", None)
+        if content is not None:
+            item["content"] = content
+        result.append(item)
+    return result or None
+
+
+def _tool_results_to_response(tool_results: list | None) -> list[dict] | None:
+    """Convert internal McpToolResult models to public-safe response dicts.
+
+    Returns None when empty so the field is omitted from JSON.
+    """
+    if not tool_results:
+        return None
+    result: list[dict] = []
+    for tr in tool_results:
+        result.append({
+            "tool_server_id": getattr(tr, "server_id", ""),
+            "tool_name": getattr(tr, "tool_name", ""),
+            "status": getattr(tr, "status", "error"),
+            "duration_ms": getattr(tr, "duration_ms", 0),
+            "artifact_ids": getattr(tr, "artifact_ids", []),
+        })
+    return result or None
+
+
 def _finalize_chat_turn(
     db: Session,
     prepared: PreparedChatTurn,
@@ -1396,6 +2039,8 @@ def _finalize_chat_turn(
     ai_content: str,
     input_tokens: int,
     output_tokens: int,
+    mcp_artifacts: list | None = None,
+    mcp_tool_results: list | None = None,
 ) -> dict:
     sources = list(prepared.sources)
     retrieval_result = prepared.retrieval_result
@@ -1474,7 +2119,7 @@ def _finalize_chat_turn(
     crud_chat.touch_chat_session(db, prepared.session_id)
     crud_chat.increment_user_tokens(db, prepared.username, input_tokens, output_tokens)
 
-    return {
+    result = {
         "reply": ai_content,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
         "request_id": prepared.request_id,
@@ -1483,6 +2128,13 @@ def _finalize_chat_turn(
         "retrieval": _build_retrieval_payload(retrieval_result)
         or _build_web_search_payload(web_search_result, answer_policy),
     }
+    artifacts_response = _artifacts_to_response(mcp_artifacts)
+    tool_results_response = _tool_results_to_response(mcp_tool_results)
+    if artifacts_response is not None:
+        result["artifacts"] = artifacts_response
+    if tool_results_response is not None:
+        result["tool_results"] = tool_results_response
+    return result
 
 
 def _mark_chat_turn_failed(db: Session, prepared: PreparedChatTurn | None, detail: str):
@@ -1507,6 +2159,7 @@ def handle_chat(
     reasoning_effort: str | None = None,
     images: list[str] | None = None,
     image_media_types: list[str] | None = None,
+    mcp_client_manager=None,
 ):
     prepared: PreparedChatTurn | None = None
 
@@ -1522,6 +2175,7 @@ def handle_chat(
             reasoning_effort=reasoning_effort,
             images=images,
             image_media_types=image_media_types,
+            mcp_client_manager=mcp_client_manager,
         )
 
         logger.info(
@@ -1529,12 +2183,19 @@ def handle_chat(
             username, session_id, llm_provider.resolve_model(model), len(prepared.request_kwargs["messages"]), len(images or []),
         )
         llm_result = llm_provider.complete(**prepared.request_kwargs)
+        mcp_artifacts, mcp_tool_results = _maybe_create_excalidraw_artifacts(
+            mcp_client_manager,
+            prepared,
+            llm_result["text"],
+        )
         return _finalize_chat_turn(
             db,
             prepared,
-            ai_content=llm_result["text"],
+            ai_content=_reply_for_excalidraw_artifact(llm_result["text"], mcp_artifacts),
             input_tokens=llm_result["input_tokens"],
             output_tokens=llm_result["output_tokens"],
+            mcp_artifacts=mcp_artifacts,
+            mcp_tool_results=mcp_tool_results,
         )
 
     except LLMError as e:
@@ -1571,6 +2232,7 @@ def handle_chat_stream(
     reasoning_effort: str | None = None,
     images: list[str] | None = None,
     image_media_types: list[str] | None = None,
+    mcp_client_manager=None,
 ) -> Iterator[dict]:
     prepared: PreparedChatTurn | None = None
     try:
@@ -1585,9 +2247,10 @@ def handle_chat_stream(
             reasoning_effort=reasoning_effort,
             images=images,
             image_media_types=image_media_types,
+            mcp_client_manager=mcp_client_manager,
         )
 
-        yield {"event": "start", "data": {"request_id": prepared.request_id}}
+        yield {"event": "start", "data": _build_start_event_metadata(prepared)}
 
         stream_result: dict | None = None
         for chunk in llm_provider.stream_complete(**prepared.request_kwargs):
@@ -1605,12 +2268,19 @@ def handle_chat_stream(
         if stream_result is None:
             raise RuntimeError("Streaming provider completed without a final payload.")
 
+        mcp_artifacts, mcp_tool_results = _maybe_create_excalidraw_artifacts(
+            mcp_client_manager,
+            prepared,
+            stream_result["text"],
+        )
         final_result = _finalize_chat_turn(
             db,
             prepared,
-            ai_content=stream_result["text"],
+            ai_content=_reply_for_excalidraw_artifact(stream_result["text"], mcp_artifacts),
             input_tokens=stream_result["input_tokens"],
             output_tokens=stream_result["output_tokens"],
+            mcp_artifacts=mcp_artifacts,
+            mcp_tool_results=mcp_tool_results,
         )
         yield {"event": "final", "data": {"success": True, **final_result}}
 

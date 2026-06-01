@@ -77,20 +77,48 @@ services:
       retries: 5
       start_period: 30s
 
+  redis:
+    image: redis:7.2-alpine
+    container_name: dominic-redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    command: >-
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --bind 0.0.0.0
+      --appendonly yes
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
   backend:
     build:
       context: ../..
       dockerfile: DominicBE/Dockerfile
+    image: dominic-backend:latest
     container_name: dominic-backend
     env_file:
       - ${BACKEND_ENV_FILE:-../.env.ec2}
     environment:
       RAG_CORE_BASE_URL: http://rag-core:8010
+      CELERY_ENABLED: ${CELERY_ENABLED:-true}
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
       qdrant:
         condition: service_started
@@ -108,6 +136,35 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  celery-worker:
+    image: dominic-backend:latest
+    container_name: dominic-celery-worker
+    env_file:
+      - ${BACKEND_ENV_FILE:-../.env.ec2}
+    environment:
+      RAG_CORE_BASE_URL: http://rag-core:8010
+      CELERY_ENABLED: ${CELERY_ENABLED:-true}
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      RUN_MIGRATIONS: "0"
+      WAIT_FOR_DATABASE: "0"
+    restart: unless-stopped
+    entrypoint: []
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "--concurrency=2", "-Q", "celery,ingestion"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      minio:
+        condition: service_started
+      minio-bootstrap:
+        condition: service_completed_successfully
+      rag-core:
+        condition: service_healthy
 
   frontend:
     build:
@@ -133,3 +190,4 @@ volumes:
   postgres_data:
   qdrant_data:
   minio_data:
+  redis_data:

@@ -253,6 +253,44 @@ curl http://dominicapp.dev
 curl http://api.dominicapp.dev/health
 ```
 
+### 9.1 Yêu cầu Nginx cho SSE streaming
+
+Endpoint chat streaming `POST /api/v1/chat/stream` dùng Server-Sent Events (SSE) để gửi từng event/token về frontend. Nginx mặc định bật buffering cho proxied responses, nên nếu thiếu cấu hình SSE, Nginx có thể gom nhiều chunk hoặc toàn bộ response rồi mới flush về client. Khi đó backend vẫn stream đúng, nhưng frontend nhận nội dung theo cụm hoặc nhận một lần ở cuối.
+
+Mỗi `location /` proxy tới frontend/backend trong `deploy/nginx/dominic-docker-ec2.conf.example` cần giữ upstream hiện tại và có đủ các directive sau:
+
+```nginx
+proxy_http_version 1.1;
+proxy_buffering off;
+proxy_cache off;
+proxy_read_timeout 300;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header Connection "";
+```
+
+Sau khi copy template vào `/etc/nginx/sites-available/dominic-docker`, chạy:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Xác minh SSE không bị buffer bằng `curl -N` (thay token và payload bằng thông tin hợp lệ của môi trường):
+
+```bash
+curl -N -X POST https://api.dominicapp.dev/api/v1/chat/stream \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Reply with a short streamed answer."}'
+```
+
+Kết quả kỳ vọng là các dòng SSE như `event: start`, `event: delta`, và `event: final` xuất hiện dần trong terminal thay vì chỉ xuất hiện một lần sau khi model trả lời xong.
+
+Nếu đặt CDN hoặc CloudFront phía trước Nginx, cấu hình cache behavior riêng cho `/api/v1/chat/stream` để pass-through SSE, tắt cache/buffering/compression response nếu có, hoặc loại trừ path này khỏi CDN cache. CDN buffering có thể gây cùng triệu chứng với Nginx buffering dù Nginx đã cấu hình đúng.
+
 ## 10. Gắn HTTPS bằng Let's Encrypt
 
 ```bash
@@ -300,19 +338,32 @@ curl https://api.dominicapp.dev/health/minio
 curl https://api.dominicapp.dev/health/qdrant
 ```
 
-### 12.3 Auth
+### 12.3 SSE chat streaming qua Nginx
+
+Sau khi có user/token hợp lệ, kiểm tra streaming bằng `curl -N` để giữ kết nối mở và in từng chunk ngay khi nhận được:
+
+```bash
+curl -N -X POST https://api.dominicapp.dev/api/v1/chat/stream \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Stream a concise response."}'
+```
+
+Pass khi thấy `event: start` trước, sau đó một hoặc nhiều `event: delta`, cuối cùng là `event: final`, và các event xuất hiện tăng dần thay vì đợi đến cuối response.
+
+### 12.4 Auth
 
 - đăng ký user mới từ UI
 - đăng nhập lại
 - kiểm tra `/api/auth/me` trả user đúng
 
-### 12.4 Knowledge flow
+### 12.5 Knowledge flow
 
 - upload một file từ UI
 - kiểm tra document xuất hiện trong Knowledge panel
 - gửi một câu hỏi grounded chat có dùng document đó
 
-### 12.5 MinIO console nếu cần
+### 12.6 MinIO console nếu cần
 
 Vì MinIO console chỉ bind nội bộ, dùng SSH tunnel từ máy local:
 

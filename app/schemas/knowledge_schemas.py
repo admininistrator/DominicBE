@@ -26,7 +26,7 @@ class KnowledgeDocumentCreateRequest(BaseModel):
 
 DocumentStatus = Literal["uploaded", "processing", "indexed", "failed"]
 JobStatus = Literal["queued", "processing", "completed", "failed"]
-IngestionResultStatus = Literal["pending", "indexed"]
+IngestionResultStatus = Literal["pending", "queued", "indexed"]
 
 
 class KnowledgeDocumentResponse(ORMBaseSchema):
@@ -61,6 +61,7 @@ class IngestionJobResponse(ORMBaseSchema):
     document_id: int
     status: JobStatus
     error_message: str | None = None
+    celery_task_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -72,6 +73,7 @@ class IngestionResult(BaseModel):
     chunks_count: int = 0
     checksum: str | None = None
     attempts: int | None = None
+    celery_task_id: str | None = None
 
 
 class KnowledgeSearchRequest(BaseModel):
