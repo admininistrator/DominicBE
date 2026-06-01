@@ -330,3 +330,45 @@ def test_handle_chat_stream_connection_error_still_returns_inline_excalidraw_art
     assert len(scene["elements"]) > 10
     assert final_data["tool_results"][-1]["status"] == "connection_error"
     assert final_data["tool_results"][-1]["artifact_ids"] == [final_data["artifacts"][0]["id"]]
+
+
+def test_handle_chat_stream_emits_excalidraw_artifact_delta_without_raw_json_text():
+    from unittest.mock import patch
+
+    prepared = _make_mock_prepared()
+    prepared.user_message = "Draw an Excalidraw use case diagram"
+    manager = _FakeExcalidrawManager()
+    elements = [
+        {"type": "cameraUpdate", "x": 0, "y": 0, "width": 800, "height": 600},
+        {"type": "ellipse", "id": "uc1", "x": 100, "y": 100, "width": 180, "height": 70},
+        {"type": "text", "id": "txt1", "x": 120, "y": 122, "width": 140, "height": 24, "text": "Login", "fontSize": 18},
+    ]
+    raw = json.dumps(elements)
+
+    with (
+        _mock_finalize_dependencies(patch),
+        patch("app.services.chat_service._prepare_chat_turn", return_value=prepared),
+        patch(
+            "app.services.chat_service.llm_provider.stream_complete",
+            return_value=iter([
+                {"type": "delta", "text": raw[:80]},
+                {"type": "delta", "text": raw[80:160]},
+                {"type": "delta", "text": raw[160:]},
+                {"type": "complete", "text": raw, "input_tokens": 10, "output_tokens": 20},
+            ]),
+        ),
+    ):
+        events = list(chat_service.handle_chat_stream(
+            MagicMock(),
+            "testuser",
+            1,
+            prepared.user_message,
+            mcp_client_manager=manager,
+        ))
+
+    assert all(event["event"] != "delta" for event in events)
+    artifact_events = [event for event in events if event["event"] == "artifact_delta"]
+    assert artifact_events
+    streamed_scene = json.loads(artifact_events[-1]["data"]["artifact"]["content"])
+    assert len(streamed_scene["elements"]) == len(elements)
+    assert streamed_scene["elements"][0]["type"] == "cameraUpdate"

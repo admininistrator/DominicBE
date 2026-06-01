@@ -176,6 +176,15 @@ class Settings(BaseSettings):
     custom_openai_base_url: str = Field(default="", alias="CUSTOM_OPENAI_BASE_URL")
     custom_openai_api_key: str = Field(default="", alias="CUSTOM_OPENAI_API_KEY")
 
+    enable_excalidraw_artifacts: bool = Field(default=True, alias="ENABLE_EXCALIDRAW_ARTIFACTS")
+    excalidraw_artifact_max_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        alias="EXCALIDRAW_ARTIFACT_MAX_BYTES",
+        ge=1024,
+    )
+    excalidraw_diagram_model: str | None = Field(default=None, alias="EXCALIDRAW_DIAGRAM_MODEL")
+    excalidraw_stream_debounce_ms: int = Field(default=80, alias="EXCALIDRAW_STREAM_DEBOUNCE_MS", ge=0)
+
     # Vision / image features
     llm_vision_enabled: bool = Field(default=True, alias="LLM_VISION_ENABLED")
     llm_image_captioning_enabled: bool = Field(

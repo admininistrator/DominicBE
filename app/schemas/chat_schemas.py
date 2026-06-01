@@ -345,3 +345,5 @@ class SessionMessageResponse(BaseModel):
     request_id: str | None = None
     sources: list[CitationSource] = Field(default_factory=list)
     retrieval: RetrievalMetadata | None = None
+    artifacts: list[ArtifactResponse] = Field(default_factory=list)
+    tool_results: list[ToolResultResponse] = Field(default_factory=list)

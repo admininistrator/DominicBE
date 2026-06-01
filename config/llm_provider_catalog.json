@@ -47,14 +47,14 @@
         "type": "openai-compatible",
         "baseUrlEnv": "NINEROUTER_BASE_URL",
         "apiKeyEnv": "NINEROUTER_API_KEY",
-        "enabled": false,
+        "enabled": true,
         "models": [
             {
                 "id": "deepseek-v4-flash",
                 "label": "DeepSeek V4 Flash",
                 "displayProvider": "DeepSeek",
                 "model": "cmc/deepseek/deepseek-v4-flash",
-                "enabled": true,
+                "enabled": false,
                 "default": true,
                 "contextWindow": 1000000,
                 "maxOutputTokens": 128000,
@@ -70,7 +70,7 @@
                 "label": "DeepSeek V4 Pro",
                 "displayProvider": "DeepSeek",
                 "model": "cmc/deepseek/deepseek-v4-pro",
-                "enabled": true,
+                "enabled": false,
                 "default": false,
                 "contextWindow": 1000000,
                 "maxOutputTokens": 128000,
@@ -86,7 +86,7 @@
                 "label": "Mimo V2.5",
                 "displayProvider": "Xiaomi",
                 "model": "cmc/xiaomi/mimo-v2.5",
-                "enabled": true,
+                "enabled": false,
                 "default": false,
                 "contextWindow": 1000000,
                 "maxOutputTokens": 128000,
@@ -102,7 +102,7 @@
                 "label": "Mimo V2.5 Pro",
                 "displayProvider": "Xiaomi",
                 "model": "cmc/xiaomi/mimo-v2.5-pro",
-                "enabled": true,
+                "enabled": false,
                 "default": false,
                 "contextWindow": 1000000,
                 "maxOutputTokens": 128000,
@@ -118,6 +118,22 @@
                 "label": "Qwen 3.7 Max",
                 "displayProvider": "Alibaba",
                 "model": "cmc/Qwen/Qwen3.7-Max",
+                "enabled": false,
+                "default": false,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 128000,
+                "capabilities": {
+                    "reasoningEffort": {
+                        "enabled": false,
+                        "userConfigurable": false
+                    }
+                }
+            },
+            {
+                "id": "gpt-5.5",
+                "label": "GPT 5.5",
+                "displayProvider": "OpenAI",
+                "model": "cx/gpt-5.5",
                 "enabled": true,
                 "default": false,
                 "contextWindow": 1000000,

@@ -26,18 +26,31 @@ def _encode_message_payload(
     documents: list[dict] | None = None,
     sources: list[dict] | None = None,
     assistant_meta: dict | None = None,
+    artifacts: list[dict] | None = None,
+    tool_results: list[dict] | None = None,
 ) -> str | None:
     normalized_images = [image for image in (images or []) if image]
     normalized_documents = [document for document in (documents or []) if document]
     normalized_sources = [source for source in (sources or []) if source]
     normalized_assistant_meta = assistant_meta or None
-    if not normalized_images and not normalized_documents and not normalized_sources and not normalized_assistant_meta:
+    normalized_artifacts = [artifact for artifact in (artifacts or []) if artifact]
+    normalized_tool_results = [tool_result for tool_result in (tool_results or []) if tool_result]
+    if (
+        not normalized_images
+        and not normalized_documents
+        and not normalized_sources
+        and not normalized_assistant_meta
+        and not normalized_artifacts
+        and not normalized_tool_results
+    ):
         return None
     return json.dumps({
         "images": normalized_images,
         "documents": normalized_documents,
         "sources": normalized_sources,
         "assistant_meta": normalized_assistant_meta,
+        "artifacts": normalized_artifacts,
+        "tool_results": normalized_tool_results,
     })
 
 def create_message(
@@ -51,6 +64,8 @@ def create_message(
     documents: list[dict] | None = None,
     sources: list[dict] | None = None,
     assistant_meta: dict | None = None,
+    artifacts: list[dict] | None = None,
+    tool_results: list[dict] | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     status: str = "pending",
@@ -64,7 +79,7 @@ def create_message(
         role=role,
         sender_username=sender_username,
         content=content,
-        image_payload_json=_encode_message_payload(images, documents, sources, assistant_meta),
+        image_payload_json=_encode_message_payload(images, documents, sources, assistant_meta, artifacts, tool_results),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         status=status,

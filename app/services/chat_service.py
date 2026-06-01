@@ -21,6 +21,25 @@ from app.services.llm_provider import LLMError
 from app.services.rag_core_client import RagCoreClientError, get_rag_core_client, is_rag_core_api_mode
 from app.services.tavily_service import TavilySearchError, search_web
 from app.services.mcp.adapters import normalize_tool_result
+from app.services.artifacts.diagram_intent import is_diagram_intent
+from app.services.artifacts.excalidraw_schema import (
+    ExcalidrawValidationError,
+    build_excalidraw_scene,
+    normalize_excalidraw_elements,
+)
+from app.services.artifacts.excalidraw_streaming import (
+    artifact_delta_event,
+    artifact_done_event,
+    artifact_error_event,
+    artifact_id_for_request,
+    artifact_response_from_elements,
+    artifact_start_event,
+    build_diagram_system_prompt,
+    parse_final_elements,
+    partial_json_array_objects,
+    repair_final_elements,
+)
+from app.services.mcp.artifact import Artifact, sanitize_artifact
 
 # Local aliases for readability (resolved from settings at module load)
 CONTEXT_WINDOW_SIZE = settings.context_window_size
@@ -213,6 +232,34 @@ def _load_message_assistant_meta(payload: str | None) -> dict | None:
     }
 
 
+def _load_message_artifacts(payload: str | None) -> list[dict]:
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except Exception:
+        logger.warning("Failed to decode message artifact payload.", exc_info=True)
+        return []
+    if not isinstance(data, dict):
+        return []
+    artifacts = data.get("artifacts") or []
+    return [artifact for artifact in artifacts if isinstance(artifact, dict)]
+
+
+def _load_message_tool_results(payload: str | None) -> list[dict]:
+    if not payload:
+        return []
+    try:
+        data = json.loads(payload)
+    except Exception:
+        logger.warning("Failed to decode message tool-result payload.", exc_info=True)
+        return []
+    if not isinstance(data, dict):
+        return []
+    tool_results = data.get("tool_results") or []
+    return [tool_result for tool_result in tool_results if isinstance(tool_result, dict)]
+
+
 def _resolve_display_model_name(model_name: str | None) -> str:
     explicit = (model_name or "").strip()
     if explicit:
@@ -365,6 +412,8 @@ def get_session_history(
                 else []
             ),
             "retrieval": retrieval_by_request.get(m.request_id) if m.role == "assistant" else None,
+            "artifacts": _load_message_artifacts(m.__dict__.get("image_payload_json")) if m.role == "assistant" else [],
+            "tool_results": _load_message_tool_results(m.__dict__.get("image_payload_json")) if m.role == "assistant" else [],
         }
         for m in rows
     ]
@@ -1492,7 +1541,7 @@ def _run_async_sync(coro_factory):
 
 
 def _is_excalidraw_request(user_message: str, mcp_client_manager) -> bool:
-    if not mcp_client_manager or not EXCALIDRAW_INTENT_PATTERN.search(user_message or ""):
+    if not mcp_client_manager or not is_diagram_intent(user_message):
         return False
     try:
         if not getattr(mcp_client_manager, "enabled", False):
@@ -1504,6 +1553,17 @@ def _is_excalidraw_request(user_message: str, mcp_client_manager) -> bool:
     except Exception:
         logger.debug("Failed to evaluate Excalidraw MCP intent", exc_info=True)
         return False
+
+
+def _should_use_native_excalidraw_artifact(user_message: str | None) -> bool:
+    return bool(settings.enable_excalidraw_artifacts and is_diagram_intent(user_message))
+
+
+def _configure_diagram_generation(prepared: PreparedChatTurn) -> None:
+    prepared.request_kwargs["system"] = build_diagram_system_prompt()
+    diagram_model = (settings.excalidraw_diagram_model or "").strip()
+    if diagram_model:
+        prepared.request_kwargs["model"] = diagram_model
 
 
 def _json_candidates_from_text(text: str) -> list[object]:
@@ -1529,17 +1589,35 @@ def _json_candidates_from_text(text: str) -> list[object]:
     return candidates
 
 
+def _partial_json_array_objects(text: str) -> list[dict]:
+    return partial_json_array_objects(text)
+
+
+def _extract_partial_excalidraw_scene(text: str) -> tuple[dict, list[dict]] | None:
+    raw_elements = _partial_json_array_objects(text)
+    try:
+        elements = normalize_excalidraw_elements(
+            raw_elements,
+            max_payload_bytes=settings.excalidraw_artifact_max_bytes,
+        )
+    except ExcalidrawValidationError:
+        elements = raw_elements
+    if not elements:
+        return None
+    scene = build_excalidraw_scene(elements)
+    return scene, elements
+
+
 def _scene_from_candidate(candidate: object) -> tuple[dict, list[dict]] | None:
     if isinstance(candidate, list) and all(isinstance(item, dict) for item in candidate):
-        elements = candidate
-        scene = {
-            "type": "excalidraw",
-            "version": 2,
-            "source": "Dominic MCP",
-            "elements": elements,
-            "appState": {"viewBackgroundColor": "#ffffff"},
-            "files": {},
-        }
+        try:
+            elements = normalize_excalidraw_elements(
+                candidate,
+                max_payload_bytes=settings.excalidraw_artifact_max_bytes,
+            )
+        except ExcalidrawValidationError:
+            return None
+        scene = build_excalidraw_scene(elements)
         return scene, elements
 
     if not isinstance(candidate, dict):
@@ -1548,13 +1626,21 @@ def _scene_from_candidate(candidate: object) -> tuple[dict, list[dict]] | None:
     if not isinstance(raw_elements, list) or not all(isinstance(item, dict) for item in raw_elements):
         return None
 
+    try:
+        elements = normalize_excalidraw_elements(
+            raw_elements,
+            max_payload_bytes=settings.excalidraw_artifact_max_bytes,
+        )
+    except ExcalidrawValidationError:
+        return None
     scene = dict(candidate)
     scene.setdefault("type", "excalidraw")
     scene.setdefault("version", 2)
-    scene.setdefault("source", "Dominic MCP")
+    scene.setdefault("source", "DominicChatbot")
     scene.setdefault("appState", {"viewBackgroundColor": "#ffffff"})
     scene.setdefault("files", {})
-    return scene, raw_elements
+    scene["elements"] = elements
+    return scene, elements
 
 
 def _extract_excalidraw_scene(text: str) -> tuple[dict, list[dict]] | None:
@@ -1563,6 +1649,26 @@ def _extract_excalidraw_scene(text: str) -> tuple[dict, list[dict]] | None:
         if scene is not None:
             return scene
     return None
+
+
+def _excalidraw_stream_artifact_response(scene: dict, *, request_id: str, sequence: int) -> dict:
+    return {
+        "id": f"stream_excalidraw_{request_id}",
+        "type": "excalidraw",
+        "title": "Excalidraw create_view",
+        "content": json.dumps(scene, ensure_ascii=False, separators=(",", ":")),
+        "url": None,
+        "preview_url": None,
+        "metadata": {
+            "tool_server": EXCALIDRAW_SERVER_ID,
+            "tool_name": EXCALIDRAW_CREATE_VIEW_TOOL,
+            "mcp_app_tool": "create_view",
+            "render_mode": "inline_create_view_stream",
+            "streaming": True,
+            "sequence": sequence,
+            "element_count": len(scene.get("elements") or []),
+        },
+    }
 
 
 def _excalidraw_text_element(
@@ -1912,6 +2018,39 @@ def _fallback_scene_artifacts(mcp_client_manager, tool_name: str, scene: dict) -
     )
 
 
+def _native_excalidraw_artifact(
+    *,
+    artifact_id: str,
+    title: str,
+    request_id: str,
+    elements: list[dict],
+) -> list[Artifact]:
+    artifact_data = artifact_response_from_elements(
+        elements,
+        artifact_id=artifact_id,
+        title=title,
+        request_id=request_id,
+        streaming=False,
+    )
+    artifact = Artifact(
+        id=artifact_data["id"],
+        type=artifact_data["type"],
+        title=artifact_data["title"],
+        mime_type="application/json",
+        content=artifact_data["content"],
+        url=None,
+        preview_url=None,
+        metadata=artifact_data["metadata"],
+        tool_server_id="native",
+        tool_name="excalidraw_artifact",
+    )
+    sanitized = sanitize_artifact(
+        artifact,
+        max_content_bytes=settings.excalidraw_artifact_max_bytes,
+    )
+    return [sanitized] if sanitized is not None else []
+
+
 def _maybe_create_excalidraw_artifacts(
     mcp_client_manager,
     prepared: PreparedChatTurn,
@@ -1986,6 +2125,15 @@ def _reply_for_excalidraw_artifact(ai_content: str, artifacts: list) -> str:
     return "I created the Excalidraw diagram. Open the artifact below to view or edit it."
 
 
+def _should_suppress_excalidraw_stream_text(prepared: PreparedChatTurn, text: str, mcp_client_manager) -> bool:
+    if not _is_excalidraw_request(prepared.user_message, mcp_client_manager):
+        return False
+    stripped = (text or "").lstrip()
+    if stripped.startswith("[") or stripped.startswith("{") or stripped.startswith("```"):
+        return True
+    return bool(_extract_partial_excalidraw_scene(text))
+
+
 def _artifacts_to_response(artifacts: list | None) -> list[dict] | None:
     """Convert internal Artifact models to public-safe response dicts.
 
@@ -2041,19 +2189,23 @@ def _finalize_chat_turn(
     output_tokens: int,
     mcp_artifacts: list | None = None,
     mcp_tool_results: list | None = None,
+    skip_answer_guardrails: bool = False,
 ) -> dict:
     sources = list(prepared.sources)
     retrieval_result = prepared.retrieval_result
     web_search_result = prepared.web_search_result
 
-    ai_content, sources, answer_policy = _apply_answer_guardrails(
-        ai_content,
-        retrieval_result,
-        sources,
-        knowledge_document_id=prepared.knowledge_document_id,
-        web_search_result=web_search_result,
-        knowledge_base_active=prepared.knowledge_base_active,
-    )
+    if skip_answer_guardrails:
+        answer_policy = "artifact"
+    else:
+        ai_content, sources, answer_policy = _apply_answer_guardrails(
+            ai_content,
+            retrieval_result,
+            sources,
+            knowledge_document_id=prepared.knowledge_document_id,
+            web_search_result=web_search_result,
+            knowledge_base_active=prepared.knowledge_base_active,
+        )
     autotitle_source_reply = ai_content
     ai_content = _linkify_web_sources_in_reply(ai_content, sources)
     if retrieval_result is not None:
@@ -2077,6 +2229,9 @@ def _finalize_chat_turn(
     persisted_web_sources = [source for source in sources if source.get("source_type") == "web"]
     assistant_meta = _build_assistant_meta(prepared.model, prepared.reasoning_effort)
 
+    artifacts_response = _artifacts_to_response(mcp_artifacts)
+    tool_results_response = _tool_results_to_response(mcp_tool_results)
+
     crud_chat.create_message(
         db=db,
         role="assistant",
@@ -2086,6 +2241,8 @@ def _finalize_chat_turn(
         request_id=prepared.request_id,
         sources=persisted_web_sources or None,
         assistant_meta=assistant_meta,
+        artifacts=artifacts_response,
+        tool_results=tool_results_response,
         input_tokens=0,
         output_tokens=output_tokens,
         status="success",
@@ -2128,8 +2285,6 @@ def _finalize_chat_turn(
         "retrieval": _build_retrieval_payload(retrieval_result)
         or _build_web_search_payload(web_search_result, answer_policy),
     }
-    artifacts_response = _artifacts_to_response(mcp_artifacts)
-    tool_results_response = _tool_results_to_response(mcp_tool_results)
     if artifacts_response is not None:
         result["artifacts"] = artifacts_response
     if tool_results_response is not None:
@@ -2182,12 +2337,34 @@ def handle_chat(
             "LiteLLM call username=%s session_id=%s model=%s messages=%d images=%d",
             username, session_id, llm_provider.resolve_model(model), len(prepared.request_kwargs["messages"]), len(images or []),
         )
+        native_diagram = _should_use_native_excalidraw_artifact(prepared.user_message)
+        if native_diagram:
+            _configure_diagram_generation(prepared)
         llm_result = llm_provider.complete(**prepared.request_kwargs)
-        mcp_artifacts, mcp_tool_results = _maybe_create_excalidraw_artifacts(
-            mcp_client_manager,
-            prepared,
-            llm_result["text"],
-        )
+        if native_diagram and not mcp_client_manager:
+            try:
+                elements = parse_final_elements(
+                    llm_result["text"],
+                    max_payload_bytes=settings.excalidraw_artifact_max_bytes,
+                )
+            except ExcalidrawValidationError:
+                elements = repair_final_elements(
+                    llm_result["text"],
+                    max_payload_bytes=settings.excalidraw_artifact_max_bytes,
+                )
+            mcp_artifacts = _native_excalidraw_artifact(
+                artifact_id=artifact_id_for_request(prepared.request_id),
+                title="Excalidraw diagram",
+                request_id=prepared.request_id,
+                elements=elements,
+            )
+            mcp_tool_results = []
+        else:
+            mcp_artifacts, mcp_tool_results = _maybe_create_excalidraw_artifacts(
+                mcp_client_manager,
+                prepared,
+                llm_result["text"],
+            )
         return _finalize_chat_turn(
             db,
             prepared,
@@ -2196,6 +2373,7 @@ def handle_chat(
             output_tokens=llm_result["output_tokens"],
             mcp_artifacts=mcp_artifacts,
             mcp_tool_results=mcp_tool_results,
+            skip_answer_guardrails=native_diagram and bool(mcp_artifacts),
         )
 
     except LLMError as e:
@@ -2252,35 +2430,161 @@ def handle_chat_stream(
 
         yield {"event": "start", "data": _build_start_event_metadata(prepared)}
 
+        native_diagram = _should_use_native_excalidraw_artifact(prepared.user_message)
+        artifact_id = artifact_id_for_request(prepared.request_id)
+        artifact_title = "Excalidraw diagram"
+        if native_diagram:
+            _configure_diagram_generation(prepared)
+            yield {
+                "event": "artifact_start",
+                "data": artifact_start_event(
+                    artifact_id=artifact_id,
+                    title=artifact_title,
+                    request_id=prepared.request_id,
+                ),
+            }
+
         stream_result: dict | None = None
+        streamed_text = ""
+        last_streamed_element_count = 0
+        artifact_sequence = 0
+        suppress_text_stream = native_diagram or _is_excalidraw_request(prepared.user_message, mcp_client_manager)
         for chunk in llm_provider.stream_complete(**prepared.request_kwargs):
             chunk_type = chunk.get("type")
             if chunk_type == "delta":
                 delta_text = chunk.get("text") or ""
                 if delta_text:
-                    yield {
-                        "event": "delta",
-                        "data": {"text": delta_text, "request_id": prepared.request_id},
-                    }
+                    streamed_text += delta_text
+                    partial_scene = _extract_partial_excalidraw_scene(streamed_text) if suppress_text_stream else None
+                    if partial_scene is not None:
+                        scene, elements = partial_scene
+                        if len(elements) > last_streamed_element_count:
+                            last_streamed_element_count = len(elements)
+                            artifact_sequence += 1
+                            if native_diagram:
+                                yield {
+                                    "event": "artifact_delta",
+                                    "data": artifact_delta_event(
+                                        artifact_id=artifact_id,
+                                        title=artifact_title,
+                                        request_id=prepared.request_id,
+                                        elements_partial=streamed_text,
+                                        elements=elements,
+                                        sequence=artifact_sequence,
+                                    ),
+                                }
+                            else:
+                                yield {
+                                    "event": "artifact_delta",
+                                    "data": {
+                                        "request_id": prepared.request_id,
+                                        "artifact": _excalidraw_stream_artifact_response(
+                                            scene,
+                                            request_id=prepared.request_id,
+                                            sequence=artifact_sequence,
+                                        ),
+                                    },
+                                }
+                    if not suppress_text_stream and not _should_suppress_excalidraw_stream_text(prepared, streamed_text, mcp_client_manager):
+                        yield {
+                            "event": "delta",
+                            "data": {"text": delta_text, "request_id": prepared.request_id},
+                        }
             elif chunk_type == "complete":
                 stream_result = chunk
 
         if stream_result is None:
             raise RuntimeError("Streaming provider completed without a final payload.")
 
-        mcp_artifacts, mcp_tool_results = _maybe_create_excalidraw_artifacts(
-            mcp_client_manager,
-            prepared,
-            stream_result["text"],
-        )
+        final_elements: list[dict] | None = None
+        if native_diagram:
+            try:
+                final_elements = parse_final_elements(
+                    stream_result["text"],
+                    max_payload_bytes=settings.excalidraw_artifact_max_bytes,
+                )
+            except ExcalidrawValidationError:
+                try:
+                    final_elements = repair_final_elements(
+                        stream_result["text"],
+                        max_payload_bytes=settings.excalidraw_artifact_max_bytes,
+                    )
+                except ExcalidrawValidationError as repair_error:
+                    yield {
+                        "event": "artifact_error",
+                        "data": artifact_error_event(
+                            artifact_id=artifact_id,
+                            request_id=prepared.request_id,
+                            message=str(repair_error),
+                        ),
+                    }
+
+            if final_elements:
+                if len(final_elements) > last_streamed_element_count:
+                    artifact_sequence += 1
+                    yield {
+                        "event": "artifact_delta",
+                        "data": artifact_delta_event(
+                            artifact_id=artifact_id,
+                            title=artifact_title,
+                            request_id=prepared.request_id,
+                            elements_partial=stream_result["text"],
+                            elements=final_elements,
+                            sequence=artifact_sequence,
+                        ),
+                    }
+                yield {
+                    "event": "artifact_done",
+                    "data": artifact_done_event(
+                        artifact_id=artifact_id,
+                        title=artifact_title,
+                        request_id=prepared.request_id,
+                        elements=final_elements,
+                    ),
+                }
+        else:
+            final_scene_and_elements = _extract_excalidraw_scene(stream_result["text"])
+            if final_scene_and_elements and len(final_scene_and_elements[1]) > last_streamed_element_count:
+                artifact_sequence += 1
+                yield {
+                    "event": "artifact_delta",
+                    "data": {
+                        "request_id": prepared.request_id,
+                        "artifact": _excalidraw_stream_artifact_response(
+                            final_scene_and_elements[0],
+                            request_id=prepared.request_id,
+                            sequence=artifact_sequence,
+                        ),
+                    },
+                }
+
+        if native_diagram and final_elements and not mcp_client_manager:
+            mcp_artifacts = _native_excalidraw_artifact(
+                artifact_id=artifact_id,
+                title=artifact_title,
+                request_id=prepared.request_id,
+                elements=final_elements,
+            )
+            mcp_tool_results = []
+        else:
+            mcp_artifacts, mcp_tool_results = _maybe_create_excalidraw_artifacts(
+                mcp_client_manager,
+                prepared,
+                stream_result["text"],
+            )
         final_result = _finalize_chat_turn(
             db,
             prepared,
-            ai_content=_reply_for_excalidraw_artifact(stream_result["text"], mcp_artifacts),
+            ai_content=(
+                _reply_for_excalidraw_artifact(stream_result["text"], mcp_artifacts)
+                if not native_diagram or mcp_artifacts
+                else "I could not create a valid Excalidraw diagram from the model output."
+            ),
             input_tokens=stream_result["input_tokens"],
             output_tokens=stream_result["output_tokens"],
             mcp_artifacts=mcp_artifacts,
             mcp_tool_results=mcp_tool_results,
+            skip_answer_guardrails=native_diagram and bool(mcp_artifacts),
         )
         yield {"event": "final", "data": {"success": True, **final_result}}
 
