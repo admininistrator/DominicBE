@@ -184,6 +184,13 @@ class Settings(BaseSettings):
     )
     excalidraw_diagram_model: str | None = Field(default=None, alias="EXCALIDRAW_DIAGRAM_MODEL")
     excalidraw_stream_debounce_ms: int = Field(default=80, alias="EXCALIDRAW_STREAM_DEBOUNCE_MS", ge=0)
+    excalidraw_artifact_provider: Literal["auto", "native", "mcp"] = Field(
+        default="auto",
+        alias="EXCALIDRAW_ARTIFACT_PROVIDER",
+    )
+    excalidraw_mcp_server_id: str = Field(default="excalidraw", alias="EXCALIDRAW_MCP_SERVER_ID")
+    excalidraw_mcp_create_view_tool: str = Field(default="create_view", alias="EXCALIDRAW_MCP_CREATE_VIEW_TOOL")
+    excalidraw_mcp_export_tool: str = Field(default="export_to_excalidraw", alias="EXCALIDRAW_MCP_EXPORT_TOOL")
 
     # Vision / image features
     llm_vision_enabled: bool = Field(default=True, alias="LLM_VISION_ENABLED")

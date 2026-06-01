@@ -1429,16 +1429,19 @@ def test_be004a_job_status_vocabulary():
 
 
 def test_be004a_ingestion_result_status_vocabulary():
-    """IngestionResult.status must only accept the two verified values.
+    """IngestionResult.status must only accept the verified values.
 
     Locks BE-004-A: schema Literal contract for ingestion result status.
+    "queued" was added when the Celery async ingestion path was introduced —
+    _queue_ingestion_job_in_celery() returns status="queued" in IngestionResult
+    when Celery is enabled and async_index=True.
     """
     from typing import get_args
 
     from app.schemas.knowledge_schemas import IngestionResult
 
     allowed = set(get_args(IngestionResult.model_fields["status"].annotation))
-    assert allowed == {"pending", "indexed"}, (
+    assert allowed == {"pending", "queued", "indexed"}, (
         f"IngestionResult status vocabulary changed unexpectedly: {allowed}"
     )
 

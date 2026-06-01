@@ -39,6 +39,17 @@ from app.services.artifacts.excalidraw_streaming import (
     partial_json_array_objects,
     repair_final_elements,
 )
+from app.services.artifacts.generation import (
+    ArtifactGenerationRequest,
+    ArtifactGenerationResult,
+    ArtifactGenerationService,
+    CallableArtifactProvider,
+    is_excalidraw_mcp_provider_available,
+)
+from app.services.artifacts.persistence import (
+    list_artifacts_by_message_ids,
+    persist_artifact_responses,
+)
 from app.services.mcp.artifact import Artifact, sanitize_artifact
 
 # Local aliases for readability (resolved from settings at module load)
@@ -56,9 +67,9 @@ AUTO_SESSION_TITLE_MODEL = "gpt-5.4-mini"
 AUTO_SESSION_TITLE_MAX_CHARS = 72
 AUTO_SESSION_TITLE_MAX_TOKENS = 24
 AUTO_SESSION_TITLE_MAX_WORDS = 8
-EXCALIDRAW_SERVER_ID = "excalidraw"
-EXCALIDRAW_EXPORT_TOOL = "export_to_excalidraw"
-EXCALIDRAW_CREATE_VIEW_TOOL = "create_view"
+EXCALIDRAW_SERVER_ID = (settings.excalidraw_mcp_server_id or "excalidraw").strip() or "excalidraw"
+EXCALIDRAW_EXPORT_TOOL = (settings.excalidraw_mcp_export_tool or "export_to_excalidraw").strip() or "export_to_excalidraw"
+EXCALIDRAW_CREATE_VIEW_TOOL = (settings.excalidraw_mcp_create_view_tool or "create_view").strip() or "create_view"
 EXCALIDRAW_INTENT_PATTERN = re.compile(
     r"\b(excalidraw|diagram|flowchart|whiteboard|wireframe|mind\s*map|draw|drawing|chart|schema)\b"
     r"|(?:\bs[ơo]\s*d[oồ]\b)"
@@ -392,8 +403,10 @@ def get_session_history(
         before_id=before_id,
     )
     assistant_request_ids = [m.request_id for m in rows if m.role == "assistant" and m.request_id]
+    assistant_message_ids = [int(m.id) for m in rows if m.role == "assistant" and getattr(m, "id", None) is not None]
     citations_by_request = _build_citations_by_request(db, assistant_request_ids)
     retrieval_by_request = _build_retrieval_by_request(db, assistant_request_ids)
+    artifacts_by_message = list_artifacts_by_message_ids(db, assistant_message_ids)
     items = [
         {
             "id": m.id,
@@ -412,7 +425,12 @@ def get_session_history(
                 else []
             ),
             "retrieval": retrieval_by_request.get(m.request_id) if m.role == "assistant" else None,
-            "artifacts": _load_message_artifacts(m.__dict__.get("image_payload_json")) if m.role == "assistant" else [],
+            "artifacts": (
+                artifacts_by_message.get(m.id)
+                or _load_message_artifacts(m.__dict__.get("image_payload_json"))
+                if m.role == "assistant"
+                else []
+            ),
             "tool_results": _load_message_tool_results(m.__dict__.get("image_payload_json")) if m.role == "assistant" else [],
         }
         for m in rows
@@ -1543,16 +1561,13 @@ def _run_async_sync(coro_factory):
 def _is_excalidraw_request(user_message: str, mcp_client_manager) -> bool:
     if not mcp_client_manager or not is_diagram_intent(user_message):
         return False
-    try:
-        if not getattr(mcp_client_manager, "enabled", False):
-            return False
-        config = getattr(mcp_client_manager, "config", None)
-        if config is not None and hasattr(config, "get_server"):
-            return config.get_server(EXCALIDRAW_SERVER_ID) is not None
-        return True
-    except Exception:
-        logger.debug("Failed to evaluate Excalidraw MCP intent", exc_info=True)
-        return False
+    return is_excalidraw_mcp_provider_available(
+        mcp_client_manager,
+        server_id=EXCALIDRAW_SERVER_ID,
+        create_view_tool=EXCALIDRAW_CREATE_VIEW_TOOL,
+        export_tool=EXCALIDRAW_EXPORT_TOOL,
+        provider_mode=settings.excalidraw_artifact_provider,
+    )
 
 
 def _should_use_native_excalidraw_artifact(user_message: str | None) -> bool:
@@ -2119,6 +2134,73 @@ def _maybe_create_excalidraw_artifacts(
     return [], tool_results
 
 
+def _generate_excalidraw_artifacts(
+    mcp_client_manager,
+    prepared: PreparedChatTurn,
+    ai_content: str,
+    *,
+    artifact_id: str,
+    title: str,
+    elements: list[dict] | None = None,
+) -> ArtifactGenerationResult:
+    request = ArtifactGenerationRequest(
+        kind="excalidraw",
+        user_message=prepared.user_message,
+        request_id=prepared.request_id,
+        artifact_id=artifact_id,
+        title=title,
+        model_output=ai_content,
+        elements=elements,
+        username=prepared.username,
+        session_id=prepared.session_id,
+        context=prepared,
+    )
+
+    def native_generate(provider_request: ArtifactGenerationRequest) -> ArtifactGenerationResult:
+        if not provider_request.elements:
+            return ArtifactGenerationResult(provider_id="native_llm_excalidraw")
+        return ArtifactGenerationResult(
+            provider_id="native_llm_excalidraw",
+            artifacts=_native_excalidraw_artifact(
+                artifact_id=provider_request.artifact_id,
+                title=provider_request.title,
+                request_id=provider_request.request_id,
+                elements=provider_request.elements,
+            ),
+        )
+
+    def mcp_generate(provider_request: ArtifactGenerationRequest) -> ArtifactGenerationResult:
+        artifacts, tool_results = _maybe_create_excalidraw_artifacts(
+            mcp_client_manager,
+            provider_request.context,
+            provider_request.model_output,
+        )
+        return ArtifactGenerationResult(
+            provider_id="mcp_excalidraw",
+            artifacts=artifacts,
+            tool_results=tool_results,
+            fallback_used=bool(artifacts and tool_results and getattr(tool_results[-1], "status", None) != "success"),
+        )
+
+    native_provider = CallableArtifactProvider(
+        provider_id="native_llm_excalidraw",
+        kind="excalidraw",
+        generate=native_generate,
+        is_available=lambda provider_request: bool(provider_request.elements),
+    )
+    mcp_provider = CallableArtifactProvider(
+        provider_id="mcp_excalidraw",
+        kind="excalidraw",
+        generate=mcp_generate,
+        is_available=lambda _provider_request: _is_excalidraw_request(prepared.user_message, mcp_client_manager),
+    )
+    service = ArtifactGenerationService(
+        [mcp_provider],
+        fallback_provider=native_provider,
+    )
+    return service.generate(request)
+
+
 def _reply_for_excalidraw_artifact(ai_content: str, artifacts: list) -> str:
     if not artifacts:
         return ai_content
@@ -2232,7 +2314,7 @@ def _finalize_chat_turn(
     artifacts_response = _artifacts_to_response(mcp_artifacts)
     tool_results_response = _tool_results_to_response(mcp_tool_results)
 
-    crud_chat.create_message(
+    assistant_message = crud_chat.create_message(
         db=db,
         role="assistant",
         sender_username=prepared.username,
@@ -2247,6 +2329,16 @@ def _finalize_chat_turn(
         output_tokens=output_tokens,
         status="success",
     )
+    if artifacts_response is not None:
+        try:
+            persist_artifact_responses(
+                db,
+                session_id=prepared.session_id,
+                message_id=assistant_message.id,
+                artifacts=artifacts_response,
+            )
+        except Exception:
+            logger.debug("First-class artifact persistence failed; message payload remains authoritative", exc_info=True)
 
     _maybe_autotitle_session(
         db,
@@ -2341,7 +2433,7 @@ def handle_chat(
         if native_diagram:
             _configure_diagram_generation(prepared)
         llm_result = llm_provider.complete(**prepared.request_kwargs)
-        if native_diagram and not mcp_client_manager:
+        if native_diagram:
             try:
                 elements = parse_final_elements(
                     llm_result["text"],
@@ -2352,19 +2444,26 @@ def handle_chat(
                     llm_result["text"],
                     max_payload_bytes=settings.excalidraw_artifact_max_bytes,
                 )
-            mcp_artifacts = _native_excalidraw_artifact(
-                artifact_id=artifact_id_for_request(prepared.request_id),
-                title="Excalidraw diagram",
-                request_id=prepared.request_id,
-                elements=elements,
-            )
-            mcp_tool_results = []
-        else:
-            mcp_artifacts, mcp_tool_results = _maybe_create_excalidraw_artifacts(
+            artifact_result = _generate_excalidraw_artifacts(
                 mcp_client_manager,
                 prepared,
                 llm_result["text"],
+                artifact_id=artifact_id_for_request(prepared.request_id),
+                title="Excalidraw diagram",
+                elements=elements,
             )
+            mcp_artifacts = artifact_result.artifacts
+            mcp_tool_results = artifact_result.tool_results
+        else:
+            artifact_result = _generate_excalidraw_artifacts(
+                mcp_client_manager,
+                prepared,
+                llm_result["text"],
+                artifact_id=artifact_id_for_request(prepared.request_id),
+                title="Excalidraw diagram",
+            )
+            mcp_artifacts = artifact_result.artifacts
+            mcp_tool_results = artifact_result.tool_results
         return _finalize_chat_turn(
             db,
             prepared,
@@ -2558,20 +2657,16 @@ def handle_chat_stream(
                     },
                 }
 
-        if native_diagram and final_elements and not mcp_client_manager:
-            mcp_artifacts = _native_excalidraw_artifact(
-                artifact_id=artifact_id,
-                title=artifact_title,
-                request_id=prepared.request_id,
-                elements=final_elements,
-            )
-            mcp_tool_results = []
-        else:
-            mcp_artifacts, mcp_tool_results = _maybe_create_excalidraw_artifacts(
-                mcp_client_manager,
-                prepared,
-                stream_result["text"],
-            )
+        artifact_result = _generate_excalidraw_artifacts(
+            mcp_client_manager,
+            prepared,
+            stream_result["text"],
+            artifact_id=artifact_id,
+            title=artifact_title,
+            elements=final_elements if native_diagram and final_elements else None,
+        )
+        mcp_artifacts = artifact_result.artifacts
+        mcp_tool_results = artifact_result.tool_results
         final_result = _finalize_chat_turn(
             db,
             prepared,

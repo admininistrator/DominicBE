@@ -75,6 +75,8 @@ def test_load_mcp_config_applies_server_env_overrides(tmp_path):
             "MCP_SERVER_EXCALIDRAW_URL": "https://override.example/mcp",
             "MCP_SERVER_EXCALIDRAW_TIMEOUT": "7",
             "MCP_SERVER_EXCALIDRAW_TOOL_ALLOWLIST": "draw, export_png",
+            "MCP_SERVER_EXCALIDRAW_ARTIFACT_CAPABILITIES": "excalidraw_json, mcp_app",
+            "MCP_SERVER_EXCALIDRAW_TAGS": "diagram, whiteboard",
         },
     )
 
@@ -82,6 +84,8 @@ def test_load_mcp_config_applies_server_env_overrides(tmp_path):
     assert server.url == "https://override.example/mcp"
     assert server.timeout_seconds == 7
     assert server.tool_allowlist == ["draw", "export_png"]
+    assert server.artifact_capabilities == ["excalidraw_json", "mcp_app"]
+    assert server.tags == ["diagram", "whiteboard"]
 
 
 def test_global_config_reads_settings_fields():

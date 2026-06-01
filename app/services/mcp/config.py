@@ -145,6 +145,10 @@ def _apply_server_env_overrides(data: dict[str, Any], env: Mapping[str, str]) ->
         overridden["timeout_seconds"] = float(env[f"{prefix}_TIMEOUT"])
     if f"{prefix}_TOOL_ALLOWLIST" in env:
         overridden["tool_allowlist"] = _split_csv(env[f"{prefix}_TOOL_ALLOWLIST"])
+    if f"{prefix}_ARTIFACT_CAPABILITIES" in env:
+        overridden["artifact_capabilities"] = _split_csv(env[f"{prefix}_ARTIFACT_CAPABILITIES"])
+    if f"{prefix}_TAGS" in env:
+        overridden["tags"] = _split_csv(env[f"{prefix}_TAGS"])
     if f"{prefix}_AUTH_STRATEGY" in env:
         value = env[f"{prefix}_AUTH_STRATEGY"].strip()
         overridden["auth_strategy"] = value or None

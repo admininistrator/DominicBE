@@ -54,3 +54,17 @@ class ChatSession(Base):
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
+
+class ChatArtifact(Base):
+    __tablename__ = "artifacts"
+    id = Column(String(128), primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    kind = Column(String(64), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    content_json = Column(Text, nullable=True)
+    elements_json = Column(Text, nullable=True)
+    artifact_metadata_json = Column("metadata_json", Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
